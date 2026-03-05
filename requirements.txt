@@ -1,0 +1,5 @@
+discord.py[voice]>=2.7.0
+yt-dlp[default]
+yt-dlp-ejs
+pyyaml
+imageio-ffmpeg

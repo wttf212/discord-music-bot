@@ -1,0 +1,13 @@
+version: "3.8"
+services:
+  music-bot:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - bot-data:/data
+    environment:
+      - GUILD_SETTINGS_FILE=/data/guild_settings.json
+
+volumes:
+  bot-data:
