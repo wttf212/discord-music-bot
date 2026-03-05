@@ -170,6 +170,7 @@ class PlayerControls(discord.ui.View):
 
     @discord.ui.button(label="⏮️ Prev", style=discord.ButtonStyle.secondary, custom_id="btn_prev")
     async def prev_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.evaluate_vote(interaction, "prev"): return
         await interaction.response.defer()
         prev_track = self.bot.queue.previous()
         if not prev_track:
@@ -194,6 +195,7 @@ class PlayerControls(discord.ui.View):
 
     @discord.ui.button(label="⏯️ Play/Pause", style=discord.ButtonStyle.primary, custom_id="btn_playpause")
     async def playpause_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.evaluate_vote(interaction, "playpause"): return
         if self.bot.player.is_playing and not self.bot.player.is_paused:
             self.bot.player.pause()
         elif self.bot.player.is_paused:
@@ -209,6 +211,7 @@ class PlayerControls(discord.ui.View):
 
     @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger, custom_id="btn_stop")
     async def stop_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.evaluate_vote(interaction, "stop"): return
         await interaction.response.defer()
         if self.bot._auto_next_task and not self.bot._auto_next_task.done():
             self.bot._auto_next_task.cancel()
@@ -224,6 +227,7 @@ class PlayerControls(discord.ui.View):
 
     @discord.ui.button(label="⏭️ Next", style=discord.ButtonStyle.secondary, custom_id="btn_next")
     async def next_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.evaluate_vote(interaction, "next"): return
         await interaction.response.defer()
         if self.bot._auto_next_task and not self.bot._auto_next_task.done():
             self.bot._auto_next_task.cancel()
