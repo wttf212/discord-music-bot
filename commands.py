@@ -3,7 +3,7 @@ import discord
 from discord.ext import commands
 from track_queue import Track
 from audio_player import is_playlist_url, extract_playlist_info
-from guild_settings import get_allowed_channel, set_allowed_channel, get_bitrate, set_bitrate
+from guild_settings import get_allowed_channel, set_allowed_channel, get_bitrate, set_bitrate, get_admins, add_admin, remove_admin
 
 
 PLAYLIST_EMOJI = "\u2705"  # ✅
@@ -27,14 +27,19 @@ def create_np_embed(bot, title: str, extra_desc: str = "") -> discord.Embed:
     return embed
 
 
-async def update_channel_topic(bot, channel_id: int, topic_text: str):
-    """Updates the textual channel topic."""
+async def _do_update_topic(channel, text):
     try:
-        channel = bot.get_channel(channel_id)
-        if channel:
-            await channel.edit(topic=topic_text)
-    except Exception as e:
-        print(f"[commands] Failed to update channel topic: {e}")
+        await channel.edit(topic=text)
+    except discord.errors.HTTPException as e:
+        status = getattr(e, "status", 0)
+        if status != 429:
+            print(f"[commands] Failed to update channel topic: {e}")
+
+async def update_channel_topic(bot, channel_id: int, topic_text: str):
+    """Updates the textual channel topic asynchronously to avoid blocking on rate limits."""
+    channel = bot.get_channel(channel_id)
+    if channel:
+        asyncio.create_task(_do_update_topic(channel, topic_text))
 
 
 async def check_channel(ctx: commands.Context) -> bool:
@@ -64,6 +69,12 @@ async def check_channel(ctx: commands.Context) -> bool:
 
 
 async def send_new_np(bot, channel_id: int, embed: discord.Embed):
+    # Reset votes whenever a new NP message is sent / track changes
+    bot.prev_votes = set()
+    bot.playpause_votes = set()
+    bot.stop_votes = set()
+    bot.next_votes = set()
+    
     channel = bot.get_channel(channel_id)
     if not channel:
         return
@@ -98,10 +109,64 @@ class PlayerControls(discord.ui.View):
         if allowed and str(interaction.channel_id) != allowed:
             await interaction.response.send_message(f"Please use controls in <#{allowed}>.", ephemeral=True)
             return False
+            
+        bot_voice = interaction.guild.voice_client
         if not interaction.user.voice or not interaction.user.voice.channel:
             await interaction.response.send_message("You need to be in a voice channel to use controls.", ephemeral=True)
             return False
+            
+        if bot_voice and bot_voice.is_connected():
+            if interaction.user.voice.channel != bot_voice.channel:
+                await interaction.response.send_message("You must be in the same voice channel as the bot to use controls.", ephemeral=True)
+                return False
+                
         return True
+
+    async def evaluate_vote(self, interaction: discord.Interaction, action: str) -> bool:
+        user_id = str(interaction.user.id)
+        owner_id = str(self.bot.config.get("owner_id", ""))
+        if user_id == owner_id:
+            return True
+            
+        bot_voice = interaction.guild.voice_client
+        if not bot_voice or not bot_voice.channel:
+            return True
+            
+        vc_members = [m for m in bot_voice.channel.members if not m.bot]
+        total = len(vc_members)
+        if total <= 1:
+            return True
+            
+        current = self.bot.queue.current
+        
+        if action in ["next", "prev", "playpause"]:
+            if current and current.requested_by == user_id:
+                return True
+        elif action == "stop":
+            all_reqs = set()
+            if current: all_reqs.add(current.requested_by)
+            for t in self.bot.queue.list(): all_reqs.add(t.requested_by)
+            if len(all_reqs) == 1 and user_id in all_reqs:
+                return True
+                
+        # Voting required
+        pct = getattr(self.bot, "fairness_pct", 50)
+        attr = f"{action}_votes"
+        if not hasattr(self.bot, attr):
+            setattr(self.bot, attr, set())
+        votes_set = getattr(self.bot, attr)
+        
+        votes_set.add(user_id)
+        
+        import math
+        req = max(1, math.ceil((pct / 100.0) * total))
+        
+        if len(votes_set) >= req:
+            votes_set.clear()
+            return True
+            
+        await interaction.response.send_message(f"🗳️ `{action}` vote from {interaction.user.display_name} recorded! ({len(votes_set)}/{req} votes needed, fairness: {pct}%)", ephemeral=False)
+        return False
 
     @discord.ui.button(label="⏮️ Prev", style=discord.ButtonStyle.secondary, custom_id="btn_prev")
     async def prev_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -544,6 +609,83 @@ class MusicCog(commands.Cog):
         import os
         os._exit(0)
 
+    async def _check_admin(self, ctx: commands.Context) -> bool:
+        """Returns True if user is bot owner or server admin, else False and sends a message."""
+        user_id = str(ctx.author.id)
+        owner_id = str(self.bot.config.get("owner_id", ""))
+        if user_id == owner_id:
+            return True
+            
+        if ctx.guild:
+            admins = get_admins(str(ctx.guild.id))
+            if user_id in admins:
+                return True
+                
+        await ctx.send("You do not have permission to use this command (requires bot admin).")
+        return False
+
+    @commands.command(name="addadmin")
+    async def addadmin(self, ctx: commands.Context, member: discord.Member):
+        if not await check_channel(ctx): return
+        owner_id = str(self.bot.config.get("owner_id", ""))
+        if str(ctx.author.id) != owner_id:
+            await ctx.send("Only the bot owner can use this command.")
+            return
+            
+        if not ctx.guild:
+            await ctx.send("This command must be used in a server.")
+            return
+            
+        add_admin(str(ctx.guild.id), str(member.id))
+        await ctx.send(f"Added {member.mention} as a bot admin for this server.")
+
+    @commands.command(name="removeadmin")
+    async def removeadmin(self, ctx: commands.Context, member: discord.Member):
+        if not await check_channel(ctx): return
+        owner_id = str(self.bot.config.get("owner_id", ""))
+        if str(ctx.author.id) != owner_id:
+            await ctx.send("Only the bot owner can use this command.")
+            return
+            
+        if not ctx.guild:
+            await ctx.send("This command must be used in a server.")
+            return
+            
+        remove_admin(str(ctx.guild.id), str(member.id))
+        await ctx.send(f"Removed {member.mention} as a bot admin for this server.")
+
+    @commands.command(name="fairplay")
+    async def fairplay(self, ctx: commands.Context, toggle: str | None = None):
+        if not await check_channel(ctx): return
+        if not await self._check_admin(ctx): return
+        
+        if toggle and toggle.lower() in ["off", "false", "0"]:
+            self.bot.queue.fair_play = False
+            await ctx.send("Fair play mode disabled (FIFO queue).")
+        elif toggle and toggle.lower() in ["on", "true", "1"]:
+            self.bot.queue.fair_play = True
+            await ctx.send("Fair play mode enabled (queued songs will alternate users).")
+        else:
+            current = "enabled" if getattr(self.bot.queue, "fair_play", True) else "disabled"
+            await ctx.send(f"Fair play mode is currently **{current}**. Toggle with `{self.bot.command_prefix}fairplay on|off`.")
+
+    @commands.command(name="fairness")
+    async def fairness(self, ctx: commands.Context, pct: int | None = None):
+        if not await check_channel(ctx): return
+        if not await self._check_admin(ctx): return
+        
+        if pct is None:
+            current = getattr(self.bot, "fairness_pct", 50)
+            await ctx.send(f"Current fairness requirement: **{current}%** of voice channel members to vote skip/stop. Usage: `{self.bot.command_prefix}fairness <0-100>`")
+            return
+            
+        if pct < 0 or pct > 100:
+            await ctx.send("Fairness percentage must be between 0 and 100.")
+            return
+            
+        self.bot.fairness_pct = pct
+        await ctx.send(f"Fairness requirement set to **{pct}%**.")
+
     @commands.command(name="help")
     async def help_cmd(self, ctx: commands.Context):
         p = self.bot.command_prefix
@@ -557,6 +699,10 @@ class MusicCog(commands.Cog):
             f"`{p}queue` — Show the current queue\n"
             f"`{p}loadall` — Load all remaining tracks from the last pending playlist\n"
             f"`{p}bitrate [kbps]` — Show or set audio encoding bitrate\n"
+            f"`{p}fairplay on|off` — Toggle user interleaving mode for queues *(admin only)*\n"
+            f"`{p}fairness <0-100>` — Set the percentage of users strictly needed to skip/stop songs *(admin only)*\n"
+            f"`{p}addadmin @user` — Add a user as a bot admin for this server *(owner only)*\n"
+            f"`{p}removeadmin @user` — Remove a user as a bot admin for this server *(owner only)*\n"
             f"`{p}settc` — Restrict bot commands to this channel *(owner only)*\n"
             f"`{p}shutdown` — Shut down the bot *(owner only)*"
         )
@@ -661,6 +807,11 @@ async def _auto_next(bot, channel_id, generation):
                 bot.player.stop_playback()
                 await voice_client.disconnect()
                 bot.player._voice_client = None
+                
+                # Reset fair play stats when leaving
+                bot.queue.fair_play = True
+                bot.fairness_pct = 50
+                
                 channel = bot.get_channel(channel_id)
                 if channel:
                     await channel.send("Queue finished and no one is in the voice channel. Leaving.")

@@ -45,3 +45,31 @@ def set_bitrate(guild_id: str, kbps: int):
         settings[guild_id] = {}
     settings[guild_id]["bitrate"] = kbps
     save_settings(settings)
+
+
+def get_admins(guild_id: str) -> list[str]:
+    settings = load_settings()
+    guild = settings.get(guild_id, {})
+    return guild.get("admins", [])
+
+
+def add_admin(guild_id: str, user_id: str):
+    settings = load_settings()
+    if guild_id not in settings:
+        settings[guild_id] = {}
+    admins = settings[guild_id].get("admins", [])
+    if user_id not in admins:
+        admins.append(user_id)
+    settings[guild_id]["admins"] = admins
+    save_settings(settings)
+
+
+def remove_admin(guild_id: str, user_id: str):
+    settings = load_settings()
+    if guild_id not in settings:
+        return
+    admins = settings[guild_id].get("admins", [])
+    if user_id in admins:
+        admins.remove(user_id)
+        settings[guild_id]["admins"] = admins
+        save_settings(settings)

@@ -59,6 +59,10 @@ Copy `config.example.yaml` to `config.yaml` and fill in:
 | `!queue` | Show queue |
 | `!loadall` | Load remaining playlist tracks |
 | `!bitrate [kbps]` | Show or set audio bitrate |
+| `!fairplay on\|off` | Toggle user interleaving mode for queues *(admin)* |
+| `!fairness <0-100>` | Set the percentage of users strictly needed to skip/stop songs *(admin)* |
+| `!addadmin @user` | Add a user as a bot admin for this server *(owner)* |
+| `!removeadmin @user`| Remove a user as a bot admin for this server *(owner)* |
 | `!settc` | Restrict commands to this channel *(owner)* |
 | `!shutdown` | Shut down the bot *(owner)* |
 
