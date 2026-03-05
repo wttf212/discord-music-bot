@@ -1,6 +1,6 @@
 # Discord Music Bot
 
-A Discord music bot with YouTube and SoundCloud support, featuring automatic PO token generation to prevent YouTube IP bans.
+A Discord music bot with YouTube and SoundCloud. (Use it at your own risk, youtube loves to ban IPs)
 
 ## Features
 

@@ -234,7 +234,9 @@ class AudioPlayer:
             if self._debug:
                 print(f"[debug][ffmpeg] Injecting headers: {headers_str!r}")
 
-        options = f"-ar {self._sample_rate} -ac {self._channels}"
+        # Note: FFmpegPCMAudio already adds -f s16le -ar 48000 -ac 2 pipe:1
+        # Do NOT duplicate -ar/-ac here or audio will be corrupted
+        options = "-vn"
 
         if self._debug:
             print(f"[debug][ffmpeg] before_options: {before_options}")
@@ -246,9 +248,6 @@ class AudioPlayer:
             before_options=before_options,
             options=options,
         )
-
-        # Wrap in PCMVolumeTransformer for future volume control if needed
-        source = discord.PCMVolumeTransformer(source, volume=1.0)
 
         self.is_playing = True
         self.is_paused = False
@@ -264,18 +263,24 @@ class AudioPlayer:
             self.current_track_title = None
             loop.call_soon_threadsafe(self._playback_done.set)
 
-        # Set encoder options for better quality
         self._voice_client.play(source, after=after_playback)
 
-        # Apply bitrate to the encoder if available
-        if hasattr(self._voice_client, 'encoder') and self._voice_client.encoder:
+        # Configure Opus encoder for music (not voice)
+        # discord.py defaults: fec=True, expected_packet_loss=0.15, signal_type='auto'
+        # These defaults waste ~15% of bitrate on error correction and don't optimize for music
+        encoder = getattr(self._voice_client, 'encoder', None)
+        if encoder:
             try:
-                self._voice_client.encoder.set_bitrate(self._audio_bitrate)
+                encoder.set_signal_type('music')
+                encoder.set_fec(False)
+                encoder.set_expected_packet_loss_percent(0.01)
+                encoder.set_bitrate(self._audio_bitrate // 1000)
+                encoder.set_bandwidth('full')
                 if self._debug:
-                    print(f"[debug][player] Encoder bitrate set to {self._audio_bitrate // 1000} kbps")
+                    print(f"[debug][player] Opus encoder: signal=music, bitrate={self._audio_bitrate // 1000}kbps, FEC=off, PLP=0%, bandwidth=full")
             except Exception as e:
                 if self._debug:
-                    print(f"[debug][player] Could not set encoder bitrate: {e}")
+                    print(f"[debug][player] Could not configure opus encoder: {e}")
 
         if self._debug:
             print(f"[debug][player] Playback started for: {title}")

@@ -31,3 +31,17 @@ def set_allowed_channel(guild_id: str, channel_id: str):
         settings[guild_id] = {}
     settings[guild_id]["allowed_channel"] = channel_id
     save_settings(settings)
+
+
+def get_bitrate(guild_id: str) -> int | None:
+    settings = load_settings()
+    guild = settings.get(guild_id, {})
+    return guild.get("bitrate")
+
+
+def set_bitrate(guild_id: str, kbps: int):
+    settings = load_settings()
+    if guild_id not in settings:
+        settings[guild_id] = {}
+    settings[guild_id]["bitrate"] = kbps
+    save_settings(settings)

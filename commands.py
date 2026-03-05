@@ -3,7 +3,7 @@ import discord
 from discord.ext import commands
 from track_queue import Track
 from audio_player import is_playlist_url, extract_playlist_info
-from guild_settings import get_allowed_channel, set_allowed_channel
+from guild_settings import get_allowed_channel, set_allowed_channel, get_bitrate, set_bitrate
 
 
 PLAYLIST_EMOJI = "\u2705"  # ✅
@@ -128,6 +128,10 @@ class MusicCog(commands.Cog):
                 try:
                     voice_client = await voice_channel.connect()
                     self.bot.player.set_voice_client(voice_client)
+                    # Restore saved bitrate for this guild
+                    saved_br = get_bitrate(guild_id)
+                    if saved_br:
+                        await self.bot.player.set_bitrate(saved_br)
                 except Exception as e:
                     await status_msg.edit(content=f"Failed to join voice channel: {e}")
                     return
@@ -212,6 +216,10 @@ class MusicCog(commands.Cog):
             try:
                 voice_client = await voice_channel.connect()
                 self.bot.player.set_voice_client(voice_client)
+                # Restore saved bitrate for this guild
+                saved_br = get_bitrate(guild_id)
+                if saved_br:
+                    await self.bot.player.set_bitrate(saved_br)
             except Exception as e:
                 await ctx.send(f"Failed to join voice channel: {e}")
                 return
@@ -381,7 +389,10 @@ class MusicCog(commands.Cog):
             return
 
         await self.bot.player.set_bitrate(kbps_int)
-        await ctx.send(f"Audio bitrate set to **{kbps_int} kbps**.")
+        # Persist per-guild
+        if ctx.guild:
+            set_bitrate(str(ctx.guild.id), kbps_int)
+        await ctx.send(f"Audio bitrate set to **{kbps_int} kbps** (saved).")
 
     @commands.command(name="shutdown")
     async def shutdown(self, ctx: commands.Context):
