@@ -63,6 +63,126 @@ async def check_channel(ctx: commands.Context) -> bool:
     return False
 
 
+async def send_new_np(bot, channel_id: int, embed: discord.Embed):
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        return
+        
+    old_msg_id = getattr(bot, "np_message_id", None)
+    if old_msg_id:
+        try:
+            old_msg = await channel.fetch_message(old_msg_id)
+            await old_msg.delete()
+        except Exception:
+            pass
+
+    view = PlayerControls(bot, channel_id)
+    try:
+        new_msg = await channel.send(embed=embed, view=view)
+        bot.np_message_id = new_msg.id
+    except Exception as e:
+        print(f"[commands] Failed to send NP message: {e}")
+
+
+class PlayerControls(discord.ui.View):
+    def __init__(self, bot, channel_id):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.channel_id = channel_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        guild_id = str(interaction.guild_id) if interaction.guild_id else None
+        if not guild_id:
+            return True
+        allowed = get_allowed_channel(guild_id)
+        if allowed and str(interaction.channel_id) != allowed:
+            await interaction.response.send_message(f"Please use controls in <#{allowed}>.", ephemeral=True)
+            return False
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.response.send_message("You need to be in a voice channel to use controls.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="⏮️ Prev", style=discord.ButtonStyle.secondary, custom_id="btn_prev")
+    async def prev_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        prev_track = self.bot.queue.previous()
+        if not prev_track:
+            await interaction.followup.send("No previous track in history.", ephemeral=True)
+            return
+            
+        if self.bot._auto_next_task and not self.bot._auto_next_task.done():
+            self.bot._auto_next_task.cancel()
+            self.bot._auto_next_task = None
+        self.bot._auto_next_gen = getattr(self.bot, '_auto_next_gen', 0) + 1
+        self.bot.player.stop_playback()
+        
+        try:
+            title = await self.bot.player.play(prev_track.query)
+            prev_track.title = title
+            embed = create_np_embed(self.bot, title)
+            await send_new_np(self.bot, self.channel_id, embed)
+            await update_channel_topic(self.bot, self.channel_id, f"▶️ Now playing: {title}")
+            _start_auto_next(self.bot, self.channel_id)
+        except Exception as e:
+            await interaction.channel.send(f"Error playing previous track: {e}")
+
+    @discord.ui.button(label="⏯️ Play/Pause", style=discord.ButtonStyle.primary, custom_id="btn_playpause")
+    async def playpause_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.bot.player.is_playing and not self.bot.player.is_paused:
+            self.bot.player.pause()
+        elif self.bot.player.is_paused:
+            self.bot.player.resume()
+        
+        embed = interaction.message.embeds[0] if interaction.message.embeds else None
+        if embed and getattr(self.bot.player, 'is_paused', False):
+            embed.title = "⏸️ Paused"
+        elif embed:
+            embed.title = "▶️ Now Playing"
+            
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger, custom_id="btn_stop")
+    async def stop_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        if self.bot._auto_next_task and not self.bot._auto_next_task.done():
+            self.bot._auto_next_task.cancel()
+            self.bot._auto_next_task = None
+        self.bot.player.stop_playback()
+        self.bot.queue.clear()
+        await self.bot.player.disconnect()
+        await update_channel_topic(self.bot, self.channel_id, "Queue is empty.")
+        
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
+
+    @discord.ui.button(label="⏭️ Next", style=discord.ButtonStyle.secondary, custom_id="btn_next")
+    async def next_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        if self.bot._auto_next_task and not self.bot._auto_next_task.done():
+            self.bot._auto_next_task.cancel()
+            self.bot._auto_next_task = None
+        self.bot._auto_next_gen = getattr(self.bot, '_auto_next_gen', 0) + 1
+        self.bot.player.stop_playback()
+        next_track = self.bot.queue.next()
+        if next_track:
+            try:
+                title = await self.bot.player.play(next_track.query)
+                next_track.title = title
+                embed = create_np_embed(self.bot, title)
+                await send_new_np(self.bot, self.channel_id, embed)
+                await update_channel_topic(self.bot, self.channel_id, f"▶️ Now playing: {title}")
+                _start_auto_next(self.bot, self.channel_id)
+            except Exception as e:
+                await interaction.channel.send(f"Error playing next track: {e}")
+        else:
+            await update_channel_topic(self.bot, self.channel_id, "Queue is empty.")
+            for child in self.children:
+                child.disabled = True
+            await interaction.message.edit(view=self)
+
+
 class MusicCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -147,7 +267,8 @@ class MusicCog(commands.Cog):
 
             if not remaining_tracks:
                 embed = create_np_embed(self.bot, title, f"From playlist: **{playlist_title}**")
-                await status_msg.edit(content="", embed=embed)
+                await status_msg.delete()
+                await send_new_np(self.bot, channel_id, embed)
                 await update_channel_topic(self.bot, channel_id, f"▶️ Now playing: {title}")
                 _start_auto_next(self.bot, channel_id)
                 return
@@ -159,17 +280,21 @@ class MusicCog(commands.Cog):
                 f"React ✅ or type `{self.bot.command_prefix}loadall` to add them to the queue."
             )
             embed = create_np_embed(self.bot, title, extra)
-            await status_msg.edit(content="", embed=embed)
+            await status_msg.delete()
+            await send_new_np(self.bot, channel_id, embed)
             await update_channel_topic(self.bot, channel_id, f"▶️ Now playing: {title}")
 
-            # Try adding ✅ reaction
-            try:
-                await status_msg.add_reaction(PLAYLIST_EMOJI)
-            except Exception as e:
-                print(f"[commands] Could not add reaction: {e}")
+            actual_msg_id = getattr(self.bot, "np_message_id", None)
+            if actual_msg_id:
+                try:
+                    ch = self.bot.get_channel(channel_id)
+                    actual_msg = await ch.fetch_message(actual_msg_id)
+                    await actual_msg.add_reaction(PLAYLIST_EMOJI)
+                except Exception as e:
+                    print(f"[commands] Could not add reaction: {e}")
 
             # Store pending playlist for reaction or !loadall
-            self.bot.pending_playlists[str(status_msg.id)] = {
+            self.bot.pending_playlists[str(actual_msg_id)] = {
                 "query": query,
                 "user_id": str(ctx.author.id),
                 "guild_id": guild_id,
@@ -178,7 +303,7 @@ class MusicCog(commands.Cog):
                 "playlist_title": playlist_title,
             }
             # Also store by channel for !loadall lookup
-            self.bot.pending_playlists[f"channel_{channel_id}"] = str(status_msg.id)
+            self.bot.pending_playlists[f"channel_{channel_id}"] = str(actual_msg_id)
 
             _start_auto_next(self.bot, channel_id)
 
@@ -196,14 +321,14 @@ class MusicCog(commands.Cog):
                             f"~~React ✅ or type `{self.bot.command_prefix}loadall`~~ *(expired)*"
                         )
                         expired_embed = create_np_embed(self.bot, title, expired_extra)
-                        channel = self.bot.get_channel(ch_id)
-                        if channel:
-                            msg = await channel.fetch_message(int(msg_id))
-                            await msg.edit(content="", embed=expired_embed)
+                        channel_obj = self.bot.get_channel(ch_id)
+                        if channel_obj:
+                            msg = await channel_obj.fetch_message(int(msg_id))
+                            await msg.edit(embed=expired_embed)
                     except Exception:
                         pass
 
-            asyncio.create_task(_expire_playlist(str(status_msg.id), channel_id))
+            asyncio.create_task(_expire_playlist(str(actual_msg_id), channel_id))
             return
 
         # ---------------------------------------------------------------
@@ -236,7 +361,8 @@ class MusicCog(commands.Cog):
             try:
                 title = await self.bot.player.play(query)
                 embed = create_np_embed(self.bot, title)
-                await status_msg.edit(content="", embed=embed)
+                await status_msg.delete()
+                await send_new_np(self.bot, channel_id, embed)
                 await update_channel_topic(self.bot, channel_id, f"▶️ Now playing: {title}")
                 _start_auto_next(self.bot, channel_id)
             except Exception as e:
@@ -294,7 +420,8 @@ class MusicCog(commands.Cog):
                 title = await self.bot.player.play(next_track.query)
                 next_track.title = title
                 embed = create_np_embed(self.bot, title)
-                await ctx.send("Skipped.", embed=embed)
+                await ctx.send("Skipped.", delete_after=3)
+                await send_new_np(self.bot, channel_id, embed)
                 await update_channel_topic(self.bot, channel_id, f"▶️ Now playing: {title}")
                 _start_auto_next(self.bot, channel_id)
             except Exception as e:
@@ -357,7 +484,7 @@ class MusicCog(commands.Cog):
                     title = await self.bot.player.play(next_track.query)
                     next_track.title = title
                     embed = create_np_embed(self.bot, title)
-                    await ctx.send(embed=embed)
+                    await send_new_np(self.bot, channel_id, embed)
                     await update_channel_topic(self.bot, channel_id, f"▶️ Now playing: {title}")
                     _start_auto_next(self.bot, channel_id)
                 except Exception as e:
@@ -413,6 +540,7 @@ class MusicCog(commands.Cog):
         await self.bot.player.disconnect()
         await update_channel_topic(self.bot, ctx.channel.id, "Queue is empty.")
         print("[main] Shutdown requested via command.")
+        await self.bot.close()  # gracefully close gateway so bot goes offline immediately
         import os
         os._exit(0)
 
@@ -506,9 +634,7 @@ async def _auto_next(bot, channel_id, generation):
                 next_track.title = title
                 consecutive_errors = 0  # reset on success
                 embed = create_np_embed(bot, title)
-                channel = bot.get_channel(channel_id)
-                if channel:
-                    await channel.send(embed=embed)
+                await send_new_np(bot, channel_id, embed)
                 await update_channel_topic(bot, channel_id, f"▶️ Now playing: {title}")
             except Exception as e:
                 consecutive_errors += 1
