@@ -1,7 +1,16 @@
 import asyncio
 import shutil
 import subprocess
+import sys
+import os
 import threading
+
+# Load bgutil PO token provider plugin for yt-dlp
+_base_dir = os.path.dirname(os.path.abspath(__file__))
+_plugin_dir = os.path.join(_base_dir, "yt-dlp-plugins", "bgutil-ytdlp-pot-provider")
+if os.path.isdir(_plugin_dir) and _plugin_dir not in sys.path:
+    sys.path.insert(0, _plugin_dir)
+
 from yt_dlp import YoutubeDL
 
 
