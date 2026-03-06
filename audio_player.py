@@ -34,12 +34,14 @@ def _is_youtube(query: str) -> bool:
 
 def get_audio_url(query: str, client: str, debug: bool = False) -> dict:
     """Extract audio URL and title via yt-dlp. Supports YouTube, SoundCloud, and others."""
+    ffmpeg_exe = _find_ffmpeg("ffmpeg")
     ydl_opts = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": not debug,
         "no_warnings": not debug,
         "verbose": debug,
+        "ffmpeg_location": ffmpeg_exe,
     }
 
     # Only apply YouTube-specific extractor args for YouTube URLs/searches
@@ -105,19 +107,33 @@ def get_audio_url(query: str, client: str, debug: bool = False) -> dict:
             else:
                 print("[yt-dlp] PO Token: not present in URL")
 
-            # Check for visitor data in cookies
-            cookies = info.get("cookies", "")
+            # Check for visitor data in cookies from the actual yt-dlp cookiejar
             visitor_data = ""
-            for cookie in info.get("http_headers", {}).get("Cookie", "").split(";"):
-                if "VISITOR_INFO1_LIVE" in cookie:
-                    visitor_data = cookie.split("=", 1)[-1].strip()
-                    break
+            if hasattr(ydl, "cookiejar"):
+                for cookie in ydl.cookiejar:
+                    if cookie.name == "VISITOR_INFO1_LIVE":
+                        visitor_data = cookie.value
+                        break
+            
             if visitor_data:
+                # Add it to http_headers so ffmpeg uses it during playback
+                existing_cookie = http_headers.get("Cookie", "")
+                if existing_cookie:
+                    if "VISITOR_INFO1_LIVE" not in existing_cookie:
+                        http_headers["Cookie"] = f"{existing_cookie}; VISITOR_INFO1_LIVE={visitor_data}"
+                else:
+                    http_headers["Cookie"] = f"VISITOR_INFO1_LIVE={visitor_data}"
                 print(f"[yt-dlp] Visitor Data: present ({len(visitor_data)} chars)")
             else:
                 print("[yt-dlp] Visitor Data: not present in cookies")
 
-        return {"url": info["url"], "title": info.get("title", "Unknown"), "http_headers": http_headers}
+        return {
+            "url": info["url"],
+            "title": info.get("title", "Unknown"),
+            "http_headers": http_headers,
+            "thumbnail": info.get("thumbnail", ""),
+            "webpage_url": info.get("webpage_url", ""),
+        }
 
 
 def is_playlist_url(query: str) -> bool:
@@ -207,8 +223,8 @@ class AudioPlayer:
         """Set the discord.py VoiceClient (called when bot joins a voice channel)."""
         self._voice_client = voice_client
 
-    async def play(self, url_or_query: str) -> str:
-        """Resolve a URL/query and start playback. Returns track title."""
+    async def play(self, url_or_query: str) -> dict:
+        """Resolve a URL/query and start playback. Returns dict with title, thumbnail, webpage_url."""
         import discord
 
         if self._debug:
@@ -223,6 +239,8 @@ class AudioPlayer:
         )
         audio_url = info["url"]
         title = info["title"]
+        thumbnail = info.get("thumbnail", "")
+        webpage_url = info.get("webpage_url", "")
         http_headers = info.get("http_headers", {})
 
         if self._debug:
@@ -294,7 +312,7 @@ class AudioPlayer:
         if self._debug:
             print(f"[debug][player] Playback started for: {title}")
 
-        return title
+        return {"title": title, "thumbnail": thumbnail, "webpage_url": webpage_url}
 
     def pause(self):
         """Pause playback."""
