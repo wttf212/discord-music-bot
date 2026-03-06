@@ -2,44 +2,71 @@ import asyncio
 import discord
 from discord.ext import commands
 from track_queue import Track
-from audio_player import is_playlist_url, extract_playlist_info
+from audio_player import is_playlist_url, extract_playlist_info, get_audio_url
 from guild_settings import get_allowed_channel, set_allowed_channel, get_bitrate, set_bitrate, get_admins, add_admin, remove_admin
 
 
 PLAYLIST_EMOJI = "\u2705"  # ✅
 
 
-def create_np_embed(bot, title: str, extra_desc: str = "") -> discord.Embed:
-    """Creates an embed for Now Playing."""
+def create_np_embed(bot, title: str, extra_desc: str = "",
+                    thumbnail: str = "", url: str = "",
+                    requester_name: str = "",
+                    queue_tracks: list | None = None) -> discord.Embed:
+    """Creates an embed for Now Playing with thumbnail, link, and queue preview."""
     kbps = bot.player._audio_bitrate // 1000
     p = bot.command_prefix
 
-    desc = f"**{title}**"
+    # Make the title a clickable link if we have a URL
+    if url:
+        desc = f"**[{title}]({url})**"
+    else:
+        desc = f"**{title}**"
+    if requester_name:
+        desc += f"\n*Requested by {requester_name}*"
     if extra_desc:
         desc += f"\n\n{extra_desc}"
+
+    # Force the embed to be wider using an invisible spacer line
+    desc += "\n\n" + "⠀" * 45
 
     embed = discord.Embed(
         title="▶️ Now Playing",
         description=desc,
         color=0x3498db,
     )
+
+    # Set thumbnail from the track
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
+
+    # Add queue preview (next 5 songs)
+    if queue_tracks:
+        lines = []
+        for i, t in enumerate(queue_tracks[:5], 1):
+            req_tag = ""
+            if t.requested_by:
+                req_tag = f" — *<@{t.requested_by}>*"
+            if t.url:
+                lines.append(f"`{i}.` [{t.title}]({t.url}){req_tag}")
+            else:
+                lines.append(f"`{i}.` {t.title}{req_tag}")
+        remaining = len(bot.queue.list()) - 5
+        if remaining > 0:
+            lines.append(f"*...and {remaining} more*")
+        embed.add_field(name="Up Next", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="Up Next", value="*No songs in queue*", inline=False)
+
     embed.set_footer(text=f"Audio: {kbps} kbps • {p}bitrate <kbps> to change")
     return embed
 
 
-async def _do_update_topic(channel, text):
-    try:
-        await channel.edit(topic=text)
-    except discord.errors.HTTPException as e:
-        status = getattr(e, "status", 0)
-        if status != 429:
-            print(f"[commands] Failed to update channel topic: {e}")
-
-async def update_channel_topic(bot, channel_id: int, topic_text: str):
-    """Updates the textual channel topic asynchronously to avoid blocking on rate limits."""
-    channel = bot.get_channel(channel_id)
-    if channel:
-        asyncio.create_task(_do_update_topic(channel, topic_text))
+def _get_requester_name(bot, user_id: str) -> str:
+    """Resolve a user ID to their mention."""
+    if not user_id:
+        return ""
+    return f"<@{user_id}>"
 
 
 async def check_channel(ctx: commands.Context) -> bool:
@@ -68,6 +95,94 @@ async def check_channel(ctx: commands.Context) -> bool:
     return False
 
 
+async def _do_update_np_embed(bot, channel, msg_id, embed):
+    """Helper to update NP embed in a separate task."""
+    try:
+        msg = await channel.fetch_message(msg_id)
+        view = _create_player_controls(bot, channel.id)
+        await msg.edit(embed=embed, view=view)
+    except Exception as e:
+        print(f"[commands] Failed to update NP embed: {e}")
+
+async def update_np_embed(bot, channel_id: int, embed: discord.Embed):
+    """Edit the existing NP message embed in-place (no new message)."""
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        return
+    msg_id = getattr(bot, "np_message_id", None)
+    if not msg_id:
+        return
+    if channel:
+        asyncio.create_task(_do_update_np_embed(bot, channel, msg_id, embed))
+
+
+class LoadPlaylistButton(discord.ui.Button):
+    def __init__(self, bot, channel_id):
+        super().__init__(label="Load Playlist Tracks", style=discord.ButtonStyle.success, emoji="✅", custom_id="btn_load_playlist")
+        self.bot = bot
+        self.channel_id = channel_id
+        
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        pending = self.bot.pending_playlists.pop(str(self.channel_id), None)
+        if not pending:
+            await interaction.followup.send("Playlist already loaded or expired.", ephemeral=True)
+            view = _create_player_controls(self.bot, self.channel_id)
+            await interaction.message.edit(view=view)
+            return
+
+        tracks = pending["tracks"]
+        user_id = str(interaction.user.id)
+        
+        for t in tracks:
+            track = Track(query=t["url"], title=t["title"], requested_by=user_id, url=t["url"])
+            self.bot.queue.add(track)
+
+        current = self.bot.queue.current
+        if current:
+            embed = create_np_embed(self.bot, current.title,
+                                    thumbnail=current.thumbnail,
+                                    url=current.url,
+                                    requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
+                                    queue_tracks=self.bot.queue.preview_fair_order())
+            
+            view = _create_player_controls(self.bot, self.channel_id)
+            await interaction.message.edit(embed=embed, view=view)
+            
+            channel = self.bot.get_channel(self.channel_id)
+            if channel:
+                await channel.send(f"📋 Added **{len(tracks)}** tracks to the queue.")
+
+
+async def _resolve_track_info(bot, channel_id: int, track: Track):
+    """Silently resolve missing track metadata via yt-dlp and update the NP embed."""
+    if track.url:  # Already resolved
+        return
+    try:
+        yt_client = bot.config.get("youtube", {}).get("client", "web")
+        info = await asyncio.get_event_loop().run_in_executor(
+            None, get_audio_url, track.query, yt_client
+        )
+        track.title = info["title"]
+        track.thumbnail = info.get("thumbnail", "")
+        track.url = info.get("webpage_url", "")
+        
+        # If there's an active NP embed showing the queue, refresh it
+        current = bot.queue.current
+        if current:
+            requester_name = _get_requester_name(bot, current.requested_by)
+            embed = create_np_embed(
+                bot,
+                current.title,
+                thumbnail=current.thumbnail,
+                url=current.url,
+                requester_name=requester_name,
+                queue_tracks=bot.queue.preview_fair_order(),
+            )
+            update_np_embed(bot, channel_id, embed)
+    except Exception as e:
+        print(f"[commands] Failed background resolve for {track.query}: {e}")
+
 async def send_new_np(bot, channel_id: int, embed: discord.Embed):
     # Reset votes whenever a new NP message is sent / track changes
     bot.prev_votes = set()
@@ -87,13 +202,18 @@ async def send_new_np(bot, channel_id: int, embed: discord.Embed):
         except Exception:
             pass
 
-    view = PlayerControls(bot, channel_id)
+    view = _create_player_controls(bot, channel_id)
     try:
         new_msg = await channel.send(embed=embed, view=view)
         bot.np_message_id = new_msg.id
     except Exception as e:
         print(f"[commands] Failed to send NP message: {e}")
 
+def _create_player_controls(bot, channel_id):
+    view = PlayerControls(bot, channel_id)
+    if str(channel_id) in bot.pending_playlists:
+        view.add_item(LoadPlaylistButton(bot, channel_id))
+    return view
 
 class PlayerControls(discord.ui.View):
     def __init__(self, bot, channel_id):
@@ -184,11 +304,17 @@ class PlayerControls(discord.ui.View):
         self.bot.player.stop_playback()
         
         try:
-            title = await self.bot.player.play(prev_track.query)
+            info = await self.bot.player.play(prev_track.query)
+            title = info["title"]
             prev_track.title = title
-            embed = create_np_embed(self.bot, title)
+            prev_track.thumbnail = info.get("thumbnail", "")
+            prev_track.url = info.get("webpage_url", "")
+            embed = create_np_embed(self.bot, title,
+                                    thumbnail=prev_track.thumbnail,
+                                    url=prev_track.url,
+                                    requester_name=_get_requester_name(self.bot, prev_track.requested_by),
+                                    queue_tracks=self.bot.queue.preview_fair_order())
             await send_new_np(self.bot, self.channel_id, embed)
-            await update_channel_topic(self.bot, self.channel_id, f"▶️ Now playing: {title}")
             _start_auto_next(self.bot, self.channel_id)
         except Exception as e:
             await interaction.channel.send(f"Error playing previous track: {e}")
@@ -219,7 +345,7 @@ class PlayerControls(discord.ui.View):
         self.bot.player.stop_playback()
         self.bot.queue.clear()
         await self.bot.player.disconnect()
-        await update_channel_topic(self.bot, self.channel_id, "Queue is empty.")
+
         
         for child in self.children:
             child.disabled = True
@@ -237,16 +363,22 @@ class PlayerControls(discord.ui.View):
         next_track = self.bot.queue.next()
         if next_track:
             try:
-                title = await self.bot.player.play(next_track.query)
+                info = await self.bot.player.play(next_track.query)
+                title = info["title"]
                 next_track.title = title
-                embed = create_np_embed(self.bot, title)
+                next_track.thumbnail = info.get("thumbnail", "")
+                next_track.url = info.get("webpage_url", "")
+                embed = create_np_embed(self.bot, title,
+                                        thumbnail=next_track.thumbnail,
+                                        url=next_track.url,
+                                        requester_name=_get_requester_name(self.bot, next_track.requested_by),
+                                        queue_tracks=self.bot.queue.preview_fair_order())
                 await send_new_np(self.bot, self.channel_id, embed)
-                await update_channel_topic(self.bot, self.channel_id, f"▶️ Now playing: {title}")
                 _start_auto_next(self.bot, self.channel_id)
             except Exception as e:
                 await interaction.channel.send(f"Error playing next track: {e}")
         else:
-            await update_channel_topic(self.bot, self.channel_id, "Queue is empty.")
+
             for child in self.children:
                 child.disabled = True
             await interaction.message.edit(view=self)
@@ -311,59 +443,108 @@ class MusicCog(commands.Cog):
             first_track_info = tracks[0]
             remaining_tracks = tracks[1:]
 
-            # Join voice if not already connected
-            voice_client = ctx.guild.voice_client
-            if not voice_client or not voice_client.is_connected():
-                try:
-                    voice_client = await voice_channel.connect()
-                    self.bot.player.set_voice_client(voice_client)
-                    # Restore saved bitrate for this guild
-                    saved_br = get_bitrate(guild_id)
-                    if saved_br:
-                        await self.bot.player.set_bitrate(saved_br)
-                except Exception as e:
-                    await status_msg.edit(content=f"Failed to join voice channel: {e}")
-                    return
-
-            # Play the first track immediately
+            # Delete the user's command message to keep chat clean
             try:
-                title = await self.bot.player.play(first_track_info["url"])
-            except Exception as e:
-                await status_msg.edit(content=f"Error playing first track: {e}")
-                return
+                await ctx.message.delete()
+            except Exception:
+                pass
+
+            # Check if audio is actually playing
+            voice_actually_playing = (
+                self.bot.player.is_playing
+                and ctx.guild.voice_client
+                and ctx.guild.voice_client.is_playing()
+            )
 
             channel_id = ctx.channel.id
+            user_id = str(ctx.author.id)
 
-            if not remaining_tracks:
-                embed = create_np_embed(self.bot, title, f"From playlist: **{playlist_title}**")
+            if voice_actually_playing:
+                # Add the first track to the queue silently
+                track = Track(query=first_track_info["url"], title=first_track_info["title"], requested_by=user_id, url=first_track_info["url"])
+                self.bot.queue.add(track)
+                
+                try:
+                    await ctx.message.delete()
+                except Exception:
+                    pass
+
+                count = len(remaining_tracks)
+                if count > 0:
+                    extra = (
+                        f"📋 **{playlist_title}** has **{count}** more tracks.\n"
+                        f"Click 'Load Playlist Tracks' to add them to the queue."
+                    )
+                else:
+                    extra = f"📋 Added **{playlist_title}** (1 track) to the queue."
+
+                current = self.bot.queue.current
+                if current:
+                    embed = create_np_embed(self.bot, current.title, extra,
+                                            thumbnail=current.thumbnail,
+                                            url=current.url,
+                                            requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
+                                            queue_tracks=self.bot.queue.preview_fair_order())
+                    await status_msg.delete()
+                    await update_np_embed(self.bot, channel_id, embed)
+            
+            else:
+                # Join voice if not already connected
+                voice_client = ctx.guild.voice_client
+                if not voice_client or not voice_client.is_connected():
+                    try:
+                        voice_client = await voice_channel.connect()
+                        self.bot.player.set_voice_client(voice_client)
+                        # Restore saved bitrate for this guild
+                        saved_br = get_bitrate(guild_id)
+                        if saved_br:
+                            await self.bot.player.set_bitrate(saved_br)
+                    except Exception as e:
+                        await status_msg.edit(content=f"Failed to join voice channel: {e}")
+                        return
+
+                # Play the first track immediately
+                try:
+                    info = await self.bot.player.play(first_track_info["url"])
+                    title = info["title"]
+                    track_thumbnail = info.get("thumbnail", "")
+                    track_url = info.get("webpage_url", "")
+                    
+                    # Explicitly set the current track state since we bypassed queueing
+                    track = Track(query=first_track_info["url"], title=title, requested_by=user_id, thumbnail=track_thumbnail, url=track_url)
+                    self.bot.queue.current = track
+                except Exception as e:
+                    await status_msg.edit(content=f"Error playing first track: {e}")
+                    return
+
+                if not remaining_tracks:
+                    embed = create_np_embed(self.bot, title,
+                                            f"From playlist: **{playlist_title}**",
+                                            thumbnail=track_thumbnail,
+                                            url=track_url,
+                                            requester_name=f"<@{user_id}>",
+                                            queue_tracks=self.bot.queue.preview_fair_order())
+                    await status_msg.delete()
+                    await send_new_np(self.bot, channel_id, embed)
+                    _start_auto_next(self.bot, channel_id)
+                    return
+
+                # Show offer to load the rest
+                count = len(remaining_tracks)
+                extra = (
+                    f"📋 **{playlist_title}** has **{count}** more tracks.\n"
+                    f"Click 'Load Playlist Tracks' to add them to the queue."
+                )
+                embed = create_np_embed(self.bot, title, extra,
+                                        thumbnail=track_thumbnail,
+                                        url=track_url,
+                                        requester_name=f"<@{user_id}>",
+                                        queue_tracks=self.bot.queue.preview_fair_order())
                 await status_msg.delete()
                 await send_new_np(self.bot, channel_id, embed)
-                await update_channel_topic(self.bot, channel_id, f"▶️ Now playing: {title}")
-                _start_auto_next(self.bot, channel_id)
-                return
 
-            # Show offer to load the rest
-            count = len(remaining_tracks)
-            extra = (
-                f"📋 **{playlist_title}** has **{count}** more tracks.\n"
-                f"React ✅ or type `{self.bot.command_prefix}loadall` to add them to the queue."
-            )
-            embed = create_np_embed(self.bot, title, extra)
-            await status_msg.delete()
-            await send_new_np(self.bot, channel_id, embed)
-            await update_channel_topic(self.bot, channel_id, f"▶️ Now playing: {title}")
-
-            actual_msg_id = getattr(self.bot, "np_message_id", None)
-            if actual_msg_id:
-                try:
-                    ch = self.bot.get_channel(channel_id)
-                    actual_msg = await ch.fetch_message(actual_msg_id)
-                    await actual_msg.add_reaction(PLAYLIST_EMOJI)
-                except Exception as e:
-                    print(f"[commands] Could not add reaction: {e}")
-
-            # Store pending playlist for reaction or !loadall
-            self.bot.pending_playlists[str(actual_msg_id)] = {
+            # Store pending playlist 
+            self.bot.pending_playlists[str(channel_id)] = {
                 "query": query,
                 "user_id": str(ctx.author.id),
                 "guild_id": guild_id,
@@ -371,33 +552,30 @@ class MusicCog(commands.Cog):
                 "tracks": remaining_tracks,
                 "playlist_title": playlist_title,
             }
-            # Also store by channel for !loadall lookup
-            self.bot.pending_playlists[f"channel_{channel_id}"] = str(actual_msg_id)
 
-            _start_auto_next(self.bot, channel_id)
+            if voice_actually_playing:
+                await update_np_embed(self.bot, channel_id, embed)
+            else:
+                await send_new_np(self.bot, channel_id, embed)
+                _start_auto_next(self.bot, channel_id)
 
             # Auto-expire after 120 seconds
-            async def _expire_playlist(msg_id: str, ch_id: int):
+            async def _expire_playlist(ch_id: int):
                 await asyncio.sleep(120)
-                removed = self.bot.pending_playlists.pop(msg_id, None)
-                # Also clean up channel reference
-                if self.bot.pending_playlists.get(f"channel_{ch_id}") == msg_id:
-                    self.bot.pending_playlists.pop(f"channel_{ch_id}", None)
+                removed = self.bot.pending_playlists.pop(str(ch_id), None)
                 if removed:
                     try:
                         expired_extra = (
                             f"📋 **{playlist_title}** had **{count}** more tracks.\n"
-                            f"~~React ✅ or type `{self.bot.command_prefix}loadall`~~ *(expired)*"
+                            f"~~Click Load Playlist Tracks~~ *(expired)*"
                         )
                         expired_embed = create_np_embed(self.bot, title, expired_extra)
-                        channel_obj = self.bot.get_channel(ch_id)
-                        if channel_obj:
-                            msg = await channel_obj.fetch_message(int(msg_id))
-                            await msg.edit(embed=expired_embed)
+                        # Re-send or re-edit... we just trigger an update
+                        await update_np_embed(self.bot, ch_id, expired_embed)
                     except Exception:
                         pass
 
-            asyncio.create_task(_expire_playlist(str(actual_msg_id), channel_id))
+            asyncio.create_task(_expire_playlist(channel_id))
             return
 
         # ---------------------------------------------------------------
@@ -421,18 +599,67 @@ class MusicCog(commands.Cog):
         user_id = str(ctx.author.id)
         channel_id = ctx.channel.id
 
-        if self.bot.player.is_playing:
-            track = Track(query=query, title="Resolving...", requested_by=user_id)
+        # Check if audio is actually playing (verify with voice client, not just the flag)
+        voice_actually_playing = (
+            self.bot.player.is_playing
+            and ctx.guild.voice_client
+            and ctx.guild.voice_client.is_playing()
+        )
+
+        if voice_actually_playing:
+            track = Track(query=query, title=query, requested_by=user_id)
             self.bot.queue.add(track)
-            await ctx.send(f"Added to queue: **{query}**")
+            
+            # Start background task to fetch actual title/thumbnail
+            asyncio.create_task(_resolve_track_info(self.bot, channel_id, track))
+
+            # Delete the user's command message to keep chat clean
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
+
+            # Rebuild and update the existing NP embed with the new queue
+            current = self.bot.queue.current
+            if current:
+                requester_name = f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else ""
+                embed = create_np_embed(
+                    self.bot,
+                    current.title,
+                    thumbnail=current.thumbnail,
+                    url=current.url,
+                    requester_name=requester_name,
+                    queue_tracks=self.bot.queue.preview_fair_order(),
+                )
+                await update_np_embed(self.bot, channel_id, embed)
         else:
+            # Delete the user's command message to keep chat clean
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
             status_msg = await ctx.send("▶️ Resolving...")
             try:
-                title = await self.bot.player.play(query)
-                embed = create_np_embed(self.bot, title)
+                info = await self.bot.player.play(query)
+                title = info["title"]
+                track_thumbnail = info.get("thumbnail", "")
+                track_url = info.get("webpage_url", "")
+
+                # Store as current track so queue-add updates can reference it
+                self.bot.queue.current = Track(
+                    query=query, title=title, requested_by=user_id,
+                    thumbnail=track_thumbnail, url=track_url,
+                )
+
+                requester_name = f"<@{user_id}>"
+
+                embed = create_np_embed(self.bot, title,
+                                        thumbnail=track_thumbnail,
+                                        url=track_url,
+                                        requester_name=requester_name,
+                                        queue_tracks=self.bot.queue.preview_fair_order())
                 await status_msg.delete()
                 await send_new_np(self.bot, channel_id, embed)
-                await update_channel_topic(self.bot, channel_id, f"▶️ Now playing: {title}")
                 _start_auto_next(self.bot, channel_id)
             except Exception as e:
                 await status_msg.edit(content=f"Error playing track: {e}")
@@ -468,7 +695,7 @@ class MusicCog(commands.Cog):
         self.bot.player.stop_playback()
         self.bot.queue.clear()
         await self.bot.player.disconnect()
-        await update_channel_topic(self.bot, ctx.channel.id, "Queue is empty.")
+
         await ctx.send("Stopped playback and left voice.")
 
     @commands.command(name="skip")
@@ -486,17 +713,23 @@ class MusicCog(commands.Cog):
         next_track = self.bot.queue.next()
         if next_track:
             try:
-                title = await self.bot.player.play(next_track.query)
+                info = await self.bot.player.play(next_track.query)
+                title = info["title"]
                 next_track.title = title
-                embed = create_np_embed(self.bot, title)
+                next_track.thumbnail = info.get("thumbnail", "")
+                next_track.url = info.get("webpage_url", "")
+                embed = create_np_embed(self.bot, title,
+                                        thumbnail=next_track.thumbnail,
+                                        url=next_track.url,
+                                        requester_name=_get_requester_name(self.bot, next_track.requested_by),
+                                        queue_tracks=self.bot.queue.preview_fair_order())
                 await ctx.send("Skipped.", delete_after=3)
                 await send_new_np(self.bot, channel_id, embed)
-                await update_channel_topic(self.bot, channel_id, f"▶️ Now playing: {title}")
                 _start_auto_next(self.bot, channel_id)
             except Exception as e:
                 await ctx.send(f"Error playing next track: {e}")
         else:
-            await update_channel_topic(self.bot, channel_id, "Queue is empty.")
+
             await ctx.send("Skipped. Queue is empty.")
 
     @commands.command(name="queue")
@@ -514,7 +747,10 @@ class MusicCog(commands.Cog):
             if self.bot.player.current_track_title:
                 lines.append(f"Now playing: **{self.bot.player.current_track_title}**")
             for i, t in enumerate(tracks, 1):
-                lines.append(f"{i}. {t.query}")
+                req_tag = ""
+                if t.requested_by:
+                    req_tag = f" — *<@{t.requested_by}>*"
+                lines.append(f"{i}. {t.title}{req_tag}")
             msg = "\n".join(lines)
         await ctx.send(msg)
 
@@ -522,25 +758,20 @@ class MusicCog(commands.Cog):
     async def loadall(self, ctx: commands.Context):
         """Load remaining playlist tracks from the most recent pending playlist."""
         channel_id = ctx.channel.id
-        msg_id = self.bot.pending_playlists.get(f"channel_{channel_id}")
-        if not msg_id:
+        pending = self.bot.pending_playlists.pop(str(channel_id), None)
+        
+        if not pending:
             await ctx.send("No pending playlist to load.")
             return
 
         if not await check_channel(ctx):
             return
 
-        pending = self.bot.pending_playlists.pop(msg_id, None)
-        self.bot.pending_playlists.pop(f"channel_{channel_id}", None)
-        if not pending:
-            await ctx.send("No pending playlist to load.")
-            return
-
         tracks = pending["tracks"]
         user_id = str(ctx.author.id)
 
         for t in tracks:
-            track = Track(query=t["url"], title=t["title"], requested_by=user_id)
+            track = Track(query=t["url"], title=t["title"], requested_by=user_id, url=t["url"])
             self.bot.queue.add(track)
 
         await ctx.send(f"📋 Added **{len(tracks)}** tracks to the queue.")
@@ -550,11 +781,17 @@ class MusicCog(commands.Cog):
             next_track = self.bot.queue.next()
             if next_track:
                 try:
-                    title = await self.bot.player.play(next_track.query)
+                    info = await self.bot.player.play(next_track.query)
+                    title = info["title"]
                     next_track.title = title
-                    embed = create_np_embed(self.bot, title)
+                    next_track.thumbnail = info.get("thumbnail", "")
+                    next_track.url = info.get("webpage_url", "")
+                    embed = create_np_embed(self.bot, title,
+                                            thumbnail=next_track.thumbnail,
+                                            url=next_track.url,
+                                            requester_name=f"<@{next_track.requested_by}>",
+                                            queue_tracks=self.bot.queue.preview_fair_order())
                     await send_new_np(self.bot, channel_id, embed)
-                    await update_channel_topic(self.bot, channel_id, f"▶️ Now playing: {title}")
                     _start_auto_next(self.bot, channel_id)
                 except Exception as e:
                     await ctx.send(f"Error playing track: {e}")
@@ -607,7 +844,7 @@ class MusicCog(commands.Cog):
         self.bot.player.stop_playback()
         self.bot.queue.clear()
         await self.bot.player.disconnect()
-        await update_channel_topic(self.bot, ctx.channel.id, "Queue is empty.")
+
         print("[main] Shutdown requested via command.")
         await self.bot.close()  # gracefully close gateway so bot goes offline immediately
         import os
@@ -711,44 +948,6 @@ class MusicCog(commands.Cog):
             f"`{p}shutdown` — Shut down the bot *(owner only)*"
         )
 
-    @commands.Cog.listener()
-    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
-        """Handle playlist confirmation reactions."""
-        if str(payload.emoji) != PLAYLIST_EMOJI:
-            return
-
-        # Ignore bot's own reaction
-        if payload.user_id == self.bot.user.id:
-            return
-
-        message_id = str(payload.message_id)
-        pending = self.bot.pending_playlists.get(message_id)
-        if not pending:
-            return
-
-        # Remove from pending so it can't be triggered twice
-        self.bot.pending_playlists.pop(message_id, None)
-        channel_id = pending["channel_id"]
-        if self.bot.pending_playlists.get(f"channel_{channel_id}") == message_id:
-            self.bot.pending_playlists.pop(f"channel_{channel_id}", None)
-
-        tracks = pending["tracks"]
-        if not tracks:
-            channel = self.bot.get_channel(channel_id)
-            if channel:
-                await channel.send("No remaining tracks to load.")
-            return
-
-        # Enqueue all remaining tracks
-        for t in tracks:
-            track = Track(query=t["url"], title=t["title"], requested_by=str(payload.user_id))
-            self.bot.queue.add(track)
-
-        channel = self.bot.get_channel(channel_id)
-        if channel:
-            await channel.send(f"📋 Added **{len(tracks)}** tracks to the queue.")
-
-
 def _start_auto_next(bot, channel_id):
     """Cancel any existing auto-next chain and start a fresh one."""
     bot.current_text_channel_id = channel_id
@@ -777,15 +976,21 @@ async def _auto_next(bot, channel_id, generation):
                 break  # something else started playing
             next_track = bot.queue.next()
             if not next_track:
-                await update_channel_topic(bot, channel_id, "Queue is empty.")
+
                 break  # queue empty
             try:
-                title = await bot.player.play(next_track.query)
+                info = await bot.player.play(next_track.query)
+                title = info["title"]
                 next_track.title = title
+                next_track.thumbnail = info.get("thumbnail", "")
+                next_track.url = info.get("webpage_url", "")
                 consecutive_errors = 0  # reset on success
-                embed = create_np_embed(bot, title)
+                embed = create_np_embed(bot, title,
+                                        thumbnail=next_track.thumbnail,
+                                        url=next_track.url,
+                                        requester_name=_get_requester_name(bot, next_track.requested_by),
+                                        queue_tracks=bot.queue.preview_fair_order())
                 await send_new_np(bot, channel_id, embed)
-                await update_channel_topic(bot, channel_id, f"▶️ Now playing: {title}")
             except Exception as e:
                 consecutive_errors += 1
                 channel = bot.get_channel(channel_id)

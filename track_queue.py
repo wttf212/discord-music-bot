@@ -7,12 +7,14 @@ class Track:
     query: str
     title: str
     requested_by: str
+    thumbnail: str = ""
+    url: str = ""
 
 
 class TrackQueue:
     def __init__(self):
         self._queue: deque[Track] = deque()
-        self._history: list[Track] = []
+        self._history = []
         self.current: Track | None = None
         self.fair_play: bool = True
         self.last_played_user: str | None = None
@@ -63,8 +65,34 @@ class TrackQueue:
         self.last_played_user = None
         self.fair_play = True
 
-    def list(self) -> list[Track]:
+    def list(self):
         return list(self._queue)
+
+    def preview_fair_order(self, limit: int = 10):
+        """Return up to 'limit' tracks in predicted fair-play order without mutating state.
+           Capped to prevent O(N^2) CPU locks causing interaction timeouts.
+        """
+        if not self.fair_play or len(self._queue) <= 1:
+            q_list = list(self._queue)
+            return q_list[:limit]
+
+        remaining = list(self._queue)
+        result = []
+        last_user = self.last_played_user
+
+        while remaining and len(result) < limit:
+            # Find first track by a different user
+            chosen_idx = 0
+            if last_user is not None:
+                for i, t in enumerate(remaining):
+                    if t.requested_by != last_user:
+                        chosen_idx = i
+                        break
+            chosen = remaining.pop(chosen_idx)
+            result.append(chosen)
+            last_user = chosen.requested_by
+
+        return result
 
     def is_empty(self) -> bool:
         return len(self._queue) == 0

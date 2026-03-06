@@ -98,8 +98,6 @@ def main():
         bot._current_guild_id = None
 
         if text_channel_id:
-            from commands import update_channel_topic
-            await update_channel_topic(bot, text_channel_id, "Queue is empty.")
             channel = bot.get_channel(text_channel_id)
             if channel:
                 await channel.send(message)

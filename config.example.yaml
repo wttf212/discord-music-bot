@@ -5,8 +5,8 @@ owner_id: "YOUR_DISCORD_USER_ID"
 
 youtube:
   # PO tokens are generated automatically by bgutil-pot (no manual config needed)
-  # web = PO token auth + JS signatures (via deno), android_vr = audio-only formats
-  client: "web,android_vr"
+  # using 'web' ensures PO tokens are always securely generated and attached
+  client: "web"
 
 ffmpeg_path: "ffmpeg"
 
