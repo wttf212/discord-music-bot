@@ -5,7 +5,9 @@ owner_id: "YOUR_DISCORD_USER_ID"
 
 youtube:
   # PO tokens are generated automatically by bgutil-pot (no manual config needed)
-  # using 'web' ensures PO tokens are always securely generated and attached
+  # 'web' provides best audio quality when bgutil attestation is working correctly.
+  # If you see "Combined video+audio format selected" warnings (bgutil attestation broken),
+  # try "web,android_vr" or just "android_vr" as a fallback — no PO token needed.
   client: "web"
 
 ffmpeg_path: "ffmpeg"
