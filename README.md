@@ -47,6 +47,17 @@ Copy `config.example.yaml` to `config.yaml` and fill in:
 | `debug` | Enable verbose logging |
 | `audio.bitrate` | Opus encoding bitrate in kbps (default: 128) |
 
+## Cookie Auth (Optional)
+
+Passing your YouTube visitor cookies reduces bot-detection on residential IPs.
+
+1. Export on the host: `yt-dlp --cookies-from-browser chrome -o /dev/null -- "https://www.youtube.com"`
+2. Place the resulting `cookies.txt` in the project root.
+3. Set `cookies_file: "/data/cookies.txt"` in `config.yaml` under the `youtube:` key.
+4. Docker: uncomment the `- ./cookies.txt:/data/cookies.txt` line in `docker-compose.yml`.
+
+Re-export every ~4 months. See `config.example.yaml` for full details.
+
 ## Commands
 
 | Command | Description |
