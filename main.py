@@ -87,6 +87,25 @@ def main():
         config = yaml.safe_load(f)
 
     token = config["bot_token"]
+
+    # --- COOKIE-02: cookies_file startup check ---
+    # Mirrors the TLS-01c guard pattern: warn and continue; never sys.exit().
+    # Per-play re-check in audio_player.py catches mid-session file changes.
+    _cookies_file = config.get("youtube", {}).get("cookies_file") or None
+    if _cookies_file:
+        import time as _time
+        if not os.path.isfile(_cookies_file):
+            print(f"[main] Warning: cookies_file '{_cookies_file}' does not exist — cookie auth disabled")
+        else:
+            _age_days = (_time.time() - os.path.getmtime(_cookies_file)) / 86400
+            if _age_days > 150:
+                print(
+                    f"[main] Warning: cookies_file is {int(_age_days)} days old (>150 days). "
+                    f"VISITOR_INFO1_LIVE may be expired — re-export cookies."
+                )
+            else:
+                print(f"[main] cookies_file found ({int(_age_days)} days old) — cookie auth enabled")
+
     bot = MusicBot(config)
 
     async def _do_empty_leave(bot, message: str):
