@@ -72,6 +72,17 @@ class MusicBot(commands.Bot):
 
 
 def main():
+    # --- TLS-01c: curl_cffi startup check ---
+    try:
+        import curl_cffi
+        print(f"[main] curl_cffi {curl_cffi.__version__} available — TLS impersonation enabled")
+    except ImportError:
+        print(
+            "[main] Warning: curl_cffi is not installed. "
+            "TLS impersonation will be DISABLED. "
+            "Install with: pip install 'yt-dlp[default,curl-cffi]'"
+        )
+
     with open("config.yaml", "r") as f:
         config = yaml.safe_load(f)
 
