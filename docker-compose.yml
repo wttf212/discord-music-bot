@@ -6,6 +6,8 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - bot-data:/data
+      # Optional: mount a cookies.txt file for YouTube visitor cookie auth (see config.example.yaml)
+      # - ./cookies.txt:/data/cookies.txt
     environment:
       - GUILD_SETTINGS_FILE=/data/guild_settings.json
 
