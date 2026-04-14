@@ -10,6 +10,17 @@ youtube:
   # try "web,android_vr" or just "android_vr" as a fallback — no PO token needed.
   client: "web"
 
+  # Optional: path to a Netscape-format cookies file exported from your browser.
+  # When set, VISITOR_INFO1_LIVE and SOCS cookies are sent with every yt-dlp request,
+  # reducing YouTube bot-detection on residential IPs and unlocking age-restricted content.
+  #
+  # Export command (run on the host, not inside Docker):
+  #   yt-dlp --cookies-from-browser chrome -o /dev/null -- "https://www.youtube.com"
+  # This writes cookies.txt in the current directory. Mount it at /data/cookies.txt in Docker.
+  # Re-export every ~4 months (VISITOR_INFO1_LIVE expires ~6 months; 150-day warning threshold).
+  #
+  # cookies_file: "/data/cookies.txt"
+
 ffmpeg_path: "ffmpeg"
 
 audio:
