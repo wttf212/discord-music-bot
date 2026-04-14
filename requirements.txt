@@ -1,5 +1,5 @@
 discord.py[voice]>=2.7.0
-yt-dlp[default]
+yt-dlp[default,curl-cffi]
 yt-dlp-ejs[all]
 pyyaml
 imageio-ffmpeg
