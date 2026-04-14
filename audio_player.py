@@ -89,6 +89,20 @@ def get_audio_url(query: str, client: str, debug: bool = False) -> dict:
     if not query.startswith(("http://", "https://")):
         query = f"ytsearch:{query}"
 
+    if _IMPERSONATE_AVAILABLE:
+        ydl_opts['impersonate'] = ImpersonateTarget('chrome')
+        # Warn if a non-browser API client is combined with browser TLS impersonation.
+        # android_vr + Chrome TLS = detectable contradiction to YouTube's anti-bot stack.
+        if is_yt and client and any(
+            c.strip().lower() in ('android_vr', 'android', 'android_music', 'ios')
+            for c in client.split(',')
+        ):
+            print(
+                f"[yt-dlp] WARNING: youtube_client='{client}' combined with "
+                f"--impersonate chrome. Non-browser API client + browser TLS fingerprint "
+                f"is a detectable contradiction. Consider switching to 'web' client."
+            )
+
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(query, download=False)
         if "entries" in info:
@@ -215,6 +229,17 @@ def _start_ytdlp_stream(query: str, client: str) -> subprocess.Popen:
                 "--extractor-args", f"youtubepot-bgutilcli:cli_path={bgutil_exe}",
                 "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:1",
             ]
+
+    if _IMPERSONATE_AVAILABLE:
+        cmd += ["--impersonate", "chrome"]
+        if is_yt and any(
+            c.strip().lower() in ('android_vr', 'android', 'android_music', 'ios')
+            for c in client.split(',')
+        ):
+            print(
+                f"[yt-dlp-pipe] WARNING: youtube_client='{client}' + --impersonate chrome: "
+                f"non-browser client contradicts browser TLS fingerprint."
+            )
 
     cmd.append(actual_query)
 
