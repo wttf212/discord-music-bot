@@ -13,6 +13,16 @@ if os.path.isdir(_plugin_dir) and _plugin_dir not in sys.path:
 
 from yt_dlp import YoutubeDL
 
+# TLS impersonation availability check (requires curl_cffi via yt-dlp[default,curl-cffi])
+# ImpersonateTarget is a pure-Python dataclass; the import always succeeds if yt-dlp is installed.
+# The `import curl_cffi` line verifies the actual network backend is present, not just the dataclass.
+try:
+    from yt_dlp.networking.impersonate import ImpersonateTarget
+    import curl_cffi  # noqa: F401 — verify the backend is present, not just the dataclass
+    _IMPERSONATE_AVAILABLE = True
+except ImportError:
+    _IMPERSONATE_AVAILABLE = False
+
 
 def _find_ffmpeg(config_path: str) -> str:
     """Resolve ffmpeg binary: config path > PATH > imageio_ffmpeg fallback."""
