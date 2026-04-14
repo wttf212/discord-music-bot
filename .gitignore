@@ -23,3 +23,7 @@ Thumbs.db
 
 # Test files
 _test_*.py
+
+# Local planning/codebase mapping (not for remote)
+.planning/
+.claude/
