@@ -4,6 +4,7 @@ import subprocess
 import sys
 import os
 import threading
+import time
 
 # Load bgutil PO token provider plugin for yt-dlp
 _base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -42,7 +43,7 @@ def _is_youtube(query: str) -> bool:
     return any(h in query for h in ("youtube.com", "youtu.be", "music.youtube.com"))
 
 
-def get_audio_url(query: str, client: str, debug: bool = False) -> dict:
+def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: str | None = None) -> dict:
     """Extract audio URL and title via yt-dlp. Supports YouTube, SoundCloud, and others."""
     ffmpeg_exe = _find_ffmpeg("ffmpeg")
     ydl_opts = {
@@ -102,6 +103,17 @@ def get_audio_url(query: str, client: str, debug: bool = False) -> dict:
                 f"--impersonate chrome. Non-browser API client + browser TLS fingerprint "
                 f"is a detectable contradiction. Consider switching to 'web' client."
             )
+
+    # COOKIE-01 / per-play re-check: pass operator-exported cookies to yt-dlp.
+    # Existence + mtime validated every call (cheap stat syscall; catches mid-session file deletion/refresh).
+    if cookies_file:
+        if not os.path.isfile(cookies_file):
+            print(f"[yt-dlp] Warning: cookies_file '{cookies_file}' not found — running without cookies")
+        else:
+            age_days = (time.time() - os.path.getmtime(cookies_file)) / 86400
+            if age_days > 150:
+                print(f"[yt-dlp] Warning: cookies_file is {int(age_days)} days old (>150) — may be stale")
+            ydl_opts['cookiefile'] = cookies_file
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(query, download=False)
@@ -199,7 +211,7 @@ def get_audio_url(query: str, client: str, debug: bool = False) -> dict:
         }
 
 
-def _start_ytdlp_stream(query: str, client: str) -> subprocess.Popen:
+def _start_ytdlp_stream(query: str, client: str, cookies_file: str | None = None) -> subprocess.Popen:
     """Start yt-dlp as a subprocess that pipes audio bytes to stdout.
 
     FFmpeg reads from this subprocess's stdout (pipe=True), so it never makes
@@ -240,6 +252,16 @@ def _start_ytdlp_stream(query: str, client: str) -> subprocess.Popen:
                 f"[yt-dlp-pipe] WARNING: youtube_client='{client}' + --impersonate chrome: "
                 f"non-browser client contradicts browser TLS fingerprint."
             )
+
+    # COOKIE-01 / per-play re-check (subprocess path) — mirrors get_audio_url logic.
+    if cookies_file:
+        if not os.path.isfile(cookies_file):
+            print(f"[yt-dlp-pipe] Warning: cookies_file '{cookies_file}' not found — running without cookies")
+        else:
+            age_days = (time.time() - os.path.getmtime(cookies_file)) / 86400
+            if age_days > 150:
+                print(f"[yt-dlp-pipe] Warning: cookies_file is {int(age_days)} days old (>150) — may be stale")
+            cmd += ["--cookies", cookies_file]
 
     cmd.append(actual_query)
 
@@ -365,6 +387,7 @@ class AudioPlayer:
             raise RuntimeError("Not connected to a voice channel")
 
         yt = self._config["youtube"]
+        cookies_file = yt.get("cookies_file") or None  # None if absent or empty string
         loop = asyncio.get_event_loop()
 
         self.stop_playback()
@@ -376,8 +399,8 @@ class AudioPlayer:
             print(f"[debug][player] Starting metadata extraction and yt-dlp stream in parallel")
 
         results = await asyncio.gather(
-            loop.run_in_executor(None, get_audio_url, url_or_query, yt["client"], self._debug),
-            loop.run_in_executor(None, _start_ytdlp_stream, url_or_query, yt["client"]),
+            loop.run_in_executor(None, get_audio_url, url_or_query, yt["client"], self._debug, cookies_file),
+            loop.run_in_executor(None, _start_ytdlp_stream, url_or_query, yt["client"], cookies_file),
             return_exceptions=True,
         )
         info_result, proc_result = results
