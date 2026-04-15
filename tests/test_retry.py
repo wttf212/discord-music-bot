@@ -357,23 +357,27 @@ class TestGetAudioUrlWithRetry(unittest.TestCase):
 # Call-site verification (source-level)
 # ---------------------------------------------------------------------------
 
+_AUDIO_PLAYER_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "audio_player.py"
+)
+
+
 class TestCallSite(unittest.TestCase):
 
+    @classmethod
+    def _read_source(cls) -> str:
+        with open(_AUDIO_PLAYER_PATH, encoding="utf-8") as fh:
+            return fh.read()
+
     def test_play_uses_get_audio_url_with_retry(self):
-        src = open(
-            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "audio_player.py"),
-            encoding="utf-8",
-        ).read()
+        src = self._read_source()
         self.assertIn("run_in_executor(None, get_audio_url_with_retry,", src,
                       "AudioPlayer.play() must use get_audio_url_with_retry, not get_audio_url")
         self.assertNotIn("run_in_executor(None, get_audio_url,", src,
                          "Old call site with bare get_audio_url must be removed")
 
     def test_no_retry_on_subprocess_path(self):
-        src = open(
-            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "audio_player.py"),
-            encoding="utf-8",
-        ).read()
+        src = self._read_source()
         self.assertNotIn("_start_ytdlp_stream_with_retry", src)
         self.assertNotIn("retry_with_backoff(_start_ytdlp_stream", src)
 

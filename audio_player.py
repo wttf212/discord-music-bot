@@ -1,10 +1,15 @@
 import asyncio
+import random
 import shutil
+import socket
 import subprocess
 import sys
 import os
 import threading
 import time
+from urllib.error import URLError
+
+from yt_dlp.utils import DownloadError
 
 # Load bgutil PO token provider plugin for yt-dlp
 _base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +46,109 @@ def _find_ffmpeg(config_path: str) -> str:
 
 def _is_youtube(query: str) -> bool:
     return any(h in query for h in ("youtube.com", "youtu.be", "music.youtube.com"))
+
+
+_NON_RETRYABLE_SUBSTRINGS = (
+    "video unavailable",
+    "sign in to confirm",
+    "confirm your age",
+    "age-restricted",
+    "age restricted",
+    "private video",
+    "this video has been removed",
+    "this video is not available",
+    "not available in your country",
+    "geo restricted",
+    "geo-blocked",
+    "members-only",
+    "members only",
+    "requires payment",
+    "copyright",
+    "this live event",
+)
+
+_RETRYABLE_SUBSTRINGS = (
+    "http error 429",
+    "too many requests",
+    "http error 5",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "remote end closed",
+    "timed out",
+    "read timed out",
+    "temporary failure in name resolution",
+)
+
+
+def _is_retryable_ytdlp_error(exc: BaseException) -> bool:
+    """Classify a yt-dlp (or connection-layer) exception as retryable or not.
+
+    Returns False for permanent policy errors that retrying would accelerate
+    IP bans on (video unavailable, sign-in required, age-restricted, geo-blocked).
+    Returns True for transient network/rate-limit errors and all ambiguous cases
+    (conservative: prefer retry over silent drop for unrecognised errors).
+    """
+    # Type-based retry: connection/timeout exceptions are always transient
+    if isinstance(exc, (ConnectionError, TimeoutError, socket.timeout, URLError)):
+        return True
+
+    # String-based classification (case-insensitive substring match)
+    msg = str(exc).lower()
+    if any(s in msg for s in _NON_RETRYABLE_SUBSTRINGS):
+        return False
+    if any(s in msg for s in _RETRYABLE_SUBSTRINGS):
+        return True
+    # Ambiguous → default to retryable (per security brief)
+    return True
+
+
+def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.0, jitter: float = 0.25, **kwargs):
+    """Retry a synchronous callable with exponential backoff + jitter.
+
+    Runs inside the executor thread — uses time.sleep (NOT asyncio.sleep).
+    Re-raises immediately on non-retryable errors to avoid accelerating IP bans
+    when YouTube returns a permanent policy error (video unavailable, sign-in,
+    age-restricted, geo-block).
+    """
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable_ytdlp_error(exc):
+                # Non-retryable: surface on attempt 1 with no sleep.
+                raise
+            if attempt == max_attempts - 1:
+                # Final attempt exhausted.
+                raise
+            exp_delay = base_delay * (2 ** attempt)
+            jitter_mult = random.uniform(1.0 - jitter, 1.0 + jitter)
+            sleep_seconds = exp_delay * jitter_mult
+            exc_class = type(exc).__name__
+            msg_preview = str(exc)[:80].replace("\n", " ")
+            print(
+                f"[retry] attempt {attempt + 1}/{max_attempts} failed: "
+                f"{exc_class}: {msg_preview} — sleeping {sleep_seconds:.1f}s"
+            )
+            time.sleep(sleep_seconds)
+    # Unreachable (loop always either returns or raises), but keep the invariant explicit.
+    raise last_exc  # type: ignore[misc]
+
+
+def get_audio_url_with_retry(query: str, client: str, debug: bool = False, cookies_file: str | None = None) -> dict:
+    """Retrying wrapper around get_audio_url (RETRY-01).
+
+    Retries on HTTP 429, 5xx, and connection-layer errors with exponential backoff
+    (3 attempts, base 5s, ±25% jitter). Surfaces video-unavailable / sign-in /
+    age-restricted / geo-blocked errors immediately — retrying those accelerates
+    IP bans.
+    """
+    return _retry_with_backoff(
+        get_audio_url, query, client, debug, cookies_file,
+        max_attempts=3, base_delay=5.0, jitter=0.25,
+    )
 
 
 def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: str | None = None) -> dict:
@@ -399,7 +507,7 @@ class AudioPlayer:
             print(f"[debug][player] Starting metadata extraction and yt-dlp stream in parallel")
 
         results = await asyncio.gather(
-            loop.run_in_executor(None, get_audio_url, url_or_query, yt["client"], self._debug, cookies_file),
+            loop.run_in_executor(None, get_audio_url_with_retry, url_or_query, yt["client"], self._debug, cookies_file),
             loop.run_in_executor(None, _start_ytdlp_stream, url_or_query, yt["client"], cookies_file),
             return_exceptions=True,
         )
