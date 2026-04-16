@@ -9,6 +9,9 @@ build/
 # Config (contains secrets)
 config.yaml
 
+# Per-guild runtime state (written by !bitrate, !settc, etc. — not source controlled)
+guild_settings.json
+
 # Platform-specific binaries (downloaded by setup script)
 bgutil-pot.exe
 bgutil-pot

@@ -65,6 +65,11 @@ _NON_RETRYABLE_SUBSTRINGS = (
     "requires payment",
     "copyright",
     "this live event",
+    # HTTP 4xx permanent errors — retrying these accelerates IP bans
+    "http error 403",
+    "forbidden",
+    "http error 401",
+    "http error 404",
 )
 
 _RETRYABLE_SUBSTRINGS = (
@@ -523,6 +528,15 @@ class AudioPlayer:
             raise info_result
         if isinstance(proc_result, Exception):
             raise proc_result
+
+        # Guard: subprocess may have exited during the metadata retry window.
+        # A dead Popen is not an Exception, so the isinstance guard above won't catch it —
+        # but FFmpeg would immediately read EOF from its stdout and silently skip the track.
+        if isinstance(proc_result, subprocess.Popen) and proc_result.poll() is not None:
+            stderr = proc_result.stderr.read().decode(errors="replace") if proc_result.stderr else ""
+            raise RuntimeError(
+                f"yt-dlp stream subprocess exited {proc_result.returncode} before playback started: {stderr[:500]}"
+            )
 
         info: dict = info_result
         self._ytdlp_proc: subprocess.Popen = proc_result

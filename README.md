@@ -51,10 +51,12 @@ Copy `config.example.yaml` to `config.yaml` and fill in:
 
 Passing your YouTube visitor cookies reduces bot-detection on residential IPs.
 
-1. Export on the host: `yt-dlp --cookies-from-browser chrome -o /dev/null -- "https://www.youtube.com"`
+1. Export on the host: `yt-dlp --cookies-from-browser chrome --cookies cookies.txt -o /dev/null -- "https://www.youtube.com"`
 2. Place the resulting `cookies.txt` in the project root.
-3. Set `cookies_file: "/data/cookies.txt"` in `config.yaml` under the `youtube:` key.
-4. Docker: uncomment the `- ./cookies.txt:/data/cookies.txt` line in `docker-compose.yml`.
+3. Set `cookies_file` in `config.yaml` under the `youtube:` key:
+   - **Native** (Windows/Linux/macOS): use the path to `cookies.txt` on your filesystem, e.g. `cookies_file: "./cookies.txt"`
+   - **Docker**: use `cookies_file: "/data/cookies.txt"` and uncomment the bind-mount in step 4.
+4. Docker only: uncomment the `- ./cookies.txt:/data/cookies.txt` line in `docker-compose.yml`.
 
 Re-export every ~4 months. See `config.example.yaml` for full details.
 

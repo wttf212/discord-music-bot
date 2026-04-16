@@ -15,8 +15,10 @@ youtube:
   # reducing YouTube bot-detection on residential IPs and unlocking age-restricted content.
   #
   # Export command (run on the host, not inside Docker):
-  #   yt-dlp --cookies-from-browser chrome -o /dev/null -- "https://www.youtube.com"
-  # This writes cookies.txt in the current directory. Mount it at /data/cookies.txt in Docker.
+  #   yt-dlp --cookies-from-browser chrome --cookies cookies.txt -o /dev/null -- "https://www.youtube.com"
+  # This writes cookies.txt in the current directory.
+  # Native: set cookies_file to the local path (e.g. "./cookies.txt").
+  # Docker: use "/data/cookies.txt" and mount ./cookies.txt:/data/cookies.txt in docker-compose.yml.
   # Re-export every ~4 months (VISITOR_INFO1_LIVE expires ~6 months; 150-day warning threshold).
   #
   # cookies_file: "/data/cookies.txt"

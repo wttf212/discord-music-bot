@@ -2,7 +2,7 @@ import asyncio
 import discord
 from discord.ext import commands
 from track_queue import Track
-from audio_player import is_playlist_url, extract_playlist_info, get_audio_url
+from audio_player import is_playlist_url, extract_playlist_info, get_audio_url_with_retry
 from guild_settings import get_allowed_channel, set_allowed_channel, get_bitrate, set_bitrate, get_admins, add_admin, remove_admin
 
 
@@ -160,8 +160,9 @@ async def _resolve_track_info(bot, channel_id: int, track: Track):
         return
     try:
         yt_client = bot.config.get("youtube", {}).get("client", "web")
+        cookies_file = bot.config.get("youtube", {}).get("cookies_file") or None
         info = await asyncio.get_event_loop().run_in_executor(
-            None, get_audio_url, track.query, yt_client
+            None, get_audio_url_with_retry, track.query, yt_client, False, cookies_file
         )
         track.title = info["title"]
         track.thumbnail = info.get("thumbnail", "")
