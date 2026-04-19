@@ -73,3 +73,73 @@ def remove_admin(guild_id: str, user_id: str):
         admins.remove(user_id)
         settings[guild_id]["admins"] = admins
         save_settings(settings)
+
+
+# --- EQ persistence (Phase 07) -------------------------------------------
+
+EQ_BASS_MIN = -10
+EQ_BASS_MAX = 10
+EQ_TREBLE_MIN = -10
+EQ_TREBLE_MAX = 10
+
+# Canonical preset table. Keys are lowercase preset names used by !eq <preset>.
+# Values are (bass_db, treble_db) integer tuples. Per CONTEXT D-05.
+EQ_PRESETS: dict[str, tuple[int, int]] = {
+    "flat": (0, 0),
+    "bass-boost": (5, 0),
+    "treble-boost": (0, 5),
+    "vocal": (-2, 3),
+}
+
+
+def _validate_eq_db(value: int, band: str) -> None:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(
+            f"EQ {band} must be an integer between {EQ_BASS_MIN} and {EQ_BASS_MAX} dB"
+        )
+    if value < EQ_BASS_MIN or value > EQ_BASS_MAX:
+        raise ValueError(
+            f"EQ {band} must be between {EQ_BASS_MIN} and {EQ_BASS_MAX} dB (got {value})"
+        )
+
+
+def get_eq_bass(guild_id: str) -> int:
+    """Return stored bass gain in dB for this guild (default 0 = flat)."""
+    settings = load_settings()
+    guild = settings.get(guild_id, {})
+    return int(guild.get("eq_bass", 0))
+
+
+def set_eq_bass(guild_id: str, db: int):
+    """Persist bass gain in dB. Raises ValueError if outside -10..+10 integer range."""
+    _validate_eq_db(db, "bass")
+    settings = load_settings()
+    if guild_id not in settings:
+        settings[guild_id] = {}
+    settings[guild_id]["eq_bass"] = db
+    save_settings(settings)
+
+
+def get_eq_treble(guild_id: str) -> int:
+    """Return stored treble gain in dB for this guild (default 0 = flat)."""
+    settings = load_settings()
+    guild = settings.get(guild_id, {})
+    return int(guild.get("eq_treble", 0))
+
+
+def set_eq_treble(guild_id: str, db: int):
+    """Persist treble gain in dB. Raises ValueError if outside -10..+10 integer range."""
+    _validate_eq_db(db, "treble")
+    settings = load_settings()
+    if guild_id not in settings:
+        settings[guild_id] = {}
+    settings[guild_id]["eq_treble"] = db
+    save_settings(settings)
+
+
+def get_eq_preset_name(bass: int, treble: int) -> str:
+    """Return the preset name whose (bass, treble) matches, or 'custom' if none match."""
+    for name, (b, t) in EQ_PRESETS.items():
+        if b == bass and t == treble:
+            return name
+    return "custom"
