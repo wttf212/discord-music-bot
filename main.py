@@ -2,6 +2,7 @@ import asyncio
 import os
 import sys
 import yaml
+from dataclasses import dataclass, field
 
 # Load bgutil PO token provider plugin for yt-dlp (must be done before yt-dlp is imported)
 # This enables dynamic PO token generation to prevent YouTube IP bans
@@ -41,6 +42,23 @@ from audio_player import AudioPlayer
 from track_queue import TrackQueue
 
 
+@dataclass
+class GuildState:
+    """All per-guild mutable state. One instance per guild, created on first use."""
+    player: AudioPlayer
+    queue: TrackQueue
+    auto_next_task: asyncio.Task | None = None
+    auto_next_gen: int = 0
+    empty_channel_task: asyncio.Task | None = None
+    np_message_id: int | None = None
+    current_text_channel_id: int | None = None
+    fairness_pct: int = 50
+    prev_votes: set = field(default_factory=set)
+    playpause_votes: set = field(default_factory=set)
+    stop_votes: set = field(default_factory=set)
+    next_votes: set = field(default_factory=set)
+
+
 class MusicBot(commands.Bot):
     def __init__(self, config: dict):
         intents = discord.Intents.default()
@@ -56,14 +74,17 @@ class MusicBot(commands.Bot):
         )
 
         self.config = config
-        self.player = AudioPlayer(config)
-        self.queue = TrackQueue()
-        self.pending_playlists: dict = {}  # message_id -> playlist info
-        self._auto_next_task: asyncio.Task | None = None  # prevent duplicate chains
-        self._auto_next_gen: int = 0
-        self._empty_channel_task: asyncio.Task | None = None  # 1-min leave timer
-        self._current_guild_id: int | None = None
-        self.current_text_channel_id: int | None = None
+        self._guild_states: dict[int, GuildState] = {}
+        self.pending_playlists: dict = {}  # channel_id (str) -> playlist info; channel IDs are globally unique
+
+    def get_guild_state(self, guild_id: int) -> GuildState:
+        """Return (or lazily create) per-guild state for the given guild."""
+        if guild_id not in self._guild_states:
+            self._guild_states[guild_id] = GuildState(
+                player=AudioPlayer(self.config),
+                queue=TrackQueue(),
+            )
+        return self._guild_states[guild_id]
 
     async def setup_hook(self):
         """Called when the bot is starting up — load cogs here."""
@@ -109,27 +130,26 @@ def main():
     bot = MusicBot(config)
 
     async def _do_empty_leave(bot, guild_id: int, message: str):
-        """Shared teardown: stop playback, clear queue, disconnect, and send a message."""
-        text_channel_id = bot.current_text_channel_id
+        """Shared teardown for one guild: stop playback, clear queue, disconnect, send message."""
+        gs = bot.get_guild_state(guild_id)
+        text_channel_id = gs.current_text_channel_id
 
-        bot.queue.clear()
-        bot.player.stop_playback()
-        bot._auto_next_gen = getattr(bot, '_auto_next_gen', 0) + 1
-        if bot._auto_next_task and not bot._auto_next_task.done():
-            bot._auto_next_task.cancel()
-            bot._auto_next_task = None
-        bot._empty_channel_task = None
+        gs.queue.clear()
+        gs.player.stop_playback()
+        gs.auto_next_gen += 1
+        if gs.auto_next_task and not gs.auto_next_task.done():
+            gs.auto_next_task.cancel()
+            gs.auto_next_task = None
+        gs.empty_channel_task = None
 
-        # Disconnect only the voice client for this specific guild
+        # Disconnect only this guild's voice client
         guild = bot.get_guild(guild_id)
         vc = guild.voice_client if guild else None
         if vc and vc.is_connected():
             await vc.disconnect()
-        if bot._current_guild_id == guild_id:
-            bot._current_guild_id = None
-        if (bot.player._voice_client and hasattr(bot.player._voice_client, 'guild')
-                and bot.player._voice_client.guild.id == guild_id):
-            bot.player._voice_client = None
+        if (gs.player._voice_client and hasattr(gs.player._voice_client, 'guild')
+                and gs.player._voice_client.guild.id == guild_id):
+            gs.player._voice_client = None
 
         if text_channel_id:
             channel = bot.get_channel(text_channel_id)
@@ -154,13 +174,16 @@ def main():
         if members:
             return
 
+        guild_id = voice_client.guild.id
+        gs = bot.get_guild_state(guild_id)
+
         # If music is playing, start a 1-minute timeout instead of leaving immediately
-        if bot.player.is_playing:
-            if not (bot._empty_channel_task and not bot._empty_channel_task.done()):
-                bot._empty_channel_task = asyncio.create_task(_leave_after_timeout(bot, voice_client))
+        if gs.player.is_playing:
+            if not (gs.empty_channel_task and not gs.empty_channel_task.done()):
+                gs.empty_channel_task = asyncio.create_task(_leave_after_timeout(bot, voice_client))
             return
 
-        await _do_empty_leave(bot, voice_client.guild.id, "Everyone left the voice channel. Leaving.")
+        await _do_empty_leave(bot, guild_id, "Everyone left the voice channel. Leaving.")
 
     @bot.event
     async def on_ready():
@@ -191,9 +214,11 @@ def main():
 
         # Someone joined the bot's channel — cancel pending leave
         if is_in_bot_channel and not member.bot:
-            if bot._empty_channel_task and not bot._empty_channel_task.done():
-                bot._empty_channel_task.cancel()
-                bot._empty_channel_task = None
+            guild_id = member.guild.id
+            gs = bot.get_guild_state(guild_id)
+            if gs.empty_channel_task and not gs.empty_channel_task.done():
+                gs.empty_channel_task.cancel()
+                gs.empty_channel_task = None
 
     try:
         bot.run(token)
