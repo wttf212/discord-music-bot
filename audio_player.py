@@ -181,8 +181,14 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
         # initial attestation") and falls back to weak tokens that only unlock format 18.
         # The CLI (bgutil-pot.exe) uses its own Rust implementation of the PPA algorithm
         # and does NOT need webpage attestation — its tokens unlock audio-only streams.
-        bgutil_exe = os.path.join(_base_dir, "bgutil-pot.exe")
-        if os.path.isfile(bgutil_exe):
+        bgutil_exe = next(
+            (p for p in (
+                os.path.join(_base_dir, "bgutil-pot.exe"),
+                os.path.join(_base_dir, "bgutil-pot"),
+            ) if os.path.isfile(p)),
+            None,
+        )
+        if bgutil_exe:
             ydl_opts["extractor_args"]["youtubepot-bgutilcli"] = {
                 "cli_path": [bgutil_exe]
             }
@@ -334,7 +340,13 @@ def _start_ytdlp_stream(query: str, client: str, cookies_file: str | None = None
     is_yt = _is_youtube(query) or not query.startswith(("http://", "https://"))
     actual_query = f"ytsearch:{query}" if not query.startswith(("http://", "https://")) else query
 
-    bgutil_exe = os.path.join(_base_dir, "bgutil-pot.exe")
+    bgutil_exe = next(
+        (p for p in (
+            os.path.join(_base_dir, "bgutil-pot.exe"),
+            os.path.join(_base_dir, "bgutil-pot"),
+        ) if os.path.isfile(p)),
+        None,
+    )
 
     cmd = [
         sys.executable, "-m", "yt_dlp",
@@ -348,7 +360,7 @@ def _start_ytdlp_stream(query: str, client: str, cookies_file: str | None = None
 
     if is_yt:
         cmd += ["--extractor-args", f"youtube:player_client={client}"]
-        if os.path.isfile(bgutil_exe):
+        if bgutil_exe:
             # Force CLI provider (avoids broken HTTP server attestation)
             cmd += [
                 "--extractor-args", f"youtubepot-bgutilcli:cli_path={bgutil_exe}",
