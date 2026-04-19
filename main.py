@@ -108,7 +108,7 @@ def main():
 
     bot = MusicBot(config)
 
-    async def _do_empty_leave(bot, message: str):
+    async def _do_empty_leave(bot, guild_id: int, message: str):
         """Shared teardown: stop playback, clear queue, disconnect, and send a message."""
         text_channel_id = bot.current_text_channel_id
 
@@ -120,12 +120,16 @@ def main():
             bot._auto_next_task = None
         bot._empty_channel_task = None
 
-        # Disconnect voice
-        for vc in bot.voice_clients:
-            if vc.is_connected():
-                await vc.disconnect()
-        bot.player._voice_client = None
-        bot._current_guild_id = None
+        # Disconnect only the voice client for this specific guild
+        guild = bot.get_guild(guild_id)
+        vc = guild.voice_client if guild else None
+        if vc and vc.is_connected():
+            await vc.disconnect()
+        if bot._current_guild_id == guild_id:
+            bot._current_guild_id = None
+        if (bot.player._voice_client and hasattr(bot.player._voice_client, 'guild')
+                and bot.player._voice_client.guild.id == guild_id):
+            bot.player._voice_client = None
 
         if text_channel_id:
             channel = bot.get_channel(text_channel_id)
@@ -140,7 +144,7 @@ def main():
         members = [m for m in voice_client.channel.members if not m.bot]
         if members:
             return  # someone rejoined
-        await _do_empty_leave(bot, "No one in the voice channel for 1 minute. Leaving.")
+        await _do_empty_leave(bot, voice_client.guild.id, "No one in the voice channel for 1 minute. Leaving.")
 
     async def _handle_empty_channel(bot, voice_client):
         if not voice_client.is_connected():
@@ -156,7 +160,7 @@ def main():
                 bot._empty_channel_task = asyncio.create_task(_leave_after_timeout(bot, voice_client))
             return
 
-        await _do_empty_leave(bot, "Everyone left the voice channel. Leaving.")
+        await _do_empty_leave(bot, voice_client.guild.id, "Everyone left the voice channel. Leaving.")
 
     @bot.event
     async def on_ready():

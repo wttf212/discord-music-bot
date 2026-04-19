@@ -12,9 +12,10 @@ PLAYLIST_EMOJI = "\u2705"  # ✅
 def create_np_embed(bot, title: str, extra_desc: str = "",
                     thumbnail: str = "", url: str = "",
                     requester_name: str = "",
-                    queue_tracks: list | None = None) -> discord.Embed:
+                    queue_tracks: list | None = None,
+                    guild_id: int | None = None) -> discord.Embed:
     """Creates an embed for Now Playing with thumbnail, link, and queue preview."""
-    kbps = bot.player._audio_bitrate // 1000
+    kbps = bot.player.get_bitrate_for_guild(guild_id) // 1000
     p = bot.command_prefix
 
     # Make the title a clickable link if we have a URL
@@ -144,8 +145,9 @@ class LoadPlaylistButton(discord.ui.Button):
                                     thumbnail=current.thumbnail,
                                     url=current.url,
                                     requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
-                                    queue_tracks=self.bot.queue.preview_fair_order())
-            
+                                    queue_tracks=self.bot.queue.preview_fair_order(),
+                                    guild_id=interaction.guild_id)
+
             view = _create_player_controls(self.bot, self.channel_id)
             await interaction.message.edit(embed=embed, view=view)
             
@@ -172,6 +174,8 @@ async def _resolve_track_info(bot, channel_id: int, track: Track):
         current = bot.queue.current
         if current:
             requester_name = _get_requester_name(bot, current.requested_by)
+            _ch = bot.get_channel(channel_id)
+            _gid = _ch.guild.id if _ch and hasattr(_ch, 'guild') and _ch.guild else None
             embed = create_np_embed(
                 bot,
                 current.title,
@@ -179,6 +183,7 @@ async def _resolve_track_info(bot, channel_id: int, track: Track):
                 url=current.url,
                 requester_name=requester_name,
                 queue_tracks=bot.queue.preview_fair_order(),
+                guild_id=_gid,
             )
             update_np_embed(bot, channel_id, embed)
     except Exception as e:
@@ -314,7 +319,8 @@ class PlayerControls(discord.ui.View):
                                     thumbnail=prev_track.thumbnail,
                                     url=prev_track.url,
                                     requester_name=_get_requester_name(self.bot, prev_track.requested_by),
-                                    queue_tracks=self.bot.queue.preview_fair_order())
+                                    queue_tracks=self.bot.queue.preview_fair_order(),
+                                    guild_id=interaction.guild_id)
             await send_new_np(self.bot, self.channel_id, embed)
             _start_auto_next(self.bot, self.channel_id)
         except Exception as e:
@@ -373,7 +379,8 @@ class PlayerControls(discord.ui.View):
                                         thumbnail=next_track.thumbnail,
                                         url=next_track.url,
                                         requester_name=_get_requester_name(self.bot, next_track.requested_by),
-                                        queue_tracks=self.bot.queue.preview_fair_order())
+                                        queue_tracks=self.bot.queue.preview_fair_order(),
+                                        guild_id=interaction.guild_id)
                 await send_new_np(self.bot, self.channel_id, embed)
                 _start_auto_next(self.bot, self.channel_id)
             except Exception as e:
@@ -485,7 +492,8 @@ class MusicCog(commands.Cog):
                                             thumbnail=current.thumbnail,
                                             url=current.url,
                                             requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
-                                            queue_tracks=self.bot.queue.preview_fair_order())
+                                            queue_tracks=self.bot.queue.preview_fair_order(),
+                                            guild_id=ctx.guild.id)
                     await status_msg.delete()
                     await update_np_embed(self.bot, channel_id, embed)
             
@@ -499,7 +507,7 @@ class MusicCog(commands.Cog):
                         # Restore saved bitrate for this guild
                         saved_br = get_bitrate(guild_id)
                         if saved_br:
-                            await self.bot.player.set_bitrate(saved_br)
+                            await self.bot.player.set_bitrate(ctx.guild.id, saved_br)
                     except Exception as e:
                         await status_msg.edit(content=f"Failed to join voice channel: {e}")
                         return
@@ -524,7 +532,8 @@ class MusicCog(commands.Cog):
                                             thumbnail=track_thumbnail,
                                             url=track_url,
                                             requester_name=f"<@{user_id}>",
-                                            queue_tracks=self.bot.queue.preview_fair_order())
+                                            queue_tracks=self.bot.queue.preview_fair_order(),
+                                            guild_id=ctx.guild.id)
                     await status_msg.delete()
                     await send_new_np(self.bot, channel_id, embed)
                     _start_auto_next(self.bot, channel_id)
@@ -540,7 +549,8 @@ class MusicCog(commands.Cog):
                                         thumbnail=track_thumbnail,
                                         url=track_url,
                                         requester_name=f"<@{user_id}>",
-                                        queue_tracks=self.bot.queue.preview_fair_order())
+                                        queue_tracks=self.bot.queue.preview_fair_order(),
+                                        guild_id=ctx.guild.id)
                 await status_msg.delete()
                 await send_new_np(self.bot, channel_id, embed)
 
@@ -570,7 +580,7 @@ class MusicCog(commands.Cog):
                             f"📋 **{playlist_title}** had **{count}** more tracks.\n"
                             f"~~Click Load Playlist Tracks~~ *(expired)*"
                         )
-                        expired_embed = create_np_embed(self.bot, title, expired_extra)
+                        expired_embed = create_np_embed(self.bot, title, expired_extra, guild_id=ctx.guild.id)
                         # Re-send or re-edit... we just trigger an update
                         await update_np_embed(self.bot, ch_id, expired_embed)
                     except Exception:
@@ -592,7 +602,7 @@ class MusicCog(commands.Cog):
                 # Restore saved bitrate for this guild
                 saved_br = get_bitrate(guild_id)
                 if saved_br:
-                    await self.bot.player.set_bitrate(saved_br)
+                    await self.bot.player.set_bitrate(ctx.guild.id, saved_br)
             except Exception as e:
                 await ctx.send(f"Failed to join voice channel: {e}")
                 return
@@ -631,6 +641,7 @@ class MusicCog(commands.Cog):
                     url=current.url,
                     requester_name=requester_name,
                     queue_tracks=self.bot.queue.preview_fair_order(),
+                    guild_id=ctx.guild.id,
                 )
                 await update_np_embed(self.bot, channel_id, embed)
         else:
@@ -658,7 +669,8 @@ class MusicCog(commands.Cog):
                                         thumbnail=track_thumbnail,
                                         url=track_url,
                                         requester_name=requester_name,
-                                        queue_tracks=self.bot.queue.preview_fair_order())
+                                        queue_tracks=self.bot.queue.preview_fair_order(),
+                                        guild_id=ctx.guild.id)
                 await status_msg.delete()
                 await send_new_np(self.bot, channel_id, embed)
                 _start_auto_next(self.bot, channel_id)
@@ -723,7 +735,8 @@ class MusicCog(commands.Cog):
                                         thumbnail=next_track.thumbnail,
                                         url=next_track.url,
                                         requester_name=_get_requester_name(self.bot, next_track.requested_by),
-                                        queue_tracks=self.bot.queue.preview_fair_order())
+                                        queue_tracks=self.bot.queue.preview_fair_order(),
+                                        guild_id=ctx.guild.id)
                 await ctx.send("Skipped.", delete_after=3)
                 await send_new_np(self.bot, channel_id, embed)
                 _start_auto_next(self.bot, channel_id)
@@ -791,7 +804,8 @@ class MusicCog(commands.Cog):
                                             thumbnail=next_track.thumbnail,
                                             url=next_track.url,
                                             requester_name=f"<@{next_track.requested_by}>",
-                                            queue_tracks=self.bot.queue.preview_fair_order())
+                                            queue_tracks=self.bot.queue.preview_fair_order(),
+                                            guild_id=ctx.guild.id)
                     await send_new_np(self.bot, channel_id, embed)
                     _start_auto_next(self.bot, channel_id)
                 except Exception as e:
@@ -802,7 +816,7 @@ class MusicCog(commands.Cog):
         if not await check_channel(ctx):
             return
 
-        current_kbps = self.bot.player._audio_bitrate // 1000
+        current_kbps = self.bot.player.get_bitrate_for_guild(ctx.guild.id if ctx.guild else None) // 1000
 
         if not kbps:
             await ctx.send(f"Current audio bitrate: **{current_kbps} kbps**. Usage: `{self.bot.command_prefix}bitrate <1-512>` (higher values may improve quality)")
@@ -822,9 +836,8 @@ class MusicCog(commands.Cog):
             await ctx.send("Bitrate must be at least 1 kbps.")
             return
 
-        await self.bot.player.set_bitrate(kbps_int)
-        # Persist per-guild
         if ctx.guild:
+            await self.bot.player.set_bitrate(ctx.guild.id, kbps_int)
             set_bitrate(str(ctx.guild.id), kbps_int)
         await ctx.send(f"Audio bitrate set to **{kbps_int} kbps** (saved).")
 
@@ -986,11 +999,14 @@ async def _auto_next(bot, channel_id, generation):
                 next_track.thumbnail = info.get("thumbnail", "")
                 next_track.url = info.get("webpage_url", "")
                 consecutive_errors = 0  # reset on success
+                _ch = bot.get_channel(channel_id)
+                _gid = _ch.guild.id if _ch and hasattr(_ch, 'guild') and _ch.guild else None
                 embed = create_np_embed(bot, title,
                                         thumbnail=next_track.thumbnail,
                                         url=next_track.url,
                                         requester_name=_get_requester_name(bot, next_track.requested_by),
-                                        queue_tracks=bot.queue.preview_fair_order())
+                                        queue_tracks=bot.queue.preview_fair_order(),
+                                        guild_id=_gid)
                 await send_new_np(bot, channel_id, embed)
             except Exception as e:
                 consecutive_errors += 1

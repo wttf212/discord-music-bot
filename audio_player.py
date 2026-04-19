@@ -484,17 +484,24 @@ class AudioPlayer:
         self._channels = config["audio"]["channels"]
         self._ffmpeg_path = _find_ffmpeg(config.get("ffmpeg_path", "ffmpeg"))
         self._debug = config.get("debug", False)
-        self._audio_bitrate: int = config["audio"].get("bitrate", 128) * 1000
+        self._default_bitrate: int = config["audio"].get("bitrate", 128) * 1000
+        self._guild_bitrates: dict[int, int] = {}
 
         if self._debug:
             print(f"[debug][player] Initialized AudioPlayer")
             print(f"[debug][player]   sample_rate={self._sample_rate}, channels={self._channels}")
             print(f"[debug][player]   ffmpeg_path={self._ffmpeg_path}")
-            print(f"[debug][player]   bitrate={self._audio_bitrate // 1000} kbps")
+            print(f"[debug][player]   bitrate={self._default_bitrate // 1000} kbps (default)")
 
     def set_voice_client(self, voice_client):
         """Set the discord.py VoiceClient (called when bot joins a voice channel)."""
         self._voice_client = voice_client
+
+    def get_bitrate_for_guild(self, guild_id: int | None) -> int:
+        """Return per-guild bitrate in bps, falling back to the config default."""
+        if guild_id is not None:
+            return self._guild_bitrates.get(guild_id, self._default_bitrate)
+        return self._default_bitrate
 
     async def play(self, url_or_query: str) -> dict:
         """Resolve a URL/query and start playback. Returns dict with title, thumbnail, webpage_url.
@@ -618,13 +625,15 @@ class AudioPlayer:
         encoder = getattr(self._voice_client, 'encoder', None)
         if encoder:
             try:
+                guild_id = self._voice_client.guild.id if hasattr(self._voice_client, 'guild') else None
+                bitrate_bps = self.get_bitrate_for_guild(guild_id)
                 encoder.set_signal_type('music')
                 encoder.set_fec(False)
                 encoder.set_expected_packet_loss_percent(0.01)
-                encoder.set_bitrate(self._audio_bitrate // 1000)
+                encoder.set_bitrate(bitrate_bps // 1000)
                 encoder.set_bandwidth('full')
                 if self._debug:
-                    print(f"[debug][player] Opus encoder: signal=music, bitrate={self._audio_bitrate // 1000}kbps, FEC=off, PLP=0%, bandwidth=full")
+                    print(f"[debug][player] Opus encoder: signal=music, bitrate={bitrate_bps // 1000}kbps, FEC=off, PLP=0%, bandwidth=full")
             except Exception as e:
                 if self._debug:
                     print(f"[debug][player] Could not configure opus encoder: {e}")
@@ -673,12 +682,14 @@ class AudioPlayer:
         if self.is_playing:
             await self._playback_done.wait()
 
-    async def set_bitrate(self, kbps: int):
-        """Update the Opus encoding bitrate."""
-        self._audio_bitrate = kbps * 1000
-        if self._voice_client and hasattr(self._voice_client, 'encoder') and self._voice_client.encoder:
+    async def set_bitrate(self, guild_id: int, kbps: int):
+        """Update the Opus encoding bitrate for a specific guild."""
+        self._guild_bitrates[guild_id] = kbps * 1000
+        # Only apply live to the encoder if this guild's voice client is currently active
+        vc_guild_id = self._voice_client.guild.id if (self._voice_client and hasattr(self._voice_client, 'guild')) else None
+        if vc_guild_id == guild_id and hasattr(self._voice_client, 'encoder') and self._voice_client.encoder:
             try:
-                self._voice_client.encoder.set_bitrate(kbps)  # encoder expects kbps, not bps
+                self._voice_client.encoder.set_bitrate(kbps)
             except Exception as e:
                 if self._debug:
                     print(f"[debug][player] Could not set encoder bitrate: {e}")
