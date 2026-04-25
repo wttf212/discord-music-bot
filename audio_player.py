@@ -31,14 +31,18 @@ except ImportError:
 
 
 def _build_ffmpeg_af_options(bass_db: int, treble_db: int) -> str:
-    """Return the FFmpeg `-af` flag (with its filter argument) for the given EQ,
+    """Return the bare FFmpeg filter chain string for the given EQ,
     or an empty string when both bands are 0 dB (flat — no filter needed).
+
+    The caller is responsible for prepending '-af ' before passing to FFmpegPCMAudio.
+    No shell quoting — FFmpegPCMAudio uses shlex.split internally, so embedded
+    quotes would become literal characters and corrupt the filter graph.
 
     Examples:
         (0, 0)   -> ""
-        (5, 0)   -> '-af "bass=g=5"'
-        (0, -3)  -> '-af "treble=g=-3"'
-        (5, -2)  -> '-af "bass=g=5,treble=g=-2"'
+        (5, 0)   -> "bass=g=5,alimiter=level_out=0.9:attack=5:release=50"
+        (0, -3)  -> "treble=g=-3,alimiter=level_out=0.9:attack=5:release=50"
+        (5, -2)  -> "bass=g=5,treble=g=-2,alimiter=level_out=0.9:attack=5:release=50"
     """
     parts: list[str] = []
     if bass_db != 0:
@@ -49,7 +53,7 @@ def _build_ffmpeg_af_options(bass_db: int, treble_db: int) -> str:
         return ""
     # alimiter prevents clipping when EQ boosts push peaks above 0 dBFS
     parts.append("alimiter=level_out=0.9:attack=5:release=50")
-    return '-af "' + ",".join(parts) + '"'
+    return ",".join(parts)
 
 
 def _find_ffmpeg(config_path: str) -> str:
@@ -618,7 +622,7 @@ class AudioPlayer:
         guild_id_for_eq = self._voice_client.guild.id if (self._voice_client and hasattr(self._voice_client, 'guild')) else None
         eq_bass, eq_treble = self.get_eq_for_guild(guild_id_for_eq)
         af_flag = _build_ffmpeg_af_options(eq_bass, eq_treble)
-        ffmpeg_options = "-vn" if not af_flag else f"-vn {af_flag}"
+        ffmpeg_options = "-vn" if not af_flag else f"-vn -af {af_flag}"
         if self._debug:
             print(f"[debug][player] FFmpeg options: {ffmpeg_options}")
         source = discord.FFmpegPCMAudio(
