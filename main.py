@@ -90,6 +90,9 @@ class MusicBot(commands.Bot):
         """Called when the bot is starting up — load cogs here."""
         from commands import setup
         await setup(self)
+        await self.tree.sync()  # Register slash commands globally (D-03; up to 1hr propagation)
+        # Development alternative for instant propagation:
+        # await self.tree.sync(guild=discord.Object(id=YOUR_GUILD_ID))
 
 
 def main():

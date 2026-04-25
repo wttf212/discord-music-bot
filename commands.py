@@ -651,7 +651,8 @@ class MusicCog(commands.Cog):
         set_allowed_channel(guild_id, channel_id)
         await ctx.send(f"Commands are now restricted to <#{channel_id}>.")
 
-    @commands.command(name="play")
+    @commands.hybrid_command(name="play", description="Play a song or search YouTube")
+    @app_commands.describe(query="Song name or URL to play")
     async def play(self, ctx: commands.Context, *, query: str = None):
         if not await check_channel(ctx):
             return
@@ -667,6 +668,31 @@ class MusicCog(commands.Cog):
         voice_channel = ctx.author.voice.channel
         guild_id = str(ctx.guild.id)
         gs = self.bot.get_guild_state(ctx.guild.id)
+
+        # ---------------------------------------------------------------
+        # Search picker flow (D-08: plain text → picker, URL → bypass)
+        # ---------------------------------------------------------------
+        # Strip bare "ytsearch:" prefix so embed title shows the raw query (D-08)
+        query = _strip_ytsearch_prefix(query)
+
+        if _is_search_query(query):
+            # Extend slash command 3-second response window (no-op for prefix)
+            await ctx.defer()
+            status_msg = await ctx.send("🔍 Searching...")
+            try:
+                results = await asyncio.get_event_loop().run_in_executor(
+                    None, _search_youtube, query
+                )
+            except Exception as e:
+                await status_msg.edit(content=f"Search error: {e}")
+                return
+            if not results:
+                await status_msg.edit(content=f"No results found for \"{query[:50]}\".")
+                return
+            embed = _build_search_embed(query, results)
+            view = SearchPickerView(self.bot, ctx, results, status_msg)
+            await status_msg.edit(content=None, embed=embed, view=view)
+            return  # SearchPickerView._on_select → _play_selected continues the flow
 
         # ---------------------------------------------------------------
         # Playlist detection: play first track, offer to add the rest
