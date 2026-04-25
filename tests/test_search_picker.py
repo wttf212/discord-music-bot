@@ -168,5 +168,104 @@ class TestBuildSearchEmbed(unittest.TestCase):
         self.assertEqual(embed.footer.text, "Select a result below • Expires in 60s")
 
 
+class TestSearchPickerView(unittest.TestCase):
+    """Unit tests for SearchPickerView construction and Select option limits."""
+
+    def _make_results(self, n=5):
+        return [
+            {
+                "title": f"Track {i}",
+                "url": f"https://www.youtube.com/watch?v=id{i}",
+                "uploader": f"Channel {i}",
+                "duration_str": f"{i}:00",
+                "thumbnail": "",
+            }
+            for i in range(1, n + 1)
+        ]
+
+    def _make_view(self, n=5):
+        bot = MagicMock()
+        ctx = MagicMock()
+        status_msg = MagicMock()
+        return commands.SearchPickerView(bot, ctx, self._make_results(n), status_msg)
+
+    def test_view_has_one_select_item(self):
+        view = self._make_view(5)
+        self.assertEqual(len(view.children), 1)
+
+    def test_select_has_correct_option_count(self):
+        view = self._make_view(5)
+        select = view.children[0]
+        self.assertEqual(len(select.options), 5)
+
+    def test_select_option_label_is_title(self):
+        view = self._make_view(3)
+        self.assertEqual(view.children[0].options[0].label, "Track 1")
+
+    def test_select_option_value_is_url(self):
+        view = self._make_view(3)
+        self.assertEqual(view.children[0].options[0].value, "https://www.youtube.com/watch?v=id1")
+
+    def test_select_option_description_format(self):
+        view = self._make_view(3)
+        self.assertEqual(view.children[0].options[0].description, "Channel 1 • 1:00")
+
+    def test_label_truncated_to_100_chars(self):
+        results = [{"title": "A" * 150, "url": "https://yt/x",
+                    "uploader": "U", "duration_str": "1:00", "thumbnail": ""}]
+        bot, ctx, msg = MagicMock(), MagicMock(), MagicMock()
+        view = commands.SearchPickerView(bot, ctx, results, msg)
+        self.assertEqual(len(view.children[0].options[0].label), 100)
+
+    def test_description_truncated_to_100_chars(self):
+        results = [{"title": "T", "url": "https://yt/x",
+                    "uploader": "C" * 100, "duration_str": "1:00", "thumbnail": ""}]
+        bot, ctx, msg = MagicMock(), MagicMock(), MagicMock()
+        view = commands.SearchPickerView(bot, ctx, results, msg)
+        self.assertLessEqual(len(view.children[0].options[0].description), 100)
+
+    def test_view_timeout_is_60(self):
+        view = self._make_view(1)
+        self.assertEqual(view.timeout, 60)
+
+    def test_single_result_still_shows_picker(self):
+        """One result still shows the select — no auto-play for single result per spec."""
+        view = self._make_view(1)
+        self.assertEqual(len(view.children[0].options), 1)
+
+
+class TestSearchPickerIntegration(unittest.TestCase):
+    """Integration tests for URL bypass (no picker) and no-results path.
+
+    These tests exercise _is_search_query routing logic only — the full
+    picker flow (interaction, playback) requires a live Discord session
+    and is covered by manual verification per 08-VALIDATION.md.
+    """
+
+    def test_url_query_bypasses_picker(self):
+        """HTTP(S) URLs are not search queries — picker must not run."""
+        self.assertFalse(commands._is_search_query("https://youtu.be/dQw4w9WgXcQ"))
+        self.assertFalse(commands._is_search_query("http://youtu.be/dQw4w9WgXcQ"))
+
+    def test_plain_text_triggers_picker(self):
+        self.assertTrue(commands._is_search_query("bohemian rhapsody"))
+
+    def test_ytsearch_prefix_triggers_picker_and_is_stripped(self):
+        query = "ytsearch:never gonna give you up"
+        self.assertTrue(commands._is_search_query(query))
+        self.assertEqual(commands._strip_ytsearch_prefix(query), "never gonna give you up")
+
+    def test_search_returns_empty_on_mock_no_results(self):
+        """When yt-dlp returns 0 entries, _search_youtube returns empty list."""
+        cm = MagicMock()
+        cm.extract_info.return_value = {"entries": []}
+        ydl_class = MagicMock()
+        ydl_class.return_value.__enter__.return_value = cm
+        ydl_class.return_value.__exit__.return_value = False
+        with patch("commands.yt_dlp.YoutubeDL", ydl_class):
+            result = commands._search_youtube("zzz_no_results_query_xyz")
+        self.assertEqual(result, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

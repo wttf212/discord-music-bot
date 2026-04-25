@@ -2,6 +2,7 @@ import asyncio
 import discord
 import yt_dlp
 from discord.ext import commands
+from discord import app_commands
 from track_queue import Track
 from audio_player import is_playlist_url, extract_playlist_info, get_audio_url_with_retry
 from guild_settings import (
@@ -87,6 +88,148 @@ def _build_search_embed(query: str, results: list[dict]) -> discord.Embed:
     )
     embed.set_footer(text="Select a result below • Expires in 60s")
     return embed
+
+class SearchPickerView(discord.ui.View):
+    """Discord Select UI for YouTube search results. Shown after !play / /play plain-text query.
+
+    After a result is selected, _play_selected() continues the normal playback flow.
+    On 60-second timeout, the picker message is edited to an expiry notice.
+    """
+
+    def __init__(self, bot, ctx: commands.Context, results: list[dict],
+                 status_msg: discord.Message):
+        super().__init__(timeout=60)   # D-07: 60-second picker window
+        self.bot = bot
+        self.ctx = ctx
+        self.results = results
+        self.status_msg = status_msg
+        self.selected = False
+
+        options = [
+            discord.SelectOption(
+                label=r["title"][:100],
+                value=r["url"],
+                description=f"{r['uploader']} • {r['duration_str']}"[:100],
+            )
+            for r in results
+        ]
+        select = discord.ui.Select(
+            placeholder="Pick a result...",
+            options=options,
+        )
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        self.selected = True
+        self.stop()
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="▶️ Loading...", embed=None, view=self)
+        selected_url = interaction.data["values"][0]
+        await _play_selected(self.bot, self.ctx, selected_url, self.status_msg)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        try:
+            await self.status_msg.edit(
+                content="Search expired — use `!play` again.",
+                embed=None,
+                view=self,
+            )
+        except Exception:
+            pass
+
+
+async def _play_selected(bot, ctx: commands.Context, url: str,
+                         picker_msg: discord.Message):
+    """Continue the play flow with a pre-resolved YouTube URL chosen from the picker.
+
+    Mirrors the single-track flow in MusicCog.play() (lines 624-712) but uses
+    picker_msg for status instead of a fresh ctx.send().
+    """
+    guild_id = str(ctx.guild.id)
+    gs = bot.get_guild_state(ctx.guild.id)
+    voice_channel = ctx.author.voice.channel
+    user_id = str(ctx.author.id)
+    channel_id = ctx.channel.id
+
+    # --- Join voice if not already connected ---
+    voice_client = ctx.guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        try:
+            voice_client = await voice_channel.connect()
+            gs.player.set_voice_client(voice_client)
+            saved_br = get_bitrate(guild_id)
+            if saved_br:
+                await gs.player.set_bitrate(ctx.guild.id, saved_br)
+            saved_bass = get_eq_bass(guild_id)
+            saved_treble = get_eq_treble(guild_id)
+            if saved_bass != 0 or saved_treble != 0:
+                await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+        except Exception as e:
+            await picker_msg.edit(
+                content=f"Failed to join voice channel: {e}",
+                embed=None, view=None,
+            )
+            return
+
+    # --- Determine playback state ---
+    voice_actually_playing = (
+        gs.player.is_playing
+        and ctx.guild.voice_client
+        and ctx.guild.voice_client.is_playing()
+    )
+
+    if voice_actually_playing:
+        # Queue-add path: bot already playing something
+        track = Track(query=url, title=url, requested_by=user_id)
+        gs.queue.add(track)
+        asyncio.create_task(_resolve_track_info(bot, channel_id, track))
+        await picker_msg.edit(content="Added to queue.", embed=None, view=None)
+        current = gs.queue.current
+        if current:
+            requester_name = f"<@{current.requested_by}>" if getattr(current, "requested_by", None) else ""
+            embed = create_np_embed(
+                bot, current.title,
+                thumbnail=current.thumbnail,
+                url=current.url,
+                requester_name=requester_name,
+                queue_tracks=gs.queue.preview_fair_order(),
+                guild_id=ctx.guild.id,
+            )
+            await update_np_embed(bot, channel_id, embed)
+    else:
+        # Start-playback path: nothing playing yet
+        try:
+            info = await gs.player.play(url)
+            title = info["title"]
+            track_thumbnail = info.get("thumbnail", "")
+            track_url = info.get("webpage_url", url)
+
+            gs.queue.current = Track(
+                query=url, title=title, requested_by=user_id,
+                thumbnail=track_thumbnail, url=track_url,
+            )
+
+            embed = create_np_embed(
+                bot, title,
+                thumbnail=track_thumbnail,
+                url=track_url,
+                requester_name=f"<@{user_id}>",
+                queue_tracks=gs.queue.preview_fair_order(),
+                guild_id=ctx.guild.id,
+            )
+            await picker_msg.delete()
+            await send_new_np(bot, channel_id, embed)
+            _start_auto_next(bot, channel_id, ctx.guild.id)
+        except Exception as e:
+            await picker_msg.edit(
+                content=f"Error playing track: {e}",
+                embed=None, view=None,
+            )
+
 
 def create_np_embed(bot, title: str, extra_desc: str = "",
                     thumbnail: str = "", url: str = "",
