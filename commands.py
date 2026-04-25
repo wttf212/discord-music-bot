@@ -1,5 +1,6 @@
 import asyncio
 import discord
+import yt_dlp
 from discord.ext import commands
 from track_queue import Track
 from audio_player import is_playlist_url, extract_playlist_info, get_audio_url_with_retry
@@ -13,6 +14,32 @@ from guild_settings import (
 
 
 PLAYLIST_EMOJI = "\u2705"  # ✅
+
+
+
+def _fmt_duration(seconds):
+    """Convert seconds (int|float|None) to 'mm:ss' string. None -> '?'."""
+    if seconds is None:
+        return "?"
+    s = int(seconds)
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def _is_search_query(query: str) -> bool:
+    """True if query should go through the search picker (plain text, including ytsearch: prefix).
+    False for direct http://, https:// URLs (case-insensitive)."""
+    if not query:
+        return False
+    lowered = query.lower()
+    return not (lowered.startswith("http://") or lowered.startswith("https://"))
+
+
+def _strip_ytsearch_prefix(query: str) -> str:
+    """Strip a leading 'ytsearch:' prefix (exact, lowercase) so the embed title shows the
+    underlying query. 'ytsearch5:' and other variants are NOT stripped."""
+    if query.startswith("ytsearch:"):
+        return query[len("ytsearch:"):]
+    return query
 
 
 def create_np_embed(bot, title: str, extra_desc: str = "",
