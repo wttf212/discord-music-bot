@@ -356,15 +356,32 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
         }
 
 
-def _start_ytdlp_stream(query: str, client: str, cookies_file: str | None = None) -> subprocess.Popen:
+def _start_ytdlp_stream(
+    query: str,
+    client: str,
+    cookies_file: str | None = None,
+    direct_url: str | None = None,
+) -> subprocess.Popen:
     """Start yt-dlp as a subprocess that pipes audio bytes to stdout.
 
     FFmpeg reads from this subprocess's stdout (pipe=True), so it never makes
     direct HTTP requests to YouTube CDN. This bypasses YouTube's TLS/JA3
     fingerprinting that returns HTTP 403 for FFmpeg's libavformat HTTP client.
+
+    When ``direct_url`` is provided (a pre-resolved CDN URL from get_audio_url),
+    yt-dlp skips format resolution and downloads the URL directly.  This avoids
+    the redundant 2–5 s YouTube API round-trip that the subprocess would otherwise
+    incur independently.  Falls back to full query resolution when ``direct_url``
+    is None (backward compatibility).
     """
-    is_yt = _is_youtube(query) or not query.startswith(("http://", "https://"))
-    actual_query = f"ytsearch:{query}" if not query.startswith(("http://", "https://")) else query
+    # When a direct CDN URL is supplied we bypass YouTube-specific logic entirely;
+    # the URL is already resolved so no extractor args or bgutil tokens are needed.
+    if direct_url is not None:
+        actual_query = direct_url
+        is_yt = False  # treat as plain URL download — no extractor args required
+    else:
+        is_yt = _is_youtube(query) or not query.startswith(("http://", "https://"))
+        actual_query = f"ytsearch:{query}" if not query.startswith(("http://", "https://")) else query
 
     bgutil_exe = next(
         (p for p in (
@@ -405,7 +422,9 @@ def _start_ytdlp_stream(query: str, client: str, cookies_file: str | None = None
             )
 
     # COOKIE-01 / per-play re-check (subprocess path) — mirrors get_audio_url logic.
-    if cookies_file:
+    # Skip cookie injection when using a direct CDN URL: the PO token embedded in the
+    # URL already authenticates the request; injecting cookies would be redundant.
+    if cookies_file and direct_url is None:
         if not os.path.isfile(cookies_file):
             print(f"[yt-dlp-pipe] Warning: cookies_file '{cookies_file}' not found — running without cookies")
         else:
@@ -570,40 +589,42 @@ class AudioPlayer:
 
         self.stop_playback()
 
-        # Run metadata extraction and subprocess startup concurrently to minimise latency:
-        #   get_audio_url  → in-process yt-dlp (download=False) for title/thumbnail/logging
-        #   _start_ytdlp_stream → Popen (near-instant); subprocess resolves URL in parallel
+        # Resolve metadata first (in-process yt-dlp), then start the stream subprocess
+        # with the already-resolved CDN URL so it skips the redundant YouTube API round-trip.
+        #
+        # Previously both ran concurrently via asyncio.gather, but the subprocess had to
+        # independently resolve the same query (2–5 s Python init + bgutil CLI PO token
+        # overhead), making it the bottleneck regardless.  The new flow:
+        #   1. get_audio_url → resolves query, returns CDN URL + metadata  (~2-5 s)
+        #   2. _start_ytdlp_stream(direct_url=...) → Popen with pre-resolved URL (~instant)
+        # Total latency ≈ step 1 only (step 2 is near-instant), saving 2–5 s per track.
         if self._debug:
-            print(f"[debug][player] Starting metadata extraction and yt-dlp stream in parallel")
+            print(f"[debug][player] Resolving audio URL via in-process yt-dlp")
 
-        results = await asyncio.gather(
-            loop.run_in_executor(None, get_audio_url_with_retry, url_or_query, yt["client"], self._debug, cookies_file),
-            loop.run_in_executor(None, _start_ytdlp_stream, url_or_query, yt["client"], cookies_file),
-            return_exceptions=True,
-        )
-        info_result, proc_result = results
+        try:
+            info: dict = await loop.run_in_executor(
+                None, get_audio_url_with_retry, url_or_query, yt["client"], self._debug, cookies_file
+            )
+        except Exception as exc:
+            raise exc
 
-        # If the subprocess started but metadata failed (or vice versa), clean up and raise
-        if isinstance(info_result, Exception):
-            if isinstance(proc_result, subprocess.Popen):
-                try:
-                    proc_result.terminate()
-                except Exception:
-                    pass
-            raise info_result
-        if isinstance(proc_result, Exception):
-            raise proc_result
+        if self._debug:
+            print(f"[debug][player] Metadata resolved — starting yt-dlp pipe subprocess with direct URL")
 
-        # Guard: subprocess may have exited during the metadata retry window.
-        # A dead Popen is not an Exception, so the isinstance guard above won't catch it —
-        # but FFmpeg would immediately read EOF from its stdout and silently skip the track.
-        if isinstance(proc_result, subprocess.Popen) and proc_result.poll() is not None:
+        try:
+            proc_result: subprocess.Popen = await loop.run_in_executor(
+                None, _start_ytdlp_stream, url_or_query, yt["client"], cookies_file, info["url"]
+            )
+        except Exception as exc:
+            raise exc
+
+        # Guard: subprocess may have exited immediately (e.g. invalid URL passed through).
+        if proc_result.poll() is not None:
             stderr = proc_result.stderr.read().decode(errors="replace") if proc_result.stderr else ""
             raise RuntimeError(
                 f"yt-dlp stream subprocess exited {proc_result.returncode} before playback started: {stderr[:500]}"
             )
 
-        info: dict = info_result
         self._ytdlp_proc: subprocess.Popen = proc_result
 
         title = info["title"]
