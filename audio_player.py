@@ -47,6 +47,8 @@ def _build_ffmpeg_af_options(bass_db: int, treble_db: int) -> str:
         parts.append(f"treble=g={treble_db}")
     if not parts:
         return ""
+    # alimiter prevents clipping when EQ boosts push peaks above 0 dBFS
+    parts.append("alimiter=level_out=0.9:attack=5:release=50")
     return '-af "' + ",".join(parts) + '"'
 
 
