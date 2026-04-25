@@ -3,7 +3,13 @@ import discord
 from discord.ext import commands
 from track_queue import Track
 from audio_player import is_playlist_url, extract_playlist_info, get_audio_url_with_retry
-from guild_settings import get_allowed_channel, set_allowed_channel, get_bitrate, set_bitrate, get_admins, add_admin, remove_admin
+from guild_settings import (
+    get_allowed_channel, set_allowed_channel,
+    get_bitrate, set_bitrate,
+    get_admins, add_admin, remove_admin,
+    get_eq_bass, set_eq_bass, get_eq_treble, set_eq_treble,
+    EQ_PRESETS, get_eq_preset_name,
+)
 
 
 PLAYLIST_EMOJI = "\u2705"  # ✅
@@ -60,7 +66,12 @@ def create_np_embed(bot, title: str, extra_desc: str = "",
     else:
         embed.add_field(name="Up Next", value="*No songs in queue*", inline=False)
 
-    embed.set_footer(text=f"Audio: {kbps} kbps • {p}bitrate <kbps> to change")
+    if gs and guild_id is not None:
+        eq_bass, eq_treble = gs.player.get_eq_for_guild(guild_id)
+    else:
+        eq_bass, eq_treble = (0, 0)
+    eq_label = get_eq_preset_name(eq_bass, eq_treble)
+    embed.set_footer(text=f"Audio: {kbps} kbps • EQ: {eq_label} • {p}bitrate | {p}eq to change")
     return embed
 
 
@@ -521,6 +532,11 @@ class MusicCog(commands.Cog):
                         saved_br = get_bitrate(guild_id)
                         if saved_br:
                             await gs.player.set_bitrate(ctx.guild.id, saved_br)
+                        # Restore saved EQ for this guild (per D-09)
+                        saved_bass = get_eq_bass(guild_id)
+                        saved_treble = get_eq_treble(guild_id)
+                        if saved_bass != 0 or saved_treble != 0:
+                            await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
                     except Exception as e:
                         await status_msg.edit(content=f"Failed to join voice channel: {e}")
                         return
@@ -615,6 +631,11 @@ class MusicCog(commands.Cog):
                 saved_br = get_bitrate(guild_id)
                 if saved_br:
                     await gs.player.set_bitrate(ctx.guild.id, saved_br)
+                # Restore saved EQ for this guild (per D-09)
+                saved_bass = get_eq_bass(guild_id)
+                saved_treble = get_eq_treble(guild_id)
+                if saved_bass != 0 or saved_treble != 0:
+                    await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
             except Exception as e:
                 await ctx.send(f"Failed to join voice channel: {e}")
                 return
@@ -871,6 +892,95 @@ class MusicCog(commands.Cog):
         set_bitrate(str(ctx.guild.id), kbps_int)
         await ctx.send(f"Audio bitrate set to **{kbps_int} kbps** (saved).")
 
+    @commands.command(name="eq")
+    async def eq(self, ctx: commands.Context, *args: str):
+        """Per-guild equalizer — admin only. See !eq for usage."""
+        if not await check_channel(ctx):
+            return
+        if not ctx.guild:
+            return
+        if not await self._check_admin(ctx):
+            return
+
+        gs = self.bot.get_guild_state(ctx.guild.id)
+        guild_id_str = str(ctx.guild.id)
+        p = self.bot.command_prefix
+        preset_list = ", ".join(EQ_PRESETS.keys())
+
+        # No args: show current state + usage.
+        if not args:
+            cur_bass = get_eq_bass(guild_id_str)
+            cur_treble = get_eq_treble(guild_id_str)
+            cur_name = get_eq_preset_name(cur_bass, cur_treble)
+            await ctx.send(
+                f"Current EQ: **{cur_name}** (bass={cur_bass:+d} dB, treble={cur_treble:+d} dB).\n"
+                f"Usage: `{p}eq bass <-10..+10>` | `{p}eq treble <-10..+10>` | "
+                f"`{p}eq <preset>` (presets: {preset_list}) | `{p}eq reset`"
+            )
+            return
+
+        sub = args[0].lower()
+
+        # Reset / flat
+        if sub in ("reset", "flat"):
+            try:
+                set_eq_bass(guild_id_str, 0)
+                set_eq_treble(guild_id_str, 0)
+            except ValueError as e:
+                await ctx.send(f"EQ error: {e}")
+                return
+            await gs.player.set_eq(ctx.guild.id, 0, 0)
+            await ctx.send("EQ reset to **flat** (applies starting next track).")
+            return
+
+        # Single-band adjustment: !eq bass <N> or !eq treble <N>
+        if sub in ("bass", "treble"):
+            if len(args) < 2:
+                await ctx.send(f"Usage: `{p}eq {sub} <-10..+10>`")
+                return
+            try:
+                db = int(args[1])
+            except ValueError:
+                await ctx.send(f"EQ {sub} value must be an integer between -10 and +10.")
+                return
+            try:
+                if sub == "bass":
+                    set_eq_bass(guild_id_str, db)
+                else:
+                    set_eq_treble(guild_id_str, db)
+            except ValueError as e:
+                await ctx.send(f"EQ error: {e}")
+                return
+            new_bass = get_eq_bass(guild_id_str)
+            new_treble = get_eq_treble(guild_id_str)
+            await gs.player.set_eq(ctx.guild.id, new_bass, new_treble)
+            preset = get_eq_preset_name(new_bass, new_treble)
+            await ctx.send(
+                f"EQ {sub} set to **{db:+d} dB** (preset: {preset}). Applies starting next track."
+            )
+            return
+
+        # Preset selection
+        if sub in EQ_PRESETS:
+            b, t = EQ_PRESETS[sub]
+            try:
+                set_eq_bass(guild_id_str, b)
+                set_eq_treble(guild_id_str, t)
+            except ValueError as e:
+                await ctx.send(f"EQ error: {e}")
+                return
+            await gs.player.set_eq(ctx.guild.id, b, t)
+            await ctx.send(
+                f"EQ preset **{sub}** applied (bass={b:+d} dB, treble={t:+d} dB). "
+                f"Applies starting next track."
+            )
+            return
+
+        # Unknown subcommand
+        await ctx.send(
+            f"Unknown EQ subcommand `{sub}`. Valid: bass, treble, reset, {preset_list}."
+        )
+
     @commands.command(name="shutdown")
     async def shutdown(self, ctx: commands.Context):
         if not await check_channel(ctx):
@@ -993,6 +1103,7 @@ class MusicCog(commands.Cog):
             f"`{p}queue` — Show the current queue\n"
             f"`{p}loadall` — Load all remaining tracks from the last pending playlist\n"
             f"`{p}bitrate [kbps]` — Show or set audio encoding bitrate\n"
+            f"`{p}eq [bass|treble <N> | preset | reset]` — Per-guild equalizer, -10..+10 dB *(admin only)*\n"
             f"`{p}fairplay on|off` — Toggle user interleaving mode for queues *(admin only)*\n"
             f"`{p}fairness <0-100>` — Set the percentage of users strictly needed to skip/stop songs *(admin only)*\n"
             f"`{p}addadmin @user` — Add a user as a bot admin for this server *(owner only)*\n"
