@@ -412,8 +412,13 @@ def is_playlist_url(query: str) -> bool:
     """Check if a URL points to a playlist (YouTube or SoundCloud)."""
     if not query.startswith(("http://", "https://")):
         return False
-    # YouTube playlists contain list= parameter
+    # YouTube playlists contain list= parameter, but skip auto-generated mixes
+    # (Radio/Mix playlists have IDs starting with "RD" — RDMM, RDGMEM, RDCLAK, etc.)
     if _is_youtube(query) and "list=" in query:
+        from urllib.parse import urlparse, parse_qs
+        list_id = parse_qs(urlparse(query).query).get("list", [""])[0]
+        if list_id.startswith("RD"):
+            return False
         return True
     # SoundCloud sets (playlists)
     if "soundcloud.com" in query and "/sets/" in query:
@@ -616,6 +621,12 @@ class AudioPlayer:
             self.is_playing = False
             self.current_track_title = None
             loop.call_soon_threadsafe(self._playback_done.set)
+
+        # Allow FFmpeg ~250ms to start up and buffer PCM into its stdout pipe before
+        # discord.py's audio thread begins. Without this, the first read() blocks
+        # during FFmpeg's codec probe, the timing loop falls behind, and discord.py
+        # rushes to catch up by sending frames with no sleep — making audio sound sped up.
+        await asyncio.sleep(0.5)
 
         self._voice_client.play(source, after=after_playback)
 
