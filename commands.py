@@ -42,6 +42,52 @@ def _strip_ytsearch_prefix(query: str) -> str:
     return query
 
 
+def _search_youtube(query: str) -> list[dict]:
+    """Run ytsearch5 with extract_flat (1.3s vs 7.4s) and return normalized result dicts.
+    BLOCKS: must be called via asyncio.run_in_executor.
+    Returns up to 5 items shaped {title, url, uploader, duration_str, thumbnail}."""
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": "in_playlist",
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(f"ytsearch5:{query}", download=False)
+    entries = (info or {}).get("entries") or []
+    results = []
+    for e in entries:
+        if not e:
+            continue
+        duration_s = e.get("duration")
+        duration_str = _fmt_duration(duration_s)
+        thumbnails = e.get("thumbnails") or []
+        thumbnail_url = thumbnails[0].get("url", "") if thumbnails else ""
+        results.append({
+            "title": e.get("title") or "Unknown",
+            "url": e.get("url") or "",                     # NOT webpage_url -- None in flat mode
+            "uploader": e.get("uploader") or e.get("channel") or "Unknown",
+            "duration_str": duration_str,
+            "thumbnail": thumbnail_url,
+        })
+    return results
+
+
+def _build_search_embed(query: str, results: list[dict]) -> discord.Embed:
+    """Build the picker embed. Title shows query truncated at 50 chars; one numbered line
+    per result with channel + duration on the indented sub-line. Color matches create_np_embed."""
+    query_display = query[:50]
+    lines = []
+    for i, r in enumerate(results, 1):
+        lines.append(f"**{i}.** {r['title']}")
+        lines.append(f"    {r['uploader']} • {r['duration_str']}")
+    embed = discord.Embed(
+        title=f"🔍 Results for \"{query_display}\"",
+        description="\n".join(lines) if lines else "No results.",
+        color=0x3498db,
+    )
+    embed.set_footer(text="Select a result below • Expires in 60s")
+    return embed
+
 def create_np_embed(bot, title: str, extra_desc: str = "",
                     thumbnail: str = "", url: str = "",
                     requester_name: str = "",
