@@ -30,6 +30,26 @@ except ImportError:
     _IMPERSONATE_AVAILABLE = False
 
 
+def _build_ffmpeg_af_options(bass_db: int, treble_db: int) -> str:
+    """Return the FFmpeg `-af` flag (with its filter argument) for the given EQ,
+    or an empty string when both bands are 0 dB (flat — no filter needed).
+
+    Examples:
+        (0, 0)   -> ""
+        (5, 0)   -> '-af "bass=g=5"'
+        (0, -3)  -> '-af "treble=g=-3"'
+        (5, -2)  -> '-af "bass=g=5,treble=g=-2"'
+    """
+    parts: list[str] = []
+    if bass_db != 0:
+        parts.append(f"bass=g={bass_db}")
+    if treble_db != 0:
+        parts.append(f"treble=g={treble_db}")
+    if not parts:
+        return ""
+    return '-af "' + ",".join(parts) + '"'
+
+
 def _find_ffmpeg(config_path: str) -> str:
     """Resolve ffmpeg binary: config path > PATH > imageio_ffmpeg fallback."""
     if config_path and config_path != "ffmpeg":
@@ -491,6 +511,7 @@ class AudioPlayer:
         self._debug = config.get("debug", False)
         self._default_bitrate: int = config["audio"].get("bitrate", 128) * 1000
         self._guild_bitrates: dict[int, int] = {}
+        self._guild_eq: dict[int, tuple[int, int]] = {}  # guild_id -> (bass_db, treble_db)
 
         if self._debug:
             print(f"[debug][player] Initialized AudioPlayer")
@@ -507,6 +528,20 @@ class AudioPlayer:
         if guild_id is not None:
             return self._guild_bitrates.get(guild_id, self._default_bitrate)
         return self._default_bitrate
+
+    def get_eq_for_guild(self, guild_id: int | None) -> tuple[int, int]:
+        """Return (bass_db, treble_db) for this guild, defaulting to (0, 0) = flat."""
+        if guild_id is None:
+            return (0, 0)
+        return self._guild_eq.get(guild_id, (0, 0))
+
+    async def set_eq(self, guild_id: int, bass_db: int, treble_db: int):
+        """Store EQ for a guild. Applies to the NEXT track (D-08) — does not
+        interrupt current playback. Caller is responsible for range validation
+        (done by guild_settings.set_eq_bass/set_eq_treble before reaching here)."""
+        self._guild_eq[guild_id] = (int(bass_db), int(treble_db))
+        if self._debug:
+            print(f"[debug][player] EQ set for guild {guild_id}: bass={bass_db}dB treble={treble_db}dB (applies next track)")
 
     async def play(self, url_or_query: str) -> dict:
         """Resolve a URL/query and start playback. Returns dict with title, thumbnail, webpage_url.
@@ -576,11 +611,19 @@ class AudioPlayer:
         # FFmpeg reads from yt-dlp's stdout pipe — no HTTP requests to YouTube CDN.
         # Note: FFmpegPCMAudio already appends -f s16le -ar 48000 -ac 2 pipe:1;
         # do NOT add -ar/-ac in options or audio will be corrupted.
+        # Build FFmpeg options: always decode-only (-vn), plus optional EQ filter chain.
+        # When EQ is flat (0,0), _build_ffmpeg_af_options returns "" so we emit exactly "-vn" (no regression).
+        guild_id_for_eq = self._voice_client.guild.id if (self._voice_client and hasattr(self._voice_client, 'guild')) else None
+        eq_bass, eq_treble = self.get_eq_for_guild(guild_id_for_eq)
+        af_flag = _build_ffmpeg_af_options(eq_bass, eq_treble)
+        ffmpeg_options = "-vn" if not af_flag else f"-vn {af_flag}"
+        if self._debug:
+            print(f"[debug][player] FFmpeg options: {ffmpeg_options}")
         source = discord.FFmpegPCMAudio(
             self._ytdlp_proc.stdout,
             executable=self._ffmpeg_path,
             pipe=True,
-            options="-vn",
+            options=ffmpeg_options,
             stderr=subprocess.PIPE,
         )
 
