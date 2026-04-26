@@ -1074,6 +1074,21 @@ class MusicCog(commands.Cog):
             msg = "\n".join(lines)
         await ctx.send(msg)
 
+    @commands.hybrid_command(name="shuffle", description="Shuffle the current queue")
+    async def shuffle(self, ctx: commands.Context):
+        if not await check_channel(ctx):
+            return
+        if not ctx.guild:
+            return
+        gs = self.bot.get_guild_state(ctx.guild.id)
+        count = gs.queue.shuffle()
+        if count == 0:
+            await ctx.send("The queue is empty — nothing to shuffle.")
+        elif count == 1:
+            await ctx.send("Only one track in the queue — nothing to shuffle.")
+        else:
+            await ctx.send(f"Shuffled {count} tracks in the queue.")
+
     @commands.command(name="loadall")
     async def loadall(self, ctx: commands.Context):
         """Load remaining playlist tracks from the most recent pending playlist."""
@@ -1361,6 +1376,7 @@ class MusicCog(commands.Cog):
             f"`{p}skip` — Skip the current track\n"
             f"`{p}stop` — Stop playback, clear queue, and leave voice\n"
             f"`{p}queue` — Show the current queue\n"
+            f"`{p}shuffle` — Shuffle the current queue\n"
             f"`{p}loadall` — Load all remaining tracks from the last pending playlist\n"
             f"`{p}bitrate [kbps]` — Show or set audio encoding bitrate\n"
             f"`{p}eq [bass|treble <N> | preset | reset]` — Per-guild equalizer, -10..+10 dB *(admin only)*\n"
