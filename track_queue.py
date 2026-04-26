@@ -1,5 +1,6 @@
 from collections import deque
 from dataclasses import dataclass
+import random
 
 
 @dataclass
@@ -67,6 +68,14 @@ class TrackQueue:
 
     def list(self):
         return list(self._queue)
+
+    def shuffle(self) -> int:
+        """Randomise pending tracks in-place. Returns count of shuffled tracks.
+        Does not affect the currently-playing track (self.current) or history."""
+        items = list(self._queue)
+        random.shuffle(items)
+        self._queue = deque(items)
+        return len(items)
 
     def preview_fair_order(self, limit: int = 10):
         """Return up to 'limit' tracks in predicted fair-play order without mutating state.
