@@ -1,4 +1,5 @@
 import asyncio
+import re
 import discord
 import yt_dlp
 from discord.ext import commands
@@ -33,6 +34,23 @@ def _is_search_query(query: str) -> bool:
         return False
     lowered = query.lower()
     return not (lowered.startswith("http://") or lowered.startswith("https://"))
+
+
+def _friendly_ytdlp_error(exc: Exception) -> str:
+    """Return a short, user-readable error message from a yt-dlp exception.
+
+    yt-dlp errors look like:
+      ERROR: [youtube] <id>: <human reason>. Use --cookies... See https://...
+    We want only the human reason, without the noisy CLI suggestions.
+    """
+    msg = str(exc)
+    msg = re.sub(r"^ERROR:\s*\[\w+\]\s*[^:]*:\s*", "", msg, count=1)
+    # Cut off at the first "Use --" or "See http" instruction
+    for cutoff in (" Use --", " See http", "\nUse --", "\nSee http"):
+        idx = msg.find(cutoff)
+        if idx != -1:
+            msg = msg[:idx]
+    return msg.strip() or "Unknown error"
 
 
 def _strip_ytsearch_prefix(query: str) -> str:
@@ -565,7 +583,7 @@ class PlayerControls(discord.ui.View):
             await send_new_np(self.bot, self.channel_id, embed)
             _start_auto_next(self.bot, self.channel_id, guild_id)
         except Exception as e:
-            await interaction.channel.send(f"Error playing previous track: {e}")
+            await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
 
     @discord.ui.button(label="⏯️ Play/Pause", style=discord.ButtonStyle.primary, custom_id="btn_playpause")
     async def playpause_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -630,7 +648,7 @@ class PlayerControls(discord.ui.View):
                 await send_new_np(self.bot, self.channel_id, embed)
                 _start_auto_next(self.bot, self.channel_id, guild_id)
             except Exception as e:
-                await interaction.channel.send(f"Error playing next track: {e}")
+                await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
             for child in self.children:
                 child.disabled = True
@@ -1045,7 +1063,7 @@ class MusicCog(commands.Cog):
                 await send_new_np(self.bot, channel_id, embed)
                 _start_auto_next(self.bot, channel_id, ctx.guild.id)
             except Exception as e:
-                await ctx.send(f"Error playing next track: {e}")
+                await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
             await ctx.send("Skipped. Queue is empty.")
 
@@ -1133,7 +1151,7 @@ class MusicCog(commands.Cog):
                     await send_new_np(self.bot, channel_id, embed)
                     _start_auto_next(self.bot, channel_id, ctx.guild.id)
                 except Exception as e:
-                    await ctx.send(f"Error playing track: {e}")
+                    await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
 
     @commands.command(name="bitrate")
     async def bitrate(self, ctx: commands.Context, kbps: str = None):
@@ -1436,7 +1454,7 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 consecutive_errors += 1
                 channel = bot.get_channel(channel_id)
                 if channel:
-                    await channel.send(f"Error playing track, skipping: {e}")
+                    await channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     if channel:
                         await channel.send(f"Too many consecutive errors ({MAX_CONSECUTIVE_ERRORS}), stopping auto-play.")
