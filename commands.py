@@ -158,6 +158,12 @@ async def _play_selected(bot, ctx: commands.Context, url: str,
     # --- Join voice if not already connected ---
     voice_client = ctx.guild.voice_client
     if not voice_client or not voice_client.is_connected():
+        if voice_client:  # stale client — force-disconnect before reconnecting
+            try:
+                await voice_client.disconnect(force=True)
+            except Exception:
+                pass
+            gs.player._voice_client = None
         try:
             voice_client = await voice_channel.connect()
             gs.player.set_voice_client(voice_client)
@@ -767,6 +773,12 @@ class MusicCog(commands.Cog):
                 # Join voice if not already connected
                 voice_client = ctx.guild.voice_client
                 if not voice_client or not voice_client.is_connected():
+                    if voice_client:  # stale client — force-disconnect before reconnecting
+                        try:
+                            await voice_client.disconnect(force=True)
+                        except Exception:
+                            pass
+                        gs.player._voice_client = None
                     try:
                         voice_client = await voice_channel.connect()
                         gs.player.set_voice_client(voice_client)
@@ -866,6 +878,12 @@ class MusicCog(commands.Cog):
         # Join voice if not already connected
         voice_client = ctx.guild.voice_client
         if not voice_client or not voice_client.is_connected():
+            if voice_client:  # stale client — force-disconnect before reconnecting
+                try:
+                    await voice_client.disconnect(force=True)
+                except Exception:
+                    pass
+                gs.player._voice_client = None
             try:
                 voice_client = await voice_channel.connect()
                 gs.player.set_voice_client(voice_client)
