@@ -513,6 +513,35 @@ def extract_playlist_info(query: str, client: str) -> dict:
     }
 
 
+class _PrimedAudioSource:
+    """Wraps a discord AudioSource with a pre-read first frame.
+
+    discord.py's AudioPlayer thread sets _start = time.perf_counter() before
+    calling source.read(). If FFmpeg hasn't produced output yet, that first read
+    blocks (codec probe + subprocess startup), causing the timing loop to fall
+    behind and rush subsequent frames with delay=0 — audible as ~1-2s of fast
+    playback. Pre-reading one frame off the event loop before play() is called
+    guarantees the audio thread's first read() returns immediately.
+    """
+
+    def __init__(self, source, first_frame: bytes):
+        self._source = source
+        self._first_frame = first_frame
+        self._first_consumed = False
+
+    def read(self) -> bytes:
+        if not self._first_consumed:
+            self._first_consumed = True
+            return self._first_frame
+        return self._source.read()
+
+    def is_opus(self) -> bool:
+        return self._source.is_opus()
+
+    def cleanup(self):
+        self._source.cleanup()
+
+
 class AudioPlayer:
     """Audio player using discord.py VoiceClient + FFmpegPCMAudio.
 
@@ -692,11 +721,11 @@ class AudioPlayer:
             self.current_track_title = None
             loop.call_soon_threadsafe(self._playback_done.set)
 
-        # Allow FFmpeg ~250ms to start up and buffer PCM into its stdout pipe before
-        # discord.py's audio thread begins. Without this, the first read() blocks
-        # during FFmpeg's codec probe, the timing loop falls behind, and discord.py
-        # rushes to catch up by sending frames with no sleep — making audio sound sped up.
-        await asyncio.sleep(0.5)
+        # Block in the executor until FFmpeg produces its first PCM frame, then
+        # hand discord.py a pre-primed source whose first read() is instant.
+        first_frame = await loop.run_in_executor(None, source.read)
+        if first_frame:
+            source = _PrimedAudioSource(source, first_frame)
 
         self._voice_client.play(source, after=after_playback)
 
