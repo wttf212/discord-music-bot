@@ -237,12 +237,12 @@ class TestRadioDiscoveryView(unittest.TestCase):
 
     def test_first_country_option_is_any(self):
         view = self._make_view()
-        self.assertEqual(view.children[0].options[0].value, "")
+        self.assertEqual(view.children[0].options[0].value, "any")
         self.assertEqual(view.children[0].options[0].label, "Any country")
 
     def test_first_genre_option_is_any(self):
         view = self._make_view()
-        self.assertEqual(view.children[1].options[0].value, "")
+        self.assertEqual(view.children[1].options[0].value, "any")
         self.assertEqual(view.children[1].options[0].label, "Any genre")
 
 

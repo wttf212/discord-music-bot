@@ -112,7 +112,7 @@ def _build_search_embed(query: str, results: list[dict]) -> discord.Embed:
 
 
 _RADIO_COUNTRIES = [
-    ("Any country", ""),
+    ("Any country", "any"),
     ("United States", "US"), ("Germany", "DE"), ("United Kingdom", "GB"),
     ("France", "FR"), ("Brazil", "BR"), ("Russia", "RU"), ("Poland", "PL"),
     ("Netherlands", "NL"), ("Italy", "IT"), ("Spain", "ES"), ("Canada", "CA"),
@@ -121,7 +121,7 @@ _RADIO_COUNTRIES = [
 ]
 
 _RADIO_GENRES = [
-    ("Any genre", ""),
+    ("Any genre", "any"),
     ("Pop", "pop"), ("Rock", "rock"), ("Jazz", "jazz"), ("Electronic", "electronic"),
     ("Classical", "classical"), ("Hip-Hop", "hip-hop"), ("Country", "country"),
     ("Metal", "metal"), ("R&B", "rnb"), ("Reggae", "reggae"), ("Folk", "folk"),
@@ -259,9 +259,11 @@ class RadioDiscoveryView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(content="📻 Loading stations...", embed=None, view=self)
+        country = "" if self.country == "any" else self.country
+        genre = "" if self.genre == "any" else self.genre
         try:
             stations = await asyncio.get_event_loop().run_in_executor(
-                None, _fetch_radio_stations, None, self.country, self.genre
+                None, _fetch_radio_stations, None, country, genre
             )
         except Exception as e:
             await self.status_msg.edit(content=f"Radio catalog error: {e}", embed=None, view=None)
@@ -274,8 +276,8 @@ class RadioDiscoveryView(discord.ui.View):
         # Build a display label for the embed title from the chosen filters
         filter_label = " • ".join(
             p for p in [
-                dict(_RADIO_COUNTRIES).get(self.country, self.country) if self.country else "",
-                dict(_RADIO_GENRES).get(self.genre, self.genre).title() if self.genre else "",
+                dict(_RADIO_COUNTRIES).get(country, country) if country else "",
+                dict(_RADIO_GENRES).get(genre, genre).title() if genre else "",
             ] if p
         ) or None
         embed = _build_radio_embed(page_stations, filter_label, 1, total_pages)
