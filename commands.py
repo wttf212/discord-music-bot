@@ -112,16 +112,22 @@ def _build_search_embed(query: str, results: list[dict]) -> discord.Embed:
 
 
 _RADIO_COUNTRIES = [
-    ("Any country", "any"),
-    ("United States", "US"), ("Germany", "DE"), ("United Kingdom", "GB"),
-    ("France", "FR"), ("Brazil", "BR"), ("Russia", "RU"), ("Poland", "PL"),
-    ("Netherlands", "NL"), ("Italy", "IT"), ("Spain", "ES"), ("Canada", "CA"),
-    ("Australia", "AU"), ("India", "IN"), ("Argentina", "AR"), ("Turkey", "TR"),
-    ("Mexico", "MX"), ("Czech Republic", "CZ"), ("Hungary", "HU"), ("Romania", "RO"),
+    # value must be unique across ALL selects in the message — use "any_country" sentinel
+    ("Any country", "any_country"),
+    # Top 24 countries by station count on radio-browser.info (fills Discord's 25-option limit)
+    ("Germany", "DE"), ("United States", "US"), ("France", "FR"),
+    ("United Kingdom", "GB"), ("Brazil", "BR"), ("Russia", "RU"),
+    ("Poland", "PL"), ("Netherlands", "NL"), ("Hungary", "HU"),
+    ("Romania", "RO"), ("Italy", "IT"), ("Spain", "ES"),
+    ("Czech Republic", "CZ"), ("Austria", "AT"), ("Belgium", "BE"),
+    ("Australia", "AU"), ("Canada", "CA"), ("Argentina", "AR"),
+    ("Mexico", "MX"), ("Turkey", "TR"), ("Portugal", "PT"),
+    ("India", "IN"), ("Ukraine", "UA"), ("Switzerland", "CH"),
 ]
 
 _RADIO_GENRES = [
-    ("Any genre", "any"),
+    # value must be unique across ALL selects in the message — use "any_genre" sentinel
+    ("Any genre", "any_genre"),
     ("Pop", "pop"), ("Rock", "rock"), ("Jazz", "jazz"), ("Electronic", "electronic"),
     ("Classical", "classical"), ("Hip-Hop", "hip-hop"), ("Country", "country"),
     ("Metal", "metal"), ("R&B", "rnb"), ("Reggae", "reggae"), ("Folk", "folk"),
@@ -259,8 +265,8 @@ class RadioDiscoveryView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(content="📻 Loading stations...", embed=None, view=self)
-        country = "" if self.country == "any" else self.country
-        genre = "" if self.genre == "any" else self.genre
+        country = "" if self.country in ("any_country", "") else self.country
+        genre = "" if self.genre in ("any_genre", "") else self.genre
         try:
             stations = await asyncio.get_event_loop().run_in_executor(
                 None, _fetch_radio_stations, None, country, genre

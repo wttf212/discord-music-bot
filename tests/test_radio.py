@@ -212,7 +212,7 @@ class TestRadioDiscoveryView(unittest.TestCase):
 
     def test_country_select_option_count(self):
         view = self._make_view()
-        self.assertEqual(len(view.children[0].options), 20)
+        self.assertEqual(len(view.children[0].options), 25)  # Any + 24 countries
 
     def test_genre_select_option_count(self):
         view = self._make_view()
@@ -237,13 +237,20 @@ class TestRadioDiscoveryView(unittest.TestCase):
 
     def test_first_country_option_is_any(self):
         view = self._make_view()
-        self.assertEqual(view.children[0].options[0].value, "any")
+        self.assertEqual(view.children[0].options[0].value, "any_country")
         self.assertEqual(view.children[0].options[0].label, "Any country")
 
     def test_first_genre_option_is_any(self):
         view = self._make_view()
-        self.assertEqual(view.children[1].options[0].value, "any")
+        self.assertEqual(view.children[1].options[0].value, "any_genre")
         self.assertEqual(view.children[1].options[0].label, "Any genre")
+
+    def test_sentinel_values_are_distinct(self):
+        """any_country and any_genre must differ so Discord doesn't see a cross-select duplicate."""
+        country_sentinels = {o.value for o in self._make_view().children[0].options}
+        genre_sentinels = {o.value for o in self._make_view().children[1].options}
+        self.assertFalse(country_sentinels & genre_sentinels,
+                         "Country and genre selects share at least one option value")
 
 
 if __name__ == "__main__":
