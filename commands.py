@@ -280,7 +280,10 @@ class RadioDiscoveryView(discord.ui.View):
 
         region_select = discord.ui.Select(
             placeholder="🌍 Region...",
-            options=[discord.SelectOption(label=label, value=code) for label, code in _RADIO_REGIONS],
+            options=[
+                discord.SelectOption(label=label, value=code, default=(code == self.region))
+                for label, code in _RADIO_REGIONS
+            ],
             custom_id="discovery_region",
         )
         region_select.callback = self._on_region
