@@ -10,6 +10,7 @@ class Track:
     requested_by: str
     thumbnail: str = ""
     url: str = ""
+    is_radio: bool = False
 
 
 class TrackQueue:
@@ -29,7 +30,7 @@ class TrackQueue:
             return None
 
         curr = self.current
-        if curr is not None:
+        if curr is not None and not curr.is_radio:
             self._history.append(curr)
 
         if self.fair_play and self.last_played_user is not None and len(self._queue) > 1:
