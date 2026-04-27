@@ -1,5 +1,8 @@
 import asyncio
+import json
 import re
+import urllib.parse
+import urllib.request
 import discord
 import yt_dlp
 from discord.ext import commands
@@ -106,6 +109,65 @@ def _build_search_embed(query: str, results: list[dict]) -> discord.Embed:
     )
     embed.set_footer(text="Select a result below • Expires in 60s")
     return embed
+
+
+def _fetch_radio_stations(query: str | None) -> list[dict]:
+    """Fetch stations from radio-browser.info. BLOCKS: call via run_in_executor.
+
+    No query  -> top 50 stations by vote count (/json/stations/topvote).
+    With query -> fuzzy name search (/json/stations/byname/{encoded}).
+    Returns list of dicts: name, url_resolved, favicon, tags, country, bitrate.
+    User-Agent header required -- radio-browser.info blocks requests without it.
+    """
+    base = "https://de1.api.radio-browser.info/json"
+    if query:
+        encoded = urllib.parse.quote(query, safe="")
+        url = f"{base}/stations/byname/{encoded}?limit=50&order=votes&reverse=true&hidebroken=true"
+    else:
+        url = f"{base}/stations/topvote?limit=50&hidebroken=true"
+    req = urllib.request.Request(url, headers={"User-Agent": "discord-music-bot/1.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def _build_radio_embed(
+    stations: list[dict],
+    query: str | None,
+    page: int,
+    total_pages: int,
+) -> discord.Embed:
+    """Build the paginated radio picker embed for RadioPickerView.
+
+    Title: radio emoji + Radio Stations (no query) or Results for query (search mode).
+    Each station: bold name line, then indented genre/country/bitrate on the next line.
+    Footer: Page N of M, Powered by radio-browser.info.
+    Color: 0x3498db (matches create_np_embed and _build_search_embed).
+    """
+    radio_icon = "\U0001f4fb"  # 📻
+    bullet = "•"         # •
+    if query:
+        title = f"{radio_icon} Results for \"{query[:40]}\""
+    else:
+        title = f"{radio_icon} Radio Stations"
+
+    lines = []
+    for s in stations:
+        name = s.get("name") or "Unknown"
+        tags = s.get("tags") or ""
+        genre = tags.split(",")[0].strip().title() if tags else "Unknown"
+        country = s.get("country") or "Unknown"
+        bitrate = s.get("bitrate") or 0
+        lines.append(f"**{name}**")
+        lines.append(f"    {genre} {bullet} {country} {bullet} {bitrate}kbps")
+
+    embed = discord.Embed(
+        title=title,
+        description="\n".join(lines) if lines else "No stations found.",
+        color=0x3498db,
+    )
+    embed.set_footer(text=f"Page {page} of {total_pages} {bullet} Powered by radio-browser.info")
+    return embed
+
 
 class SearchPickerView(discord.ui.View):
     """Discord Select UI for YouTube search results. Shown after !play / /play plain-text query.

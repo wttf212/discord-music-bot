@@ -787,6 +787,86 @@ class AudioPlayer:
                 pass
         self._playback_done.set()
 
+    async def play_radio(self, track) -> dict:
+        """Stream a live radio URL directly via FFmpegPCMAudio -- no yt-dlp subprocess.
+
+        track.url: HTTP/HTTPS stream URL from radio-browser.info.
+        FFmpeg reconnect flags handle transient stream drops transparently (D-16).
+        stop_playback() needs zero changes: _ytdlp_proc stays None; voice_client.stop()
+        terminates the FFmpegPCMAudio-owned FFmpeg process via discord.py cleanup.
+        """
+        import discord
+
+        stream_url = track.url
+        title = track.title
+        thumbnail = track.thumbnail
+
+        if not self._voice_client or not self._voice_client.is_connected():
+            raise RuntimeError("Not connected to a voice channel")
+
+        loop = asyncio.get_event_loop()
+        self.stop_playback()
+
+        if self._debug:
+            print(f"[debug][player] play_radio() starting: {title} -> {stream_url}")
+
+        # Direct HTTP stream -- FFmpeg handles MP3/AAC/OGG natively.
+        # before_options go BEFORE -i (reconnect flags); options go AFTER -i (-vn = no video).
+        # Do NOT use pipe=True -- stream_url is a string URL, not a file descriptor.
+        # Do NOT prime with _PrimedAudioSource -- blocking read on a live HTTP stream
+        # can stall indefinitely if the station is slow to produce initial audio frames.
+        source = discord.FFmpegPCMAudio(
+            stream_url,
+            executable=self._ffmpeg_path,
+            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            options="-vn",
+            stderr=subprocess.PIPE,
+        )
+
+        def _log_ffmpeg_stderr(proc):
+            try:
+                for raw in proc.stderr:
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    if line:
+                        print(f"[ffmpeg] {line}")
+            except Exception:
+                pass
+        threading.Thread(
+            target=_log_ffmpeg_stderr, args=(source._process,), daemon=True
+        ).start()
+
+        self.is_playing = True
+        self.is_paused = False
+        self.current_track_title = title
+        self._playback_done.clear()
+
+        def after_playback(error):
+            if error:
+                print(f"[player] Radio playback ended with error: {error}")
+            self.is_playing = False
+            self.current_track_title = None
+            loop.call_soon_threadsafe(self._playback_done.set)
+
+        self._voice_client.play(source, after=after_playback)
+
+        encoder = getattr(self._voice_client, "encoder", None)
+        if encoder:
+            try:
+                guild_id = self._voice_client.guild.id if hasattr(self._voice_client, "guild") else None
+                bitrate_bps = self.get_bitrate_for_guild(guild_id)
+                encoder.set_signal_type("music")
+                encoder.set_fec(False)
+                encoder.set_expected_packet_loss_percent(0.01)
+                encoder.set_bitrate(bitrate_bps // 1000)
+                encoder.set_bandwidth("full")
+            except Exception:
+                pass
+
+        if self._debug:
+            print(f"[debug][player] Radio playback started: {title}")
+
+        return {"title": title, "thumbnail": thumbnail, "webpage_url": ""}
+
     async def wait_for_playback(self):
         """Wait for the current track to finish."""
         if self.is_playing:
