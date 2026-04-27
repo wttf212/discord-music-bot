@@ -5,7 +5,9 @@ A Discord music bot with YouTube and SoundCloud. (Use it at your own risk, youtu
 ## Features
 
 - 🎵 Play music from YouTube, SoundCloud, and other supported sites
+- 📻 Internet radio browser — search 30k+ stations via radio-browser.info
 - 📋 Playlist support with reaction-based loading
+- 🔀 Queue shuffle
 - 🔧 Configurable audio bitrate
 - 🔒 DAVE E2EE voice encryption support (discord.py v2.7.0+)
 - 🛡️ Automatic PO token generation via bgutil-pot (prevents YouTube bans)
@@ -64,12 +66,16 @@ Re-export every ~4 months. See `config.example.yaml` for full details.
 
 | Command | Description |
 |---------|-------------|
+| Command | Description |
+|---------|-------------|
 | `!play <url or search>` | Play a track or playlist |
+| `!radio [search]` | Browse internet radio stations; optional search term filters by name |
 | `!pause` | Pause playback |
 | `!resume` | Resume playback |
 | `!skip` | Skip current track |
 | `!stop` | Stop and leave voice |
 | `!queue` | Show queue |
+| `!shuffle` | Shuffle the current queue |
 | `!loadall` | Load remaining playlist tracks |
 | `!bitrate [kbps]` | Show or set audio bitrate |
 | `!fairplay on\|off` | Toggle user interleaving mode for queues *(admin)* |
@@ -78,6 +84,8 @@ Re-export every ~4 months. See `config.example.yaml` for full details.
 | `!removeadmin @user`| Remove a user as a bot admin for this server *(owner)* |
 | `!settc` | Restrict commands to this channel *(owner)* |
 | `!shutdown` | Shut down the bot *(owner)* |
+
+All commands also work as slash commands (e.g. `/radio jazz`, `/play lo-fi`).
 
 ## Requirements
 
