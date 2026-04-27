@@ -108,6 +108,26 @@ class TestFetchRadioStations(unittest.TestCase):
         self.assertEqual(len(result), 5)
         self.assertEqual(result[0]["name"], "Station 0")
 
+    def test_search_url_used_when_country_given(self):
+        with patch("commands.urllib.request.urlopen") as mock_urlopen, \
+             patch("commands.urllib.request.Request") as mock_req:
+            mock_urlopen.return_value = self._mock_urlopen([])
+            commands._fetch_radio_stations(None, country="US")
+        call_args = str(mock_req.call_args)
+        self.assertIn("search", call_args)
+        self.assertIn("countrycode", call_args)
+        self.assertIn("US", call_args)
+
+    def test_search_url_used_when_genre_given(self):
+        with patch("commands.urllib.request.urlopen") as mock_urlopen, \
+             patch("commands.urllib.request.Request") as mock_req:
+            mock_urlopen.return_value = self._mock_urlopen([])
+            commands._fetch_radio_stations(None, genre="jazz")
+        call_args = str(mock_req.call_args)
+        self.assertIn("search", call_args)
+        self.assertIn("tagList", call_args)
+        self.assertIn("jazz", call_args)
+
 
 class TestRadioPickerView(unittest.TestCase):
     """Tests for RadioPickerView construction and pagination controls."""
@@ -175,6 +195,55 @@ class TestRadioPickerView(unittest.TestCase):
     def test_total_pages_calculation(self):
         view = self._make_view(15)  # 15 stations / 10 per page = 2 pages
         self.assertEqual(view._total_pages, 2)
+
+
+class TestRadioDiscoveryView(unittest.TestCase):
+    """Tests for RadioDiscoveryView construction."""
+
+    def _make_view(self):
+        bot = MagicMock()
+        ctx = MagicMock()
+        msg = MagicMock()
+        return commands.RadioDiscoveryView(bot, ctx, msg)
+
+    def test_child_count(self):
+        view = self._make_view()
+        self.assertEqual(len(view.children), 3)
+
+    def test_country_select_option_count(self):
+        view = self._make_view()
+        self.assertEqual(len(view.children[0].options), 20)
+
+    def test_genre_select_option_count(self):
+        view = self._make_view()
+        self.assertEqual(len(view.children[1].options), 16)
+
+    def test_browse_button_style(self):
+        view = self._make_view()
+        import discord as _discord
+        self.assertEqual(view.children[2].style, _discord.ButtonStyle.primary)
+
+    def test_timeout_is_60(self):
+        view = self._make_view()
+        self.assertEqual(view.timeout, 60)
+
+    def test_default_country_empty(self):
+        view = self._make_view()
+        self.assertEqual(view.country, "")
+
+    def test_default_genre_empty(self):
+        view = self._make_view()
+        self.assertEqual(view.genre, "")
+
+    def test_first_country_option_is_any(self):
+        view = self._make_view()
+        self.assertEqual(view.children[0].options[0].value, "")
+        self.assertEqual(view.children[0].options[0].label, "Any country")
+
+    def test_first_genre_option_is_any(self):
+        view = self._make_view()
+        self.assertEqual(view.children[1].options[0].value, "")
+        self.assertEqual(view.children[1].options[0].label, "Any genre")
 
 
 if __name__ == "__main__":
