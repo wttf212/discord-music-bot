@@ -320,12 +320,21 @@ class RadioPickerView(discord.ui.View):
         super().__init__(timeout=60)
         self.bot = bot
         self.ctx = ctx
-        self.stations = stations
+        # Deduplicate by url_resolved and drop stations with no stream URL.
+        # radio-browser.info can return duplicate stream URLs; Discord rejects
+        # SelectOption lists with duplicate values (error code 50035).
+        seen_urls: set[str] = set()
+        self.stations = []
+        for s in stations:
+            url = s.get("url_resolved") or ""
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                self.stations.append(s)
         self.status_msg = status_msg
         self.query = query
         self.page = 0
         self.selected = False
-        self._total_pages = max(1, (len(stations) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self._total_pages = max(1, (len(self.stations) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
         self._rebuild_items()
 
     def _page_stations(self) -> list[dict]:
