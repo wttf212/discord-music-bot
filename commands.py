@@ -278,10 +278,12 @@ class RadioDiscoveryView(discord.ui.View):
     def _build_items(self):
         self.clear_items()
 
+        region_label = dict(_RADIO_REGIONS).get(self.region, "")
+        region_placeholder = f"🌍 {region_label}" if self.region != "worldwide" else "🌍 Region..."
         region_select = discord.ui.Select(
-            placeholder="🌍 Region...",
+            placeholder=region_placeholder,
             options=[
-                discord.SelectOption(label=label, value=code, default=(code == self.region))
+                discord.SelectOption(label=label, value=code)
                 for label, code in _RADIO_REGIONS
             ],
             custom_id="discovery_region",
