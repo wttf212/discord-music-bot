@@ -111,19 +111,68 @@ def _build_search_embed(query: str, results: list[dict]) -> discord.Embed:
     return embed
 
 
-_RADIO_COUNTRIES = [
-    # value must be unique across ALL selects in the message — use "any_country" sentinel
-    ("Any country", "any_country"),
-    # Top 24 countries by station count on radio-browser.info (fills Discord's 25-option limit)
-    ("Germany", "DE"), ("United States", "US"), ("France", "FR"),
-    ("United Kingdom", "GB"), ("Brazil", "BR"), ("Russia", "RU"),
-    ("Poland", "PL"), ("Netherlands", "NL"), ("Hungary", "HU"),
-    ("Romania", "RO"), ("Italy", "IT"), ("Spain", "ES"),
-    ("Czech Republic", "CZ"), ("Austria", "AT"), ("Belgium", "BE"),
-    ("Australia", "AU"), ("Canada", "CA"), ("Argentina", "AR"),
-    ("Mexico", "MX"), ("Turkey", "TR"), ("Portugal", "PT"),
-    ("India", "IN"), ("Ukraine", "UA"), ("Switzerland", "CH"),
+_RADIO_REGIONS = [
+    ("🌐 Worldwide", "worldwide"),
+    ("🇪🇺 Northern Europe", "europe_north"),
+    ("🇪🇺 Western Europe", "europe_west"),
+    ("🇪🇺 Southern Europe", "europe_south"),
+    ("🇪🇺 Eastern Europe", "europe_east"),
+    ("🌎 Americas", "americas"),
+    ("🌏 Asia & Pacific", "asia_pacific"),
+    ("🌍 Middle East & Africa", "mideast_africa"),
 ]
+
+_RADIO_REGION_COUNTRIES: dict[str, list[tuple[str, str]]] = {
+    "worldwide": [("Any country", "any_country")],
+    "europe_north": [
+        ("Any", "any_country"),
+        ("Denmark", "DK"), ("Estonia", "EE"), ("Finland", "FI"),
+        ("Iceland", "IS"), ("Latvia", "LV"), ("Lithuania", "LT"),
+        ("Norway", "NO"), ("Sweden", "SE"),
+    ],
+    "europe_west": [
+        ("Any", "any_country"),
+        ("Austria", "AT"), ("Belgium", "BE"), ("France", "FR"),
+        ("Germany", "DE"), ("Ireland", "IE"), ("Luxembourg", "LU"),
+        ("Netherlands", "NL"), ("Switzerland", "CH"), ("United Kingdom", "GB"),
+    ],
+    "europe_south": [
+        ("Any", "any_country"),
+        ("Albania", "AL"), ("Bosnia & Herzegovina", "BA"), ("Croatia", "HR"),
+        ("Cyprus", "CY"), ("Greece", "GR"), ("Italy", "IT"),
+        ("Malta", "MT"), ("Portugal", "PT"), ("Serbia", "RS"),
+        ("Slovenia", "SI"), ("Spain", "ES"),
+    ],
+    "europe_east": [
+        ("Any", "any_country"),
+        ("Belarus", "BY"), ("Bulgaria", "BG"), ("Czech Republic", "CZ"),
+        ("Hungary", "HU"), ("Moldova", "MD"), ("Poland", "PL"),
+        ("Romania", "RO"), ("Russia", "RU"), ("Slovakia", "SK"),
+        ("Ukraine", "UA"),
+    ],
+    "americas": [
+        ("Any", "any_country"),
+        ("Argentina", "AR"), ("Bolivia", "BO"), ("Brazil", "BR"),
+        ("Canada", "CA"), ("Chile", "CL"), ("Colombia", "CO"),
+        ("Ecuador", "EC"), ("Mexico", "MX"), ("Paraguay", "PY"),
+        ("Peru", "PE"), ("United States", "US"), ("Uruguay", "UY"),
+        ("Venezuela", "VE"),
+    ],
+    "asia_pacific": [
+        ("Any", "any_country"),
+        ("Australia", "AU"), ("China", "CN"), ("India", "IN"),
+        ("Indonesia", "ID"), ("Japan", "JP"), ("Malaysia", "MY"),
+        ("New Zealand", "NZ"), ("Philippines", "PH"), ("Singapore", "SG"),
+        ("South Korea", "KR"), ("Thailand", "TH"), ("Vietnam", "VN"),
+    ],
+    "mideast_africa": [
+        ("Any", "any_country"),
+        ("Egypt", "EG"), ("Ethiopia", "ET"), ("Ghana", "GH"),
+        ("Israel", "IL"), ("Kenya", "KE"), ("Morocco", "MA"),
+        ("Nigeria", "NG"), ("Saudi Arabia", "SA"), ("South Africa", "ZA"),
+        ("Turkey", "TR"), ("UAE", "AE"),
+    ],
+}
 
 _RADIO_GENRES = [
     # value must be unique across ALL selects in the message — use "any_genre" sentinel
@@ -205,11 +254,11 @@ def _build_radio_embed(
 
 
 class RadioDiscoveryView(discord.ui.View):
-    """Country + genre picker shown before the station list for /radio with no search term.
+    """Region → country → genre cascade picker for /radio with no search term.
 
-    User picks a country and/or genre, then clicks Browse. The Browse callback fetches
-    filtered stations and replaces this message with the standard RadioPickerView.
-    Either filter may be left as "Any" — both empty falls back to topvote.
+    Step 1: user picks a region — country select updates to that region's countries.
+    Step 2: user picks a country (or leaves "Any") and a genre.
+    Step 3: Browse fetches filtered stations and hands off to RadioPickerView.
     """
 
     def __init__(self, bot, ctx: commands.Context, status_msg: discord.Message):
@@ -217,17 +266,29 @@ class RadioDiscoveryView(discord.ui.View):
         self.bot = bot
         self.ctx = ctx
         self.status_msg = status_msg
-        self.country = ""
-        self.genre = ""
+        self.region = "worldwide"
+        self.country = ""   # ISO-3166-1 alpha-2, or "" for no filter
+        self.genre = ""     # tag string, or "" for no filter
         self._build_items()
 
+    def _country_options(self) -> list[discord.SelectOption]:
+        entries = _RADIO_REGION_COUNTRIES.get(self.region, [("Any country", "any_country")])
+        return [discord.SelectOption(label=label, value=code) for label, code in entries]
+
     def _build_items(self):
+        self.clear_items()
+
+        region_select = discord.ui.Select(
+            placeholder="🌍 Region...",
+            options=[discord.SelectOption(label=label, value=code) for label, code in _RADIO_REGIONS],
+            custom_id="discovery_region",
+        )
+        region_select.callback = self._on_region
+        self.add_item(region_select)
+
         country_select = discord.ui.Select(
-            placeholder="🌍 Country...",
-            options=[
-                discord.SelectOption(label=label, value=code)
-                for label, code in _RADIO_COUNTRIES
-            ],
+            placeholder="🏳️ Country...",
+            options=self._country_options(),
             custom_id="discovery_country",
         )
         country_select.callback = self._on_country
@@ -235,10 +296,7 @@ class RadioDiscoveryView(discord.ui.View):
 
         genre_select = discord.ui.Select(
             placeholder="🎵 Genre...",
-            options=[
-                discord.SelectOption(label=label, value=tag)
-                for label, tag in _RADIO_GENRES
-            ],
+            options=[discord.SelectOption(label=label, value=tag) for label, tag in _RADIO_GENRES],
             custom_id="discovery_genre",
         )
         genre_select.callback = self._on_genre
@@ -252,12 +310,20 @@ class RadioDiscoveryView(discord.ui.View):
         browse_btn.callback = self._on_browse
         self.add_item(browse_btn)
 
+    async def _on_region(self, interaction: discord.Interaction):
+        self.region = interaction.data["values"][0]
+        self.country = ""   # reset when region changes
+        self._build_items()
+        await interaction.response.edit_message(view=self)
+
     async def _on_country(self, interaction: discord.Interaction):
-        self.country = interaction.data["values"][0]
+        value = interaction.data["values"][0]
+        self.country = "" if value == "any_country" else value
         await interaction.response.defer()
 
     async def _on_genre(self, interaction: discord.Interaction):
-        self.genre = interaction.data["values"][0]
+        value = interaction.data["values"][0]
+        self.genre = "" if value == "any_genre" else value
         await interaction.response.defer()
 
     async def _on_browse(self, interaction: discord.Interaction):
@@ -265,11 +331,9 @@ class RadioDiscoveryView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(content="📻 Loading stations...", embed=None, view=self)
-        country = "" if self.country in ("any_country", "") else self.country
-        genre = "" if self.genre in ("any_genre", "") else self.genre
         try:
             stations = await asyncio.get_event_loop().run_in_executor(
-                None, _fetch_radio_stations, None, country, genre
+                None, _fetch_radio_stations, None, self.country, self.genre
             )
         except Exception as e:
             await self.status_msg.edit(content=f"Radio catalog error: {e}", embed=None, view=None)
@@ -279,13 +343,17 @@ class RadioDiscoveryView(discord.ui.View):
             return
         total_pages = max(1, (len(stations) + RadioPickerView.PAGE_SIZE - 1) // RadioPickerView.PAGE_SIZE)
         page_stations = stations[:RadioPickerView.PAGE_SIZE]
-        # Build a display label for the embed title from the chosen filters
-        filter_label = " • ".join(
-            p for p in [
-                dict(_RADIO_COUNTRIES).get(country, country) if country else "",
-                dict(_RADIO_GENRES).get(genre, genre).title() if genre else "",
-            ] if p
-        ) or None
+        # Build embed title from active filters
+        label_parts = []
+        if self.country:
+            for entries in _RADIO_REGION_COUNTRIES.values():
+                for name, code in entries:
+                    if code == self.country:
+                        label_parts.append(name)
+                        break
+        if self.genre:
+            label_parts.append(dict(_RADIO_GENRES).get(self.genre, self.genre).title())
+        filter_label = " • ".join(label_parts) or None
         embed = _build_radio_embed(page_stations, filter_label, 1, total_pages)
         view = RadioPickerView(self.bot, self.ctx, stations, self.status_msg, query=filter_label)
         await self.status_msg.edit(content=None, embed=embed, view=view)

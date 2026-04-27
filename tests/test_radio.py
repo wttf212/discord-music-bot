@@ -198,59 +198,70 @@ class TestRadioPickerView(unittest.TestCase):
 
 
 class TestRadioDiscoveryView(unittest.TestCase):
-    """Tests for RadioDiscoveryView construction."""
+    """Tests for RadioDiscoveryView region→country cascade construction."""
 
     def _make_view(self):
-        bot = MagicMock()
-        ctx = MagicMock()
-        msg = MagicMock()
-        return commands.RadioDiscoveryView(bot, ctx, msg)
+        return commands.RadioDiscoveryView(MagicMock(), MagicMock(), MagicMock())
 
     def test_child_count(self):
+        """Region select + country select + genre select + Browse button = 4."""
         view = self._make_view()
-        self.assertEqual(len(view.children), 3)
+        self.assertEqual(len(view.children), 4)
 
-    def test_country_select_option_count(self):
+    def test_region_select_option_count(self):
         view = self._make_view()
-        self.assertEqual(len(view.children[0].options), 25)  # Any + 24 countries
+        self.assertEqual(len(view.children[0].options), len(commands._RADIO_REGIONS))
+
+    def test_country_select_default_is_worldwide(self):
+        """Initially shows just 'Any country' (worldwide region)."""
+        view = self._make_view()
+        self.assertEqual(len(view.children[1].options), 1)
+        self.assertEqual(view.children[1].options[0].value, "any_country")
 
     def test_genre_select_option_count(self):
         view = self._make_view()
-        self.assertEqual(len(view.children[1].options), 16)
+        self.assertEqual(len(view.children[2].options), 16)
 
     def test_browse_button_style(self):
-        view = self._make_view()
         import discord as _discord
-        self.assertEqual(view.children[2].style, _discord.ButtonStyle.primary)
+        view = self._make_view()
+        self.assertEqual(view.children[3].style, _discord.ButtonStyle.primary)
 
     def test_timeout_is_60(self):
-        view = self._make_view()
-        self.assertEqual(view.timeout, 60)
+        self.assertEqual(self._make_view().timeout, 60)
+
+    def test_default_region_is_worldwide(self):
+        self.assertEqual(self._make_view().region, "worldwide")
 
     def test_default_country_empty(self):
-        view = self._make_view()
-        self.assertEqual(view.country, "")
+        self.assertEqual(self._make_view().country, "")
 
     def test_default_genre_empty(self):
-        view = self._make_view()
-        self.assertEqual(view.genre, "")
+        self.assertEqual(self._make_view().genre, "")
 
-    def test_first_country_option_is_any(self):
-        view = self._make_view()
-        self.assertEqual(view.children[0].options[0].value, "any_country")
-        self.assertEqual(view.children[0].options[0].label, "Any country")
+    def test_northern_europe_has_latvia(self):
+        """Latvia must appear under the Northern Europe region."""
+        codes = [code for _, code in commands._RADIO_REGION_COUNTRIES["europe_north"]]
+        self.assertIn("LV", codes)
 
-    def test_first_genre_option_is_any(self):
-        view = self._make_view()
-        self.assertEqual(view.children[1].options[0].value, "any_genre")
-        self.assertEqual(view.children[1].options[0].label, "Any genre")
+    def test_all_region_country_options_within_discord_limit(self):
+        """Every region's country list must fit in Discord's 25-option Select limit."""
+        for region, entries in commands._RADIO_REGION_COUNTRIES.items():
+            self.assertLessEqual(len(entries), 25, f"{region} exceeds 25 options")
 
-    def test_sentinel_values_are_distinct(self):
-        """any_country and any_genre must differ so Discord doesn't see a cross-select duplicate."""
-        country_sentinels = {o.value for o in self._make_view().children[0].options}
-        genre_sentinels = {o.value for o in self._make_view().children[1].options}
-        self.assertFalse(country_sentinels & genre_sentinels,
-                         "Country and genre selects share at least one option value")
+    def test_no_duplicate_values_within_any_region(self):
+        for region, entries in commands._RADIO_REGION_COUNTRIES.items():
+            values = [v for _, v in entries]
+            self.assertEqual(len(values), len(set(values)), f"Duplicate values in {region}")
+
+    def test_sentinel_values_disjoint_across_selects(self):
+        """Region, country, and genre selects must not share any option value."""
+        view = self._make_view()
+        region_vals = {o.value for o in view.children[0].options}
+        country_vals = {o.value for o in view.children[1].options}
+        genre_vals = {o.value for o in view.children[2].options}
+        self.assertFalse(region_vals & genre_vals, "Region and genre share a value")
+        self.assertFalse(country_vals & genre_vals, "Country and genre share a value")
 
 
 if __name__ == "__main__":
