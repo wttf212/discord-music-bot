@@ -1246,6 +1246,46 @@ class MusicCog(commands.Cog):
             except Exception as e:
                 await status_msg.edit(content=f"Error playing track: {e}")
 
+    @commands.hybrid_command(name="radio", description="Browse or search internet radio stations")
+    @app_commands.describe(query="Station name to search, or leave blank for top stations")
+    async def radio(self, ctx: commands.Context, *, query: str = None):
+        """Browse and stream internet radio stations.
+
+        No query: shows top stations by popularity (topvote).
+        With query: fuzzy name search across 30k+ stations.
+        Uses radio-browser.info REST API (no API key required, D-01).
+        """
+        if not await check_channel(ctx):
+            return
+
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            await ctx.send("You need to be in a voice channel.")
+            return
+
+        # Extend slash command 3-second response window (no-op for prefix form)
+        await ctx.defer()
+        status_msg = await ctx.send("📻 Loading stations...")
+
+        try:
+            stations = await asyncio.get_event_loop().run_in_executor(
+                None, _fetch_radio_stations, query
+            )
+        except Exception as e:
+            await status_msg.edit(content=f"Radio catalog error: {e}")
+            return
+
+        if not stations:
+            msg = f"No stations found for \"{query[:50]}\"." if query else "Could not load stations."
+            await status_msg.edit(content=msg)
+            return
+
+        total_pages = max(1, (len(stations) + RadioPickerView.PAGE_SIZE - 1) // RadioPickerView.PAGE_SIZE)
+        page_stations = stations[:RadioPickerView.PAGE_SIZE]
+        embed = _build_radio_embed(page_stations, query, 1, total_pages)
+        view = RadioPickerView(self.bot, ctx, stations, status_msg, query=query)
+        await status_msg.edit(content=None, embed=embed, view=view)
+        # RadioPickerView._on_select -> _play_radio_selected continues the flow
+
     @commands.command(name="pause")
     async def pause(self, ctx: commands.Context):
         if not await check_channel(ctx):
