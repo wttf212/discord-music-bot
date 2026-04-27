@@ -111,11 +111,30 @@ def _build_search_embed(query: str, results: list[dict]) -> discord.Embed:
     return embed
 
 
-def _fetch_radio_stations(query: str | None) -> list[dict]:
+_RADIO_COUNTRIES = [
+    ("Any country", ""),
+    ("United States", "US"), ("Germany", "DE"), ("United Kingdom", "GB"),
+    ("France", "FR"), ("Brazil", "BR"), ("Russia", "RU"), ("Poland", "PL"),
+    ("Netherlands", "NL"), ("Italy", "IT"), ("Spain", "ES"), ("Canada", "CA"),
+    ("Australia", "AU"), ("India", "IN"), ("Argentina", "AR"), ("Turkey", "TR"),
+    ("Mexico", "MX"), ("Czech Republic", "CZ"), ("Hungary", "HU"), ("Romania", "RO"),
+]
+
+_RADIO_GENRES = [
+    ("Any genre", ""),
+    ("Pop", "pop"), ("Rock", "rock"), ("Jazz", "jazz"), ("Electronic", "electronic"),
+    ("Classical", "classical"), ("Hip-Hop", "hip-hop"), ("Country", "country"),
+    ("Metal", "metal"), ("R&B", "rnb"), ("Reggae", "reggae"), ("Folk", "folk"),
+    ("News", "news"), ("Talk", "talk"), ("Dance", "dance"), ("Techno", "techno"),
+]
+
+
+def _fetch_radio_stations(query: str | None, country: str = "", genre: str = "") -> list[dict]:
     """Fetch stations from radio-browser.info. BLOCKS: call via run_in_executor.
 
-    No query  -> top 50 stations by vote count (/json/stations/topvote).
-    With query -> fuzzy name search (/json/stations/byname/{encoded}).
+    No query, no filters -> top 50 stations by vote count (/json/stations/topvote).
+    With query           -> fuzzy name search (/json/stations/byname/{encoded}).
+    With country/genre   -> filtered search (/json/stations/search).
     Returns list of dicts: name, url_resolved, favicon, tags, country, bitrate.
     User-Agent header required -- radio-browser.info blocks requests without it.
     """
@@ -123,6 +142,16 @@ def _fetch_radio_stations(query: str | None) -> list[dict]:
     if query:
         encoded = urllib.parse.quote(query, safe="")
         url = f"{base}/stations/byname/{encoded}?limit=50&order=votes&reverse=true&hidebroken=true"
+    elif country or genre:
+        params = urllib.parse.urlencode({
+            "countrycode": country,
+            "tagList": genre,
+            "limit": 50,
+            "order": "votes",
+            "reverse": "true",
+            "hidebroken": "true",
+        })
+        url = f"{base}/stations/search?{params}"
     else:
         url = f"{base}/stations/topvote?limit=50&hidebroken=true"
     req = urllib.request.Request(url, headers={"User-Agent": "discord-music-bot/1.0"})
@@ -167,6 +196,103 @@ def _build_radio_embed(
     )
     embed.set_footer(text=f"Page {page} of {total_pages} {bullet} Powered by radio-browser.info")
     return embed
+
+
+class RadioDiscoveryView(discord.ui.View):
+    """Country + genre picker shown before the station list for /radio with no search term.
+
+    User picks a country and/or genre, then clicks Browse. The Browse callback fetches
+    filtered stations and replaces this message with the standard RadioPickerView.
+    Either filter may be left as "Any" — both empty falls back to topvote.
+    """
+
+    def __init__(self, bot, ctx: commands.Context, status_msg: discord.Message):
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.ctx = ctx
+        self.status_msg = status_msg
+        self.country = ""
+        self.genre = ""
+        self._build_items()
+
+    def _build_items(self):
+        country_select = discord.ui.Select(
+            placeholder="🌍 Country...",
+            options=[
+                discord.SelectOption(label=label, value=code)
+                for label, code in _RADIO_COUNTRIES
+            ],
+            custom_id="discovery_country",
+        )
+        country_select.callback = self._on_country
+        self.add_item(country_select)
+
+        genre_select = discord.ui.Select(
+            placeholder="🎵 Genre...",
+            options=[
+                discord.SelectOption(label=label, value=tag)
+                for label, tag in _RADIO_GENRES
+            ],
+            custom_id="discovery_genre",
+        )
+        genre_select.callback = self._on_genre
+        self.add_item(genre_select)
+
+        browse_btn = discord.ui.Button(
+            label="Browse Stations",
+            style=discord.ButtonStyle.primary,
+            custom_id="discovery_browse",
+        )
+        browse_btn.callback = self._on_browse
+        self.add_item(browse_btn)
+
+    async def _on_country(self, interaction: discord.Interaction):
+        self.country = interaction.data["values"][0]
+        await interaction.response.defer()
+
+    async def _on_genre(self, interaction: discord.Interaction):
+        self.genre = interaction.data["values"][0]
+        await interaction.response.defer()
+
+    async def _on_browse(self, interaction: discord.Interaction):
+        self.stop()
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="📻 Loading stations...", embed=None, view=self)
+        try:
+            stations = await asyncio.get_event_loop().run_in_executor(
+                None, _fetch_radio_stations, None, self.country, self.genre
+            )
+        except Exception as e:
+            await self.status_msg.edit(content=f"Radio catalog error: {e}", embed=None, view=None)
+            return
+        if not stations:
+            await self.status_msg.edit(content="No stations found for those filters.", embed=None, view=None)
+            return
+        total_pages = max(1, (len(stations) + RadioPickerView.PAGE_SIZE - 1) // RadioPickerView.PAGE_SIZE)
+        page_stations = stations[:RadioPickerView.PAGE_SIZE]
+        # Build a display label for the embed title from the chosen filters
+        filter_label = " • ".join(
+            p for p in [
+                dict(_RADIO_COUNTRIES).get(self.country, self.country) if self.country else "",
+                dict(_RADIO_GENRES).get(self.genre, self.genre).title() if self.genre else "",
+            ] if p
+        ) or None
+        embed = _build_radio_embed(page_stations, filter_label, 1, total_pages)
+        view = RadioPickerView(self.bot, self.ctx, stations, self.status_msg, query=filter_label)
+        await self.status_msg.edit(content=None, embed=embed, view=view)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        try:
+            await self.status_msg.edit(
+                content="Discovery expired — use `/radio` again.",
+                embed=None,
+                view=self,
+            )
+        except Exception:
+            pass
 
 
 class RadioPickerView(discord.ui.View):
@@ -1247,11 +1373,11 @@ class MusicCog(commands.Cog):
                 await status_msg.edit(content=f"Error playing track: {e}")
 
     @commands.hybrid_command(name="radio", description="Browse or search internet radio stations")
-    @app_commands.describe(query="Station name to search, or leave blank for top stations")
+    @app_commands.describe(query="Station name to search, or leave blank to browse by country/genre")
     async def radio(self, ctx: commands.Context, *, query: str = None):
         """Browse and stream internet radio stations.
 
-        No query: shows top stations by popularity (topvote).
+        No query: shows country + genre picker for discovery.
         With query: fuzzy name search across 30k+ stations.
         Uses radio-browser.info REST API (no API key required, D-01).
         """
@@ -1262,10 +1388,22 @@ class MusicCog(commands.Cog):
             await ctx.send("You need to be in a voice channel.")
             return
 
-        # Extend slash command 3-second response window (no-op for prefix form)
         await ctx.defer()
-        status_msg = await ctx.send("📻 Loading stations...")
 
+        if not query:
+            # Discovery mode: let user narrow by country + genre before loading stations
+            status_msg = await ctx.send("📻 Discover Radio")
+            embed = discord.Embed(
+                title="📻 Discover Radio",
+                description="Pick a country and genre to browse stations, or leave either as \"Any\" to browse all.",
+                color=0x3498db,
+            )
+            view = RadioDiscoveryView(self.bot, ctx, status_msg)
+            await status_msg.edit(content=None, embed=embed, view=view)
+            return
+
+        # Search mode: go straight to byname results
+        status_msg = await ctx.send("📻 Searching stations...")
         try:
             stations = await asyncio.get_event_loop().run_in_executor(
                 None, _fetch_radio_stations, query
@@ -1275,8 +1413,7 @@ class MusicCog(commands.Cog):
             return
 
         if not stations:
-            msg = f"No stations found for \"{query[:50]}\"." if query else "Could not load stations."
-            await status_msg.edit(content=msg)
+            await status_msg.edit(content=f"No stations found for \"{query[:50]}\".")
             return
 
         total_pages = max(1, (len(stations) + RadioPickerView.PAGE_SIZE - 1) // RadioPickerView.PAGE_SIZE)
