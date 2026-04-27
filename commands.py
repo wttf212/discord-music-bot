@@ -169,6 +169,202 @@ def _build_radio_embed(
     return embed
 
 
+class RadioPickerView(discord.ui.View):
+    """Paginated radio station picker. Shows 10 stations per page.
+
+    After a station is selected via the Select dropdown, _play_radio_selected()
+    starts radio playback. Prev/Next buttons navigate pages without fetching new
+    data from radio-browser.info -- the full station list is held in self.stations.
+    On 60-second timeout, controls are disabled and the message is edited to an
+    expiry notice per D-07.
+    """
+
+    PAGE_SIZE = 10
+
+    def __init__(self, bot, ctx: commands.Context, stations: list[dict],
+                 status_msg: discord.Message, query: str | None = None):
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.ctx = ctx
+        self.stations = stations
+        self.status_msg = status_msg
+        self.query = query
+        self.page = 0
+        self.selected = False
+        self._total_pages = max(1, (len(stations) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self._rebuild_items()
+
+    def _page_stations(self) -> list[dict]:
+        start = self.page * self.PAGE_SIZE
+        return self.stations[start:start + self.PAGE_SIZE]
+
+    def _rebuild_items(self):
+        """Clear children and rebuild Select + Prev/Next buttons for the current page."""
+        self.clear_items()
+        page_stations = self._page_stations()
+        options = []
+        for s in page_stations:
+            name = (s.get("name") or "Unknown")[:100]
+            tags = s.get("tags") or ""
+            genre = tags.split(",")[0].strip().title() if tags else "Unknown"
+            country = s.get("country") or "Unknown"
+            bitrate = s.get("bitrate") or 0
+            desc = f"{genre} • {country} • {bitrate}kbps"
+            options.append(discord.SelectOption(
+                label=name,
+                value=s.get("url_resolved") or "",
+                description=desc[:100],
+            ))
+        select = discord.ui.Select(
+            placeholder="Pick a station...",
+            options=options,
+        )
+        select.callback = self._on_select
+        self.add_item(select)
+
+        btn_prev = discord.ui.Button(
+            label="⏮️ Prev",
+            style=discord.ButtonStyle.secondary,
+            custom_id="radio_btn_prev",
+            disabled=(self.page == 0),
+        )
+        btn_prev.callback = self._on_prev
+        self.add_item(btn_prev)
+
+        btn_next = discord.ui.Button(
+            label="Next ⏭️",
+            style=discord.ButtonStyle.secondary,
+            custom_id="radio_btn_next",
+            disabled=(self.page >= self._total_pages - 1),
+        )
+        btn_next.callback = self._on_next
+        self.add_item(btn_next)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        self.selected = True
+        self.stop()
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="▶️ Loading...", embed=None, view=self)
+        selected_url = interaction.data["values"][0]
+        # Find full station dict by url_resolved so _play_radio_selected has all metadata
+        station = next(
+            (s for s in self.stations if s.get("url_resolved") == selected_url),
+            {"url_resolved": selected_url, "name": selected_url, "favicon": "", "tags": "", "country": "", "bitrate": 0},
+        )
+        # Validate stream URL scheme before passing to FFmpeg (T-09-05)
+        url = station.get("url_resolved") or ""
+        if not (url.startswith("http://") or url.startswith("https://")):
+            await self.status_msg.edit(content="Invalid stream URL scheme -- only http:// and https:// are supported.", embed=None, view=None)
+            return
+        await _play_radio_selected(self.bot, self.ctx, station, self.status_msg)
+
+    async def _on_prev(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1)
+        self._rebuild_items()
+        embed = _build_radio_embed(self._page_stations(), self.query, self.page + 1, self._total_pages)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def _on_next(self, interaction: discord.Interaction):
+        self.page = min(self._total_pages - 1, self.page + 1)
+        self._rebuild_items()
+        embed = _build_radio_embed(self._page_stations(), self.query, self.page + 1, self._total_pages)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        try:
+            await self.status_msg.edit(
+                content="Radio browser expired — use `/radio` again.",
+                embed=None,
+                view=self,
+            )
+        except Exception:
+            pass
+
+
+async def _play_radio_selected(bot, ctx: commands.Context, station: dict,
+                               picker_msg: discord.Message):
+    """Continue the play flow with a radio station selected from RadioPickerView.
+
+    Mirrors _play_selected() but calls gs.player.play_radio(track) instead of
+    gs.player.play(url). The Track has is_radio=True so it is excluded from history.
+    NP embed shows extra_desc="\U0001f534 LIVE" instead of a duration.
+    """
+    guild_id = str(ctx.guild.id)
+    gs = bot.get_guild_state(ctx.guild.id)
+    voice_channel = ctx.author.voice.channel
+    user_id = str(ctx.author.id)
+    channel_id = ctx.channel.id
+
+    stream_url = station.get("url_resolved") or ""
+    station_name = station.get("name") or stream_url
+    favicon = station.get("favicon") or ""
+
+    # --- Join voice if not already connected ---
+    voice_client = ctx.guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        if voice_client:
+            try:
+                await voice_client.disconnect(force=True)
+            except Exception:
+                pass
+            gs.player._voice_client = None
+        try:
+            voice_client = await voice_channel.connect()
+            gs.player.set_voice_client(voice_client)
+            saved_br = get_bitrate(guild_id)
+            if saved_br:
+                await gs.player.set_bitrate(ctx.guild.id, saved_br)
+            saved_bass = get_eq_bass(guild_id)
+            saved_treble = get_eq_treble(guild_id)
+            if saved_bass != 0 or saved_treble != 0:
+                await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+        except Exception as e:
+            await picker_msg.edit(
+                content=f"Failed to join voice channel: {e}",
+                embed=None, view=None,
+            )
+            return
+
+    # Stop current playback if any
+    if gs.player.is_playing:
+        gs.player.stop_playback()
+
+    # Build the Track with is_radio=True (D-11: excluded from _history)
+    track = Track(
+        query=station_name,
+        title=station_name,
+        requested_by=user_id,
+        thumbnail=favicon,
+        url=stream_url,
+        is_radio=True,
+    )
+
+    try:
+        await gs.player.play_radio(track)
+        gs.queue.current = track
+
+        embed = create_np_embed(
+            bot, station_name,
+            extra_desc="\U0001f534 LIVE",
+            thumbnail=favicon,
+            url="",
+            requester_name=f"<@{user_id}>",
+            queue_tracks=gs.queue.preview_fair_order(),
+            guild_id=ctx.guild.id,
+        )
+        await picker_msg.delete()
+        await send_new_np(bot, channel_id, embed)
+        _start_auto_next(bot, channel_id, ctx.guild.id)
+    except Exception as e:
+        await picker_msg.edit(
+            content=f"Error starting radio: {e}",
+            embed=None, view=None,
+        )
+
+
 class SearchPickerView(discord.ui.View):
     """Discord Select UI for YouTube search results. Shown after !play / /play plain-text query.
 
@@ -1049,6 +1245,46 @@ class MusicCog(commands.Cog):
                 _start_auto_next(self.bot, channel_id, ctx.guild.id)
             except Exception as e:
                 await status_msg.edit(content=f"Error playing track: {e}")
+
+    @commands.hybrid_command(name="radio", description="Browse or search internet radio stations")
+    @app_commands.describe(query="Station name to search, or leave blank for top stations")
+    async def radio(self, ctx: commands.Context, *, query: str = None):
+        """Browse and stream internet radio stations.
+
+        No query: shows top stations by popularity (topvote).
+        With query: fuzzy name search across 30k+ stations.
+        Uses radio-browser.info REST API (no API key required, D-01).
+        """
+        if not await check_channel(ctx):
+            return
+
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            await ctx.send("You need to be in a voice channel.")
+            return
+
+        # Extend slash command 3-second response window (no-op for prefix form)
+        await ctx.defer()
+        status_msg = await ctx.send("📻 Loading stations...")
+
+        try:
+            stations = await asyncio.get_event_loop().run_in_executor(
+                None, _fetch_radio_stations, query
+            )
+        except Exception as e:
+            await status_msg.edit(content=f"Radio catalog error: {e}")
+            return
+
+        if not stations:
+            msg = f"No stations found for \"{query[:50]}\"." if query else "Could not load stations."
+            await status_msg.edit(content=msg)
+            return
+
+        total_pages = max(1, (len(stations) + RadioPickerView.PAGE_SIZE - 1) // RadioPickerView.PAGE_SIZE)
+        page_stations = stations[:RadioPickerView.PAGE_SIZE]
+        embed = _build_radio_embed(page_stations, query, 1, total_pages)
+        view = RadioPickerView(self.bot, ctx, stations, status_msg, query=query)
+        await status_msg.edit(content=None, embed=embed, view=view)
+        # RadioPickerView._on_select -> _play_radio_selected continues the flow
 
     @commands.command(name="pause")
     async def pause(self, ctx: commands.Context):
