@@ -1,6 +1,8 @@
 import asyncio
 import json
+import random
 import re
+import socket
 import urllib.parse
 import urllib.request
 import discord
@@ -184,6 +186,25 @@ _RADIO_GENRES = [
 ]
 
 
+def _radio_browser_base() -> str:
+    """Pick a live radio-browser.info API server via DNS round-robin.
+
+    radio-browser.info runs multiple servers; all.api.radio-browser.info resolves
+    to all of them. Picking one randomly distributes load and avoids hitting a
+    single flaky node (WinError 10054 / connection reset from overloaded servers).
+    Falls back to de1 if DNS lookup fails.
+    """
+    try:
+        results = socket.getaddrinfo("all.api.radio-browser.info", 443, proto=socket.IPPROTO_TCP)
+        host = random.choice(results)[4][0]
+        # IPv6 addresses need brackets in URLs
+        if ":" in host:
+            host = f"[{host}]"
+        return f"https://{host}/json"
+    except OSError:
+        return "https://de1.api.radio-browser.info/json"
+
+
 def _fetch_radio_stations(query: str | None, country: str = "", genre: str = "") -> list[dict]:
     """Fetch stations from radio-browser.info. BLOCKS: call via run_in_executor.
 
@@ -193,7 +214,7 @@ def _fetch_radio_stations(query: str | None, country: str = "", genre: str = "")
     Returns list of dicts: name, url_resolved, favicon, tags, country, bitrate.
     User-Agent header required -- radio-browser.info blocks requests without it.
     """
-    base = "https://de1.api.radio-browser.info/json"
+    base = _radio_browser_base()
     if query:
         encoded = urllib.parse.quote(query, safe="")
         url = f"{base}/stations/byname/{encoded}?limit=50&order=votes&reverse=true&hidebroken=true"
