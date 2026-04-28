@@ -257,8 +257,8 @@ class RadioDiscoveryView(discord.ui.View):
     """Region → country → genre cascade picker for /radio with no search term.
 
     Step 1: user picks a region — country select updates to that region's countries.
-    Step 2: user picks a country (or leaves "Any") and a genre.
-    Step 3: Browse fetches filtered stations and hands off to RadioPickerView.
+    Region/country/genre picker for /radio with no search term.
+    Any dropdown selection immediately fetches stations and transitions to RadioPickerView.
     """
 
     def __init__(self, bot, ctx: commands.Context, status_msg: discord.Message):
@@ -278,7 +278,7 @@ class RadioDiscoveryView(discord.ui.View):
     def _build_items(self):
         self.clear_items()
 
-        region_label = dict(_RADIO_REGIONS).get(self.region, "")
+        region_label = {code: label for label, code in _RADIO_REGIONS}.get(self.region, "")
         region_placeholder = f"🌍 {region_label}" if self.region != "worldwide" else "🌍 Region..."
         region_select = discord.ui.Select(
             placeholder=region_placeholder,
@@ -307,31 +307,22 @@ class RadioDiscoveryView(discord.ui.View):
         genre_select.callback = self._on_genre
         self.add_item(genre_select)
 
-        browse_btn = discord.ui.Button(
-            label="Browse Stations",
-            style=discord.ButtonStyle.primary,
-            custom_id="discovery_browse",
-        )
-        browse_btn.callback = self._on_browse
-        self.add_item(browse_btn)
-
     async def _on_region(self, interaction: discord.Interaction):
         self.region = interaction.data["values"][0]
         self.country = ""   # reset when region changes
-        self._build_items()
-        await interaction.response.edit_message(view=self)
+        await self._auto_browse(interaction)
 
     async def _on_country(self, interaction: discord.Interaction):
         value = interaction.data["values"][0]
         self.country = "" if value == "any_country" else value
-        await interaction.response.defer()
+        await self._auto_browse(interaction)
 
     async def _on_genre(self, interaction: discord.Interaction):
         value = interaction.data["values"][0]
         self.genre = "" if value == "any_genre" else value
-        await interaction.response.defer()
+        await self._auto_browse(interaction)
 
-    async def _on_browse(self, interaction: discord.Interaction):
+    async def _auto_browse(self, interaction: discord.Interaction):
         self.stop()
         for child in self.children:
             child.disabled = True
