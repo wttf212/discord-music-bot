@@ -1,8 +1,10 @@
 import asyncio
+import http.client
 import json
 import random
 import re
 import socket
+import ssl
 import urllib.parse
 import urllib.request
 import discord
@@ -186,23 +188,21 @@ _RADIO_GENRES = [
 ]
 
 
-def _radio_browser_base() -> str:
-    """Pick a live radio-browser.info API server via DNS round-robin.
+_RADIO_SNI = "all.api.radio-browser.info"
 
-    radio-browser.info runs multiple servers; all.api.radio-browser.info resolves
-    to all of them. Picking one randomly distributes load and avoids hitting a
-    single flaky node (WinError 10054 / connection reset from overloaded servers).
-    Falls back to de1 if DNS lookup fails.
+
+class _RadioHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection that TCP-connects to a chosen IP but validates SSL against _RADIO_SNI.
+
+    http.client.HTTPSConnection derives server_hostname from self.host, so connecting
+    to a raw IP causes cert verification to fail (cert is issued to the domain, not the
+    IP). Overriding connect() lets us use the correct SNI hostname for SSL while still
+    targeting a specific server IP for load distribution / WinError 10054 avoidance.
     """
-    try:
-        results = socket.getaddrinfo("all.api.radio-browser.info", 443, proto=socket.IPPROTO_TCP)
-        host = random.choice(results)[4][0]
-        # IPv6 addresses need brackets in URLs
-        if ":" in host:
-            host = f"[{host}]"
-        return f"https://{host}/json"
-    except OSError:
-        return "https://de1.api.radio-browser.info/json"
+
+    def connect(self):
+        http.client.HTTPConnection.connect(self)
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=_RADIO_SNI)
 
 
 def _fetch_radio_stations(query: str | None, country: str = "", genre: str = "") -> list[dict]:
@@ -214,12 +214,17 @@ def _fetch_radio_stations(query: str | None, country: str = "", genre: str = "")
     Returns list of dicts: name, url_resolved, favicon, tags, country, bitrate.
     User-Agent header required -- radio-browser.info blocks requests without it.
     """
-    base = _radio_browser_base()
+    try:
+        results = socket.getaddrinfo(_RADIO_SNI, 443, proto=socket.IPPROTO_TCP)
+        ip = random.choice(results)[4][0]
+    except OSError:
+        ip = "de1.api.radio-browser.info"
+
     if query:
         encoded = urllib.parse.quote(query, safe="")
-        url = f"{base}/stations/byname/{encoded}?limit=50&order=votes&reverse=true&hidebroken=true"
+        path = f"/json/stations/byname/{encoded}?limit=50&order=votes&reverse=true&hidebroken=true"
     elif country or genre:
-        params = urllib.parse.urlencode({
+        qs = urllib.parse.urlencode({
             "countrycode": country,
             "tagList": genre,
             "limit": 50,
@@ -227,12 +232,15 @@ def _fetch_radio_stations(query: str | None, country: str = "", genre: str = "")
             "reverse": "true",
             "hidebroken": "true",
         })
-        url = f"{base}/stations/search?{params}"
+        path = f"/json/stations/search?{qs}"
     else:
-        url = f"{base}/stations/topvote?limit=50&hidebroken=true"
-    req = urllib.request.Request(url, headers={"User-Agent": "discord-music-bot/1.0"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read())
+        path = "/json/stations/topvote?limit=50&hidebroken=true"
+
+    ctx = ssl.create_default_context()
+    conn = _RadioHTTPSConnection(ip, context=ctx)
+    conn.request("GET", path, headers={"User-Agent": "discord-music-bot/1.0", "Host": _RADIO_SNI})
+    resp = conn.getresponse()
+    return json.loads(resp.read())
 
 
 def _build_radio_embed(
@@ -440,7 +448,8 @@ class RadioPickerView(discord.ui.View):
         self.clear_items()
         page_stations = self._page_stations()
         options = []
-        for s in page_stations:
+        start = self.page * self.PAGE_SIZE
+        for i, s in enumerate(page_stations):
             name = (s.get("name") or "Unknown")[:100]
             tags = s.get("tags") or ""
             genre = tags.split(",")[0].strip().title() if tags else "Unknown"
@@ -449,7 +458,7 @@ class RadioPickerView(discord.ui.View):
             desc = f"{genre} • {country} • {bitrate}kbps"
             options.append(discord.SelectOption(
                 label=name,
-                value=s.get("url_resolved") or "",
+                value=str(start + i),   # absolute index — URLs can exceed Discord's 100-char limit
                 description=desc[:100],
             ))
         select = discord.ui.Select(
@@ -483,12 +492,7 @@ class RadioPickerView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(content="▶️ Loading...", embed=None, view=self)
-        selected_url = interaction.data["values"][0]
-        # Find full station dict by url_resolved so _play_radio_selected has all metadata
-        station = next(
-            (s for s in self.stations if s.get("url_resolved") == selected_url),
-            {"url_resolved": selected_url, "name": selected_url, "favicon": "", "tags": "", "country": "", "bitrate": 0},
-        )
+        station = self.stations[int(interaction.data["values"][0])]
         # Validate stream URL scheme before passing to FFmpeg (T-09-05)
         url = station.get("url_resolved") or ""
         if not (url.startswith("http://") or url.startswith("https://")):
@@ -647,7 +651,7 @@ class SearchPickerView(discord.ui.View):
             child.disabled = True
         try:
             await self.status_msg.edit(
-                content="Search expired — use `!play` again.",
+                content="Search expired — use `!search` again.",
                 embed=None,
                 view=self,
             )
@@ -1170,14 +1174,45 @@ class MusicCog(commands.Cog):
         set_allowed_channel(guild_id, channel_id)
         await ctx.send(f"Commands are now restricted to <#{channel_id}>.")
 
-    @commands.hybrid_command(name="play", description="Play a song or search YouTube")
-    @app_commands.describe(query="Song name or URL to play")
+    @commands.hybrid_command(name="search", description="Search YouTube and pick a result to play")
+    @app_commands.describe(query="Song name or keywords to search for")
+    async def search(self, ctx: commands.Context, *, query: str = None):
+        if not await check_channel(ctx):
+            return
+
+        if not query:
+            await ctx.send(f"Usage: `{self.bot.command_prefix}search <keywords>`")
+            return
+
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            await ctx.send("You need to be in a voice channel.")
+            return
+
+        query = _strip_ytsearch_prefix(query)
+        await ctx.defer()
+        status_msg = await ctx.send("🔍 Searching...")
+        try:
+            results = await asyncio.get_event_loop().run_in_executor(
+                None, _search_youtube, query
+            )
+        except Exception as e:
+            await status_msg.edit(content=f"Search error: {e}")
+            return
+        if not results:
+            await status_msg.edit(content=f"No results found for \"{query[:50]}\".")
+            return
+        embed = _build_search_embed(query, results)
+        view = SearchPickerView(self.bot, ctx, results, status_msg)
+        await status_msg.edit(content=None, embed=embed, view=view)
+
+    @commands.hybrid_command(name="play", description="Play a song or playlist from a URL")
+    @app_commands.describe(query="URL to play (YouTube, SoundCloud, etc.)")
     async def play(self, ctx: commands.Context, *, query: str = None):
         if not await check_channel(ctx):
             return
 
         if not query:
-            await ctx.send(f"Usage: `{self.bot.command_prefix}play <url or search>`")
+            await ctx.send(f"Usage: `{self.bot.command_prefix}play <url>`")
             return
 
         if not ctx.author.voice or not ctx.author.voice.channel:
@@ -1188,30 +1223,12 @@ class MusicCog(commands.Cog):
         guild_id = str(ctx.guild.id)
         gs = self.bot.get_guild_state(ctx.guild.id)
 
-        # ---------------------------------------------------------------
-        # Search picker flow (D-08: plain text → picker, URL → bypass)
-        # ---------------------------------------------------------------
-        # Strip bare "ytsearch:" prefix so embed title shows the raw query (D-08)
         query = _strip_ytsearch_prefix(query)
 
         if _is_search_query(query):
-            # Extend slash command 3-second response window (no-op for prefix)
-            await ctx.defer()
-            status_msg = await ctx.send("🔍 Searching...")
-            try:
-                results = await asyncio.get_event_loop().run_in_executor(
-                    None, _search_youtube, query
-                )
-            except Exception as e:
-                await status_msg.edit(content=f"Search error: {e}")
-                return
-            if not results:
-                await status_msg.edit(content=f"No results found for \"{query[:50]}\".")
-                return
-            embed = _build_search_embed(query, results)
-            view = SearchPickerView(self.bot, ctx, results, status_msg)
-            await status_msg.edit(content=None, embed=embed, view=view)
-            return  # SearchPickerView._on_select → _play_selected continues the flow
+            p = self.bot.command_prefix
+            await ctx.send(f"❌ Provide a direct URL, or use `{p}search <keywords>` to search YouTube.")
+            return
 
         # ---------------------------------------------------------------
         # Playlist detection: play first track, offer to add the rest
@@ -1934,7 +1951,8 @@ class MusicCog(commands.Cog):
         p = self.bot.command_prefix
         await ctx.send(
             f"**Available commands:**\n"
-            f"`{p}play <url or search>` — Play a track or playlist (join voice first)\n"
+            f"`{p}play <url>` — Play a track or playlist from a URL (join voice first)\n"
+            f"`{p}search <keywords>` — Search YouTube and pick a result from a dropdown\n"
             f"`{p}pause` — Pause playback\n"
             f"`{p}resume` — Resume paused playback\n"
             f"`{p}skip` — Skip the current track\n"
