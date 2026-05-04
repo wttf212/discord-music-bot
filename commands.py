@@ -1603,6 +1603,11 @@ class MusicCog(commands.Cog):
             return
         if not ctx.guild:
             return
+        passes, vote_msg = _check_vote(self.bot, ctx.guild, ctx.author, "playpause")
+        if not passes:
+            await ctx.send(vote_msg)
+            return
+
         gs = self.bot.get_guild_state(ctx.guild.id)
         if not gs.player.is_playing:
             await ctx.send("Nothing is playing.")
@@ -1619,6 +1624,11 @@ class MusicCog(commands.Cog):
             return
         if not ctx.guild:
             return
+        passes, vote_msg = _check_vote(self.bot, ctx.guild, ctx.author, "playpause")
+        if not passes:
+            await ctx.send(vote_msg)
+            return
+
         gs = self.bot.get_guild_state(ctx.guild.id)
         if not gs.player.is_paused:
             await ctx.send("Not paused.")
