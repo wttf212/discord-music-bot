@@ -72,7 +72,7 @@ All commands work with the prefix (default `!`) and as slash commands (e.g. `/pl
 
 | Command | Description |
 |---------|-------------|
-| `!play <url>` | Play a track or playlist from a YouTube/SoundCloud URL (join voice first) |
+| `!play <url or keywords>` | Play a track or playlist — URL plays directly, plain text auto-plays the top YouTube result (join voice first) |
 | `!search <keywords>` | Search YouTube and pick a result from a dropdown |
 | `!pause` | Pause playback |
 | `!resume` | Resume paused playback |

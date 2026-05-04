@@ -1205,14 +1205,14 @@ class MusicCog(commands.Cog):
         view = SearchPickerView(self.bot, ctx, results, status_msg)
         await status_msg.edit(content=None, embed=embed, view=view)
 
-    @commands.hybrid_command(name="play", description="Play a song or playlist from a URL")
-    @app_commands.describe(query="URL to play (YouTube, SoundCloud, etc.)")
+    @commands.hybrid_command(name="play", description="Play a song or playlist from a URL or search query")
+    @app_commands.describe(query="URL or search keywords to play")
     async def play(self, ctx: commands.Context, *, query: str = None):
         if not await check_channel(ctx):
             return
 
         if not query:
-            await ctx.send(f"Usage: `{self.bot.command_prefix}play <url>`")
+            await ctx.send(f"Usage: `{self.bot.command_prefix}play <url or keywords>`")
             return
 
         if not ctx.author.voice or not ctx.author.voice.channel:
@@ -1225,10 +1225,23 @@ class MusicCog(commands.Cog):
 
         query = _strip_ytsearch_prefix(query)
 
+        _search_status_msg = None
         if _is_search_query(query):
-            p = self.bot.command_prefix
-            await ctx.send(f"❌ Provide a direct URL, or use `{p}search <keywords>` to search YouTube.")
-            return
+            # Plain text query — resolve to the top YouTube result automatically
+            await ctx.defer()
+            _search_status_msg = await ctx.send("🔍 Finding best match...")
+            try:
+                results = await asyncio.get_event_loop().run_in_executor(
+                    None, _search_youtube, query
+                )
+            except Exception as e:
+                await _search_status_msg.edit(content=f"Search error: {e}")
+                return
+            if not results:
+                await _search_status_msg.edit(content=f"No results found for \"{query[:50]}\".")
+                return
+            query = results[0]["url"]
+            await _search_status_msg.edit(content="▶️ Loading...")
 
         # ---------------------------------------------------------------
         # Playlist detection: play first track, offer to add the rest
@@ -1473,7 +1486,7 @@ class MusicCog(commands.Cog):
                 await ctx.message.delete()
             except Exception:
                 pass
-            status_msg = await ctx.send("▶️ Resolving...")
+            status_msg = _search_status_msg or await ctx.send("▶️ Resolving...")
             try:
                 info = await gs.player.play(query)
                 title = info["title"]
