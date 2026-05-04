@@ -218,7 +218,12 @@ def _fetch_radio_stations(query: str | None, country: str = "", genre: str = "")
         results = socket.getaddrinfo(_RADIO_SNI, 443, proto=socket.IPPROTO_TCP)
         ip = random.choice(results)[4][0]
     except OSError:
-        ip = "de1.api.radio-browser.info"
+        _fallback = "de1.api.radio-browser.info"
+        try:
+            results = socket.getaddrinfo(_fallback, 443, proto=socket.IPPROTO_TCP)
+            ip = results[0][4][0]
+        except OSError:
+            raise OSError(f"Cannot reach radio-browser.info — check network connectivity")
 
     if query:
         encoded = urllib.parse.quote(query, safe="")
