@@ -1173,9 +1173,7 @@ class PlayerControls(discord.ui.View):
             except Exception as e:
                 await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
-            for child in self.children:
-                child.disabled = True
-            await interaction.message.edit(view=self)
+            await update_np_stopped(self.bot, self.channel_id)
 
 
 class MusicCog(commands.Cog):
@@ -1667,6 +1665,8 @@ class MusicCog(commands.Cog):
                 await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
             await ctx.send("Skipped. Queue is empty.")
+            channel_id = gs.current_text_channel_id or ctx.channel.id
+            await update_np_stopped(self.bot, channel_id)
 
     @commands.command(name="queue")
     async def queue(self, ctx: commands.Context):
