@@ -869,7 +869,7 @@ async def update_np_embed(bot, channel_id: int, embed: discord.Embed):
     asyncio.create_task(_do_update_np_embed(bot, channel, msg_id, embed))
 
 
-async def update_np_stopped(bot, channel_id: int, last_title: str, thumbnail: str = ""):
+async def update_np_stopped(bot, channel_id: int):
     """Update the NP embed to a stopped/queue-finished state and remove all buttons."""
     channel = bot.get_channel(channel_id)
     if not channel or not hasattr(channel, 'guild') or not channel.guild:
@@ -881,11 +881,8 @@ async def update_np_stopped(bot, channel_id: int, last_title: str, thumbnail: st
         return
     embed = discord.Embed(
         title="⏹ Queue Finished",
-        description=f"*{last_title}* was the last track.\n\n" + "⠀" * 45,
         color=0x95a5a6,
     )
-    if thumbnail:
-        embed.set_thumbnail(url=thumbnail)
     embed.add_field(name="Up Next", value="*Queue is empty*", inline=False)
     p = bot.command_prefix
     kbps = gs.player.get_bitrate_for_guild(guild_id) // 1000
@@ -1138,16 +1135,13 @@ class PlayerControls(discord.ui.View):
         await interaction.response.defer()
         guild_id = interaction.guild_id
         gs = self.bot.get_guild_state(guild_id)
-        last = gs.queue.current
-        last_title = last.title if last else (gs.player.current_track_title or "Unknown")
-        last_thumbnail = last.thumbnail if last else ""
         if gs.auto_next_task and not gs.auto_next_task.done():
             gs.auto_next_task.cancel()
             gs.auto_next_task = None
         gs.player.stop_playback()
         gs.queue.clear()
         await gs.player.disconnect()
-        await update_np_stopped(self.bot, self.channel_id, last_title, last_thumbnail)
+        await update_np_stopped(self.bot, self.channel_id)
 
     @discord.ui.button(label="⏭️ Next", style=discord.ButtonStyle.secondary, custom_id="btn_next")
     async def next_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1630,14 +1624,11 @@ class MusicCog(commands.Cog):
         if not ctx.guild:
             return
         gs = self.bot.get_guild_state(ctx.guild.id)
-        last = gs.queue.current
-        last_title = last.title if last else (gs.player.current_track_title or "Unknown")
-        last_thumbnail = last.thumbnail if last else ""
         channel_id = gs.current_text_channel_id or ctx.channel.id
         gs.player.stop_playback()
         gs.queue.clear()
         await gs.player.disconnect()
-        await update_np_stopped(self.bot, channel_id, last_title, last_thumbnail)
+        await update_np_stopped(self.bot, channel_id)
         await ctx.send("Stopped playback and left voice.")
 
     @commands.command(name="skip")
@@ -2049,10 +2040,7 @@ async def _auto_next(bot, channel_id, guild_id, generation):
             next_track = gs.queue.next()
             if not next_track:
                 # Queue drained — update embed to stopped state and strip buttons
-                last = gs.queue.current
-                last_title = last.title if last else "Unknown"
-                last_thumbnail = last.thumbnail if last else ""
-                await update_np_stopped(bot, channel_id, last_title, last_thumbnail)
+                await update_np_stopped(bot, channel_id)
                 break
             try:
                 info = await gs.player.play(next_track.query)
