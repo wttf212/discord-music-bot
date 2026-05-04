@@ -1493,11 +1493,16 @@ class MusicCog(commands.Cog):
             # Start background task to fetch actual title/thumbnail
             asyncio.create_task(_resolve_track_info(self.bot, channel_id, track))
 
-            # Delete the user's command message to keep chat clean
+            # Delete the user's command message and any search status message
             try:
                 await ctx.message.delete()
             except Exception:
                 pass
+            if _search_status_msg:
+                try:
+                    await _search_status_msg.delete()
+                except Exception:
+                    pass
 
             # Rebuild and update the existing NP embed with the new queue
             current = gs.queue.current
