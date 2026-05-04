@@ -1964,7 +1964,7 @@ class MusicCog(commands.Cog):
         p = self.bot.command_prefix
         await ctx.send(
             f"**Available commands:**\n"
-            f"`{p}play <url>` — Play a track or playlist from a URL (join voice first)\n"
+            f"`{p}play <url or keywords>` — Play a track or playlist (URL plays directly, text auto-plays top result)\n"
             f"`{p}search <keywords>` — Search YouTube and pick a result from a dropdown\n"
             f"`{p}pause` — Pause playback\n"
             f"`{p}resume` — Resume paused playback\n"
@@ -1973,6 +1973,8 @@ class MusicCog(commands.Cog):
             f"`{p}queue` — Show the current queue\n"
             f"`{p}shuffle` — Shuffle the current queue\n"
             f"`{p}loadall` — Load all remaining tracks from the last pending playlist\n"
+            f"`{p}radio` — Browse internet radio by region/country/genre\n"
+            f"`{p}radio <name>` — Search 30k+ radio stations by name\n"
             f"`{p}bitrate [kbps]` — Show or set audio encoding bitrate\n"
             f"`{p}eq [bass|treble <N> | preset | reset]` — Per-guild equalizer, -10..+10 dB *(admin only)*\n"
             f"`{p}fairplay on|off` — Toggle user interleaving mode for queues *(admin only)*\n"
