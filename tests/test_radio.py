@@ -3,6 +3,8 @@
 Exercises _fetch_radio_stations, _build_radio_embed, and RadioPickerView construction
 WITHOUT hitting the network. All HTTP calls are mocked.
 """
+import http.client
+import ssl
 import sys
 import os
 import unittest
@@ -65,68 +67,84 @@ class TestRadioHelpers(unittest.TestCase):
 
 
 class TestFetchRadioStations(unittest.TestCase):
-    """Tests for _fetch_radio_stations helper (urllib mocked)."""
+    """Tests for _fetch_radio_stations helper (network mocked)."""
 
-    def _mock_urlopen(self, data: list):
+    def _make_conn_mock(self, data: list):
         import json
         mock_resp = MagicMock()
         mock_resp.read.return_value = json.dumps(data).encode()
-        mock_resp.__enter__ = lambda self: self
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        return mock_resp
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = mock_resp
+        return mock_conn
+
+    def _patch(self, data: list):
+        """Context manager: patches HTTPSConnection + socket.getaddrinfo."""
+        mock_conn = self._make_conn_mock(data)
+        conn_patch = patch("commands._RadioHTTPSConnection", return_value=mock_conn)
+        dns_patch = patch("commands.socket.getaddrinfo", return_value=[
+            (None, None, None, None, ("1.2.3.4", 443))
+        ])
+        return conn_patch, dns_patch, mock_conn
 
     def test_topvote_url_used_when_no_query(self):
-        with patch("commands.urllib.request.urlopen") as mock_urlopen, \
-             patch("commands.urllib.request.Request") as mock_req:
-            mock_urlopen.return_value = self._mock_urlopen([])
+        conn_p, dns_p, mock_conn = self._patch([])
+        with conn_p, dns_p:
             commands._fetch_radio_stations(None)
-        call_args = str(mock_req.call_args)
-        self.assertIn("topvote", call_args)
+        path = mock_conn.request.call_args[0][1]
+        self.assertIn("topvote", path)
 
     def test_byname_url_used_when_query_given(self):
-        with patch("commands.urllib.request.urlopen") as mock_urlopen, \
-             patch("commands.urllib.request.Request") as mock_req:
-            mock_urlopen.return_value = self._mock_urlopen([])
+        conn_p, dns_p, mock_conn = self._patch([])
+        with conn_p, dns_p:
             commands._fetch_radio_stations("jazz")
-        call_args = str(mock_req.call_args)
-        self.assertIn("byname", call_args)
-        self.assertIn("jazz", call_args)
+        path = mock_conn.request.call_args[0][1]
+        self.assertIn("byname", path)
+        self.assertIn("jazz", path)
 
     def test_user_agent_header_present(self):
-        with patch("commands.urllib.request.urlopen") as mock_urlopen, \
-             patch("commands.urllib.request.Request") as mock_req:
-            mock_urlopen.return_value = self._mock_urlopen([])
+        conn_p, dns_p, mock_conn = self._patch([])
+        with conn_p, dns_p:
             commands._fetch_radio_stations(None)
-        call_repr = str(mock_req.call_args)
-        self.assertIn("User-Agent", call_repr)
+        headers = mock_conn.request.call_args[1]["headers"]
+        self.assertIn("User-Agent", headers)
 
     def test_returns_parsed_json(self):
-        with patch("commands.urllib.request.urlopen") as mock_urlopen, \
-             patch("commands.urllib.request.Request"):
-            mock_urlopen.return_value = self._mock_urlopen(SAMPLE_STATIONS[:5])
+        conn_p, dns_p, mock_conn = self._patch(SAMPLE_STATIONS[:5])
+        with conn_p, dns_p:
             result = commands._fetch_radio_stations(None)
         self.assertEqual(len(result), 5)
         self.assertEqual(result[0]["name"], "Station 0")
 
     def test_search_url_used_when_country_given(self):
-        with patch("commands.urllib.request.urlopen") as mock_urlopen, \
-             patch("commands.urllib.request.Request") as mock_req:
-            mock_urlopen.return_value = self._mock_urlopen([])
+        conn_p, dns_p, mock_conn = self._patch([])
+        with conn_p, dns_p:
             commands._fetch_radio_stations(None, country="US")
-        call_args = str(mock_req.call_args)
-        self.assertIn("search", call_args)
-        self.assertIn("countrycode", call_args)
-        self.assertIn("US", call_args)
+        path = mock_conn.request.call_args[0][1]
+        self.assertIn("search", path)
+        self.assertIn("countrycode", path)
+        self.assertIn("US", path)
 
     def test_search_url_used_when_genre_given(self):
-        with patch("commands.urllib.request.urlopen") as mock_urlopen, \
-             patch("commands.urllib.request.Request") as mock_req:
-            mock_urlopen.return_value = self._mock_urlopen([])
+        conn_p, dns_p, mock_conn = self._patch([])
+        with conn_p, dns_p:
             commands._fetch_radio_stations(None, genre="jazz")
-        call_args = str(mock_req.call_args)
-        self.assertIn("search", call_args)
-        self.assertIn("tagList", call_args)
-        self.assertIn("jazz", call_args)
+        path = mock_conn.request.call_args[0][1]
+        self.assertIn("search", path)
+        self.assertIn("tagList", path)
+        self.assertIn("jazz", path)
+
+    def test_ssl_uses_sni_hostname_not_ip(self):
+        """_RadioHTTPSConnection.connect() must wrap with the domain SNI, not a raw IP."""
+        ctx = ssl.create_default_context()
+        # Verify the subclass passes _RADIO_SNI to wrap_socket, not the IP
+        ip = "1.2.3.4"
+        conn = commands._RadioHTTPSConnection(ip, context=ctx)
+        mock_sock = MagicMock()
+        conn.sock = mock_sock
+        with patch.object(ctx, "wrap_socket", return_value=MagicMock()) as mock_wrap, \
+             patch.object(http.client.HTTPConnection, "connect"):
+            conn.connect()
+        mock_wrap.assert_called_once_with(mock_sock, server_hostname=commands._RADIO_SNI)
 
 
 class TestRadioPickerView(unittest.TestCase):
@@ -174,9 +192,17 @@ class TestRadioPickerView(unittest.TestCase):
         view = self._make_view(5)
         self.assertEqual(view.children[0].options[0].label, "Station 0")
 
-    def test_select_value_is_stream_url(self):
+    def test_select_value_is_absolute_index(self):
         view = self._make_view(5)
-        self.assertEqual(view.children[0].options[0].value, "http://stream0.example.com/live")
+        # Values are absolute station indices — avoids Discord's 100-char limit on values
+        self.assertEqual(view.children[0].options[0].value, "0")
+        self.assertEqual(view.children[0].options[4].value, "4")
+
+    def test_select_value_within_discord_limit(self):
+        # Index strings are always well under Discord's 100-char value limit
+        view = self._make_view(15)
+        for opt in view.children[0].options:
+            self.assertLessEqual(len(opt.value), 100)
 
     def test_select_description_contains_bitrate(self):
         view = self._make_view(5)

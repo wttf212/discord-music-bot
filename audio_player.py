@@ -9,6 +9,7 @@ import threading
 import time
 from urllib.error import URLError
 
+import discord
 from yt_dlp.utils import DownloadError
 
 # Load bgutil PO token provider plugin for yt-dlp
@@ -513,7 +514,7 @@ def extract_playlist_info(query: str, client: str) -> dict:
     }
 
 
-class _PrimedAudioSource:
+class _PrimedAudioSource(discord.AudioSource):
     """Wraps a discord AudioSource with a pre-read first frame.
 
     discord.py's AudioPlayer thread sets _start = time.perf_counter() before
@@ -727,11 +728,9 @@ class AudioPlayer:
         if first_frame:
             source = _PrimedAudioSource(source, first_frame)
 
-        self._voice_client.play(source, after=after_playback)
-
-        # Configure Opus encoder for music (not voice)
+        # Configure Opus encoder before play() so first frames use music settings.
         # discord.py defaults: fec=True, expected_packet_loss=0.15, signal_type='auto'
-        # These defaults waste ~15% of bitrate on error correction and don't optimise for music
+        # These defaults waste ~15% of bitrate on error correction and don't optimise for music.
         encoder = getattr(self._voice_client, 'encoder', None)
         if encoder:
             try:
@@ -747,6 +746,8 @@ class AudioPlayer:
             except Exception as e:
                 if self._debug:
                     print(f"[debug][player] Could not configure opus encoder: {e}")
+
+        self._voice_client.play(source, after=after_playback)
 
         if self._debug:
             print(f"[debug][player] Playback started for: {title}")
@@ -813,12 +814,20 @@ class AudioPlayer:
         # Direct HTTP stream -- FFmpeg handles MP3/AAC/OGG natively.
         # before_options go BEFORE -i (reconnect flags); options go AFTER -i (-vn = no video).
         # Do NOT use pipe=True -- stream_url is a string URL, not a file descriptor.
-        # Do NOT prime with _PrimedAudioSource -- blocking read on a live HTTP stream
-        # can stall indefinitely if the station is slow to produce initial audio frames.
+        # -reconnect_at_eof 1: reconnect when server closes the HTTP connection between chunks
+        #   (common with Shoutcast/IceCast stations that restart after each song).
+        # -probesize 32k -analyzeduration 0: skip FFmpeg's default 5-second/5MB stream probe.
+        #   Without these, FFmpeg blocks for up to 5s before emitting the first PCM frame;
+        #   discord.py's AudioPlayer thread sets its clock before that first read, so it rushes
+        #   every subsequent frame with delay=0 — audible as choppy/robotic audio at stream start.
         source = discord.FFmpegPCMAudio(
             stream_url,
             executable=self._ffmpeg_path,
-            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            before_options=(
+                "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+                "-reconnect_at_eof 1 "
+                "-probesize 32k -analyzeduration 0"
+            ),
             options="-vn",
             stderr=subprocess.PIPE,
         )
@@ -847,8 +856,7 @@ class AudioPlayer:
             self.current_track_title = None
             loop.call_soon_threadsafe(self._playback_done.set)
 
-        self._voice_client.play(source, after=after_playback)
-
+        # Configure Opus encoder before play() so first frames use music settings.
         encoder = getattr(self._voice_client, "encoder", None)
         if encoder:
             try:
@@ -861,6 +869,21 @@ class AudioPlayer:
                 encoder.set_bandwidth("full")
             except Exception:
                 pass
+
+        # Prime with one frame so the audio thread's first read() is instant.
+        # Reduced probesize means FFmpeg produces the first frame within ~100ms,
+        # so a 3-second timeout is conservative. Falls back gracefully on slow stations.
+        try:
+            first_frame = await asyncio.wait_for(
+                loop.run_in_executor(None, source.read),
+                timeout=3.0,
+            )
+            if first_frame:
+                source = _PrimedAudioSource(source, first_frame)
+        except asyncio.TimeoutError:
+            pass
+
+        self._voice_client.play(source, after=after_playback)
 
         if self._debug:
             print(f"[debug][player] Radio playback started: {title}")
