@@ -1006,6 +1006,55 @@ def _create_player_controls(bot, channel_id):
         view.add_item(LoadPlaylistButton(bot, channel_id))
     return view
 
+import math as _math
+
+def _check_vote(bot, guild, user, action: str) -> tuple[bool, str]:
+    """Shared fairness vote logic for both button interactions and prefix commands.
+
+    Returns (passes, denial_message). denial_message is empty string when passes=True.
+    """
+    user_id = str(user.id)
+    owner_id = str(bot.config.get("owner_id", ""))
+    if user_id == owner_id:
+        return True, ""
+
+    bot_voice = guild.voice_client
+    if not bot_voice or not bot_voice.channel:
+        return True, ""
+
+    vc_members = [m for m in bot_voice.channel.members if not m.bot]
+    total = len(vc_members)
+    if total <= 1:
+        return True, ""
+
+    gs = bot.get_guild_state(guild.id)
+    current = gs.queue.current
+
+    if action in ["next", "prev", "playpause"]:
+        if current and current.requested_by == user_id:
+            return True, ""
+    elif action == "stop":
+        all_reqs = set()
+        if current:
+            all_reqs.add(current.requested_by)
+        for t in gs.queue.list():
+            all_reqs.add(t.requested_by)
+        if len(all_reqs) == 1 and user_id in all_reqs:
+            return True, ""
+
+    pct = gs.fairness_pct
+    votes_set = getattr(gs, f"{action}_votes")
+    votes_set.add(user_id)
+    req = max(1, _math.ceil((pct / 100.0) * total))
+
+    if len(votes_set) >= req:
+        votes_set.clear()
+        return True, ""
+
+    msg = f"🗳️ `{action}` vote from {user.display_name} recorded! ({len(votes_set)}/{req} votes needed, fairness: {pct}%)"
+    return False, msg
+
+
 class PlayerControls(discord.ui.View):
     def __init__(self, bot, channel_id):
         super().__init__(timeout=None)
@@ -1034,48 +1083,10 @@ class PlayerControls(discord.ui.View):
         return True
 
     async def evaluate_vote(self, interaction: discord.Interaction, action: str) -> bool:
-        user_id = str(interaction.user.id)
-        owner_id = str(self.bot.config.get("owner_id", ""))
-        if user_id == owner_id:
-            return True
-
-        bot_voice = interaction.guild.voice_client
-        if not bot_voice or not bot_voice.channel:
-            return True
-
-        vc_members = [m for m in bot_voice.channel.members if not m.bot]
-        total = len(vc_members)
-        if total <= 1:
-            return True
-
-        guild_id = interaction.guild_id
-        gs = self.bot.get_guild_state(guild_id)
-        current = gs.queue.current
-
-        if action in ["next", "prev", "playpause"]:
-            if current and current.requested_by == user_id:
-                return True
-        elif action == "stop":
-            all_reqs = set()
-            if current: all_reqs.add(current.requested_by)
-            for t in gs.queue.list(): all_reqs.add(t.requested_by)
-            if len(all_reqs) == 1 and user_id in all_reqs:
-                return True
-
-        # Voting required
-        pct = gs.fairness_pct
-        votes_set = getattr(gs, f"{action}_votes")
-        votes_set.add(user_id)
-
-        import math
-        req = max(1, math.ceil((pct / 100.0) * total))
-
-        if len(votes_set) >= req:
-            votes_set.clear()
-            return True
-
-        await interaction.response.send_message(f"🗳️ `{action}` vote from {interaction.user.display_name} recorded! ({len(votes_set)}/{req} votes needed, fairness: {pct}%)", ephemeral=False)
-        return False
+        passes, msg = _check_vote(self.bot, interaction.guild, interaction.user, action)
+        if not passes:
+            await interaction.response.send_message(msg, ephemeral=False)
+        return passes
 
     @discord.ui.button(label="⏮️ Prev", style=discord.ButtonStyle.secondary, custom_id="btn_prev")
     async def prev_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1621,6 +1632,12 @@ class MusicCog(commands.Cog):
             return
         if not ctx.guild:
             return
+
+        passes, vote_msg = _check_vote(self.bot, ctx.guild, ctx.author, "stop")
+        if not passes:
+            await ctx.send(vote_msg)
+            return
+
         gs = self.bot.get_guild_state(ctx.guild.id)
         channel_id = gs.current_text_channel_id or ctx.channel.id
         gs.player.stop_playback()
@@ -1634,6 +1651,11 @@ class MusicCog(commands.Cog):
         if not await check_channel(ctx):
             return
         if not ctx.guild:
+            return
+
+        passes, vote_msg = _check_vote(self.bot, ctx.guild, ctx.author, "next")
+        if not passes:
+            await ctx.send(vote_msg)
             return
 
         gs = self.bot.get_guild_state(ctx.guild.id)
