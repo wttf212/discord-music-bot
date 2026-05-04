@@ -869,7 +869,7 @@ async def update_np_embed(bot, channel_id: int, embed: discord.Embed):
     asyncio.create_task(_do_update_np_embed(bot, channel, msg_id, embed))
 
 
-async def update_np_stopped(bot, channel_id: int, last_title: str):
+async def update_np_stopped(bot, channel_id: int, last_title: str, thumbnail: str = ""):
     """Update the NP embed to a stopped/queue-finished state and remove all buttons."""
     channel = bot.get_channel(channel_id)
     if not channel or not hasattr(channel, 'guild') or not channel.guild:
@@ -884,6 +884,8 @@ async def update_np_stopped(bot, channel_id: int, last_title: str):
         description=f"*{last_title}* was the last track.\n\n" + "⠀" * 45,
         color=0x95a5a6,
     )
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
     embed.add_field(name="Up Next", value="*Queue is empty*", inline=False)
     try:
         msg = await channel.fetch_message(msg_id)
@@ -2040,7 +2042,8 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 # Queue drained — update embed to stopped state and strip buttons
                 last = gs.queue.current
                 last_title = last.title if last else "Unknown"
-                await update_np_stopped(bot, channel_id, last_title)
+                last_thumbnail = last.thumbnail if last else ""
+                await update_np_stopped(bot, channel_id, last_title, last_thumbnail)
                 break
             try:
                 info = await gs.player.play(next_track.query)
