@@ -869,6 +869,29 @@ async def update_np_embed(bot, channel_id: int, embed: discord.Embed):
     asyncio.create_task(_do_update_np_embed(bot, channel, msg_id, embed))
 
 
+async def update_np_stopped(bot, channel_id: int, last_title: str):
+    """Update the NP embed to a stopped/queue-finished state and remove all buttons."""
+    channel = bot.get_channel(channel_id)
+    if not channel or not hasattr(channel, 'guild') or not channel.guild:
+        return
+    guild_id = channel.guild.id
+    gs = bot.get_guild_state(guild_id)
+    msg_id = gs.np_message_id
+    if not msg_id:
+        return
+    embed = discord.Embed(
+        title="⏹ Queue Finished",
+        description=f"*{last_title}* was the last track.\n\n" + "⠀" * 45,
+        color=0x95a5a6,
+    )
+    embed.add_field(name="Up Next", value="*Queue is empty*", inline=False)
+    try:
+        msg = await channel.fetch_message(msg_id)
+        await msg.edit(embed=embed, view=None)
+    except Exception as e:
+        print(f"[commands] Failed to update stopped NP embed: {e}")
+
+
 class LoadPlaylistButton(discord.ui.Button):
     def __init__(self, bot, channel_id):
         super().__init__(label="Load Playlist Tracks", style=discord.ButtonStyle.success, emoji="✅", custom_id="btn_load_playlist")
@@ -2014,7 +2037,11 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 break  # something else started playing
             next_track = gs.queue.next()
             if not next_track:
-                break  # queue empty
+                # Queue drained — update embed to stopped state and strip buttons
+                last = gs.queue.current
+                last_title = last.title if last else "Unknown"
+                await update_np_stopped(bot, channel_id, last_title)
+                break
             try:
                 info = await gs.player.play(next_track.query)
                 title = info["title"]
