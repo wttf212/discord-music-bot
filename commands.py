@@ -1138,16 +1138,16 @@ class PlayerControls(discord.ui.View):
         await interaction.response.defer()
         guild_id = interaction.guild_id
         gs = self.bot.get_guild_state(guild_id)
+        last = gs.queue.current
+        last_title = last.title if last else (gs.player.current_track_title or "Unknown")
+        last_thumbnail = last.thumbnail if last else ""
         if gs.auto_next_task and not gs.auto_next_task.done():
             gs.auto_next_task.cancel()
             gs.auto_next_task = None
         gs.player.stop_playback()
         gs.queue.clear()
         await gs.player.disconnect()
-
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(view=self)
+        await update_np_stopped(self.bot, self.channel_id, last_title, last_thumbnail)
 
     @discord.ui.button(label="⏭️ Next", style=discord.ButtonStyle.secondary, custom_id="btn_next")
     async def next_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1630,10 +1630,14 @@ class MusicCog(commands.Cog):
         if not ctx.guild:
             return
         gs = self.bot.get_guild_state(ctx.guild.id)
+        last = gs.queue.current
+        last_title = last.title if last else (gs.player.current_track_title or "Unknown")
+        last_thumbnail = last.thumbnail if last else ""
+        channel_id = gs.current_text_channel_id or ctx.channel.id
         gs.player.stop_playback()
         gs.queue.clear()
         await gs.player.disconnect()
-
+        await update_np_stopped(self.bot, channel_id, last_title, last_thumbnail)
         await ctx.send("Stopped playback and left voice.")
 
     @commands.command(name="skip")
