@@ -887,6 +887,11 @@ async def update_np_stopped(bot, channel_id: int, last_title: str, thumbnail: st
     if thumbnail:
         embed.set_thumbnail(url=thumbnail)
     embed.add_field(name="Up Next", value="*Queue is empty*", inline=False)
+    p = bot.command_prefix
+    kbps = gs.player.get_bitrate_for_guild(guild_id) // 1000
+    eq_bass, eq_treble = gs.player.get_eq_for_guild(guild_id)
+    eq_label = get_eq_preset_name(eq_bass, eq_treble)
+    embed.set_footer(text=f"Audio: {kbps} kbps • EQ: {eq_label} • {p}bitrate | {p}eq to change")
     try:
         msg = await channel.fetch_message(msg_id)
         await msg.edit(embed=embed, view=None)
