@@ -1,16 +1,18 @@
 # Discord Music Bot
 
-A Discord music bot with YouTube and SoundCloud. (Use it at your own risk, youtube loves to ban IPs)
+A Discord music bot with YouTube and SoundCloud. (Use it at your own risk, YouTube loves to ban IPs)
 
 ## Features
 
 - 🎵 Play music from YouTube, SoundCloud, and other supported sites
-- 📻 Internet radio browser — search 30k+ stations via radio-browser.info
-- 📋 Playlist support with reaction-based loading
-- 🔀 Queue shuffle
-- 🔧 Configurable audio bitrate
+- 🔍 YouTube search with a dropdown picker (`!search`)
+- 📻 Internet radio browser — region/country/genre discovery or name search across 30k+ stations
+- 📋 Playlist support — plays the first track immediately, load the rest with `!loadall`
+- 🔀 Queue with fair-play interleaving and shuffle
+- 🎚️ Per-guild equalizer (bass, treble, presets)
+- 🔧 Configurable audio bitrate per server
 - 🔒 DAVE E2EE voice encryption support (discord.py v2.7.0+)
-- 🛡️ Automatic PO token generation via bgutil-pot (prevents YouTube bans)
+- 🛡️ Automatic PO token generation via bgutil-pot (prevents YouTube blocks)
 - 📌 Channel restriction (`!settc`)
 - 🚪 Auto-leave when voice channel empties
 
@@ -64,28 +66,66 @@ Re-export every ~4 months. See `config.example.yaml` for full details.
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| Command | Description |
-|---------|-------------|
-| `!play <url or search>` | Play a track or playlist |
-| `!radio [search]` | Browse internet radio stations; optional search term filters by name |
-| `!pause` | Pause playback |
-| `!resume` | Resume playback |
-| `!skip` | Skip current track |
-| `!stop` | Stop and leave voice |
-| `!queue` | Show queue |
-| `!shuffle` | Shuffle the current queue |
-| `!loadall` | Load remaining playlist tracks |
-| `!bitrate [kbps]` | Show or set audio bitrate |
-| `!fairplay on\|off` | Toggle user interleaving mode for queues *(admin)* |
-| `!fairness <0-100>` | Set the percentage of users strictly needed to skip/stop songs *(admin)* |
-| `!addadmin @user` | Add a user as a bot admin for this server *(owner)* |
-| `!removeadmin @user`| Remove a user as a bot admin for this server *(owner)* |
-| `!settc` | Restrict commands to this channel *(owner)* |
-| `!shutdown` | Shut down the bot *(owner)* |
+All commands work with the prefix (default `!`) and as slash commands (e.g. `/play`, `/search`).
 
-All commands also work as slash commands (e.g. `/radio jazz`, `/play lo-fi`).
+### Playback
+
+| Command | Description |
+|---------|-------------|
+| `!play <url>` | Play a track or playlist from a YouTube/SoundCloud URL (join voice first) |
+| `!search <keywords>` | Search YouTube and pick a result from a dropdown |
+| `!pause` | Pause playback |
+| `!resume` | Resume paused playback |
+| `!skip` | Skip the current track |
+| `!stop` | Stop playback, clear the queue, and leave voice |
+
+### Queue
+
+| Command | Description |
+|---------|-------------|
+| `!queue` | Show the current queue |
+| `!shuffle` | Shuffle the queued tracks |
+| `!loadall` | Load all remaining tracks from the last pending playlist |
+
+### Radio
+
+| Command | Description |
+|---------|-------------|
+| `!radio` | Open the region → country → genre discovery picker |
+| `!radio <name>` | Search 30k+ stations by name and pick from results |
+
+### Audio
+
+| Command | Description |
+|---------|-------------|
+| `!bitrate [kbps]` | Show or set the Opus encoding bitrate for this server |
+| `!eq` | Show equalizer usage |
+| `!eq bass <-10..10>` | Boost or cut bass (dB) |
+| `!eq treble <-10..10>` | Boost or cut treble (dB) |
+| `!eq preset <name>` | Apply a named preset (e.g. `bass`, `vocal`, `flat`) |
+| `!eq reset` | Reset equalizer to flat |
+
+### Admin *(bot admin required)*
+
+| Command | Description |
+|---------|-------------|
+| `!fairplay on\|off` | Toggle fair-play interleaving (alternates tracks between users) |
+| `!fairness <0-100>` | Percentage of voice-channel members required to vote-skip or vote-stop |
+
+### Owner *(owner_id only)*
+
+| Command | Description |
+|---------|-------------|
+| `!addadmin @user` | Grant a user bot-admin privileges for this server |
+| `!removeadmin @user` | Revoke bot-admin privileges for a user |
+| `!settc` | Restrict all bot commands to the current channel |
+| `!shutdown` | Shut down the bot |
+
+### Other
+
+| Command | Description |
+|---------|-------------|
+| `!help` | Show command list |
 
 ## Requirements
 
