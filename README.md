@@ -127,11 +127,51 @@ All commands work with the prefix (default `!`) and as slash commands (e.g. `/pl
 |---------|-------------|
 | `!help` | Show command list |
 
+## Bot Permissions
+
+### Required Discord Permissions
+
+When inviting the bot, grant it the following permissions (or use the permissions integer `2184276992`):
+
+**Text Channel**
+
+| Permission | Why |
+|---|---|
+| View Channel | Read commands and post responses |
+| Send Messages | Post now-playing embeds and status replies |
+| Manage Messages | Delete user command messages and stale status messages to keep chat clean |
+| Embed Links | Send rich now-playing, queue, search, and radio embeds |
+| Read Message History | Fetch and edit previous now-playing messages |
+
+**Voice Channel**
+
+| Permission | Why |
+|---|---|
+| Connect | Join the voice channel the user is in |
+| Speak | Stream audio to the channel |
+| Use Voice Activity | Required for audio transmission |
+
+### OAuth2 Invite Scopes
+
+Select both scopes when generating your invite URL:
+
+- `bot` — grants the permissions above
+- `applications.commands` — registers slash commands (`/play`, `/search`, etc.)
+
+### Privileged Gateway Intents
+
+Enable these in the [Discord Developer Portal](https://discord.com/developers/applications) under your application → **Bot → Privileged Gateway Intents**:
+
+| Intent | Why |
+|---|---|
+| **Message Content** | Required — lets the bot read prefix commands (`!play`, `!skip`, etc.) |
+| **Server Members** | Recommended — needed for accurate voice-channel member counts (fair-play vote thresholds and auto-leave) |
+
+> **Note:** Without Server Members intent, the bot cannot reliably count how many users are in a voice channel, which breaks `!fairness` vote thresholds and may cause premature auto-leave.
+
 ## Requirements
 
 - Python 3.11+
 - ffmpeg
 - Deno (for YouTube signature solving)
-- Discord bot with these privileged intents enabled:
-  - Message Content
-  - Server Members (recommended)
+- Discord bot with privileged intents enabled (see [Bot Permissions](#bot-permissions) above)
