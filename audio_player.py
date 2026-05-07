@@ -559,6 +559,7 @@ class AudioPlayer:
         self.current_track_title: str | None = None
         self._playback_done = asyncio.Event()
         self._ytdlp_proc: subprocess.Popen | None = None
+        self._playback_gen = 0  # Incremented at start of play()/play_radio() to guard stale after_playback callbacks
 
         self._sample_rate = config["audio"]["sample_rate"]
         self._channels = config["audio"]["channels"]
@@ -617,6 +618,8 @@ class AudioPlayer:
         cookies_file = yt.get("cookies_file") or None  # None if absent or empty string
         loop = asyncio.get_event_loop()
 
+        self._playback_gen += 1
+        _gen = self._playback_gen
         self.stop_playback()
 
         # Resolve metadata first (in-process yt-dlp), then start the stream subprocess
@@ -716,6 +719,8 @@ class AudioPlayer:
         self._playback_done.clear()
 
         def after_playback(error):
+            if self._playback_gen != _gen:
+                return  # Stale callback from a previous stream — ignore
             if error:
                 print(f"[player] Playback ended with error: {error}")
             self.is_playing = False
@@ -806,6 +811,8 @@ class AudioPlayer:
             raise RuntimeError("Not connected to a voice channel")
 
         loop = asyncio.get_event_loop()
+        self._playback_gen += 1
+        _gen = self._playback_gen
         self.stop_playback()
 
         if self._debug:
@@ -850,6 +857,8 @@ class AudioPlayer:
         self._playback_done.clear()
 
         def after_playback(error):
+            if self._playback_gen != _gen:
+                return  # Stale callback from a previous stream — ignore
             if error:
                 print(f"[player] Radio playback ended with error: {error}")
             self.is_playing = False
