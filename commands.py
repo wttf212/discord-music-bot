@@ -1,10 +1,7 @@
 import asyncio
 import http.client
 import json
-import random
 import re
-import socket
-import ssl
 import urllib.parse
 import urllib.request
 import discord
@@ -189,20 +186,7 @@ _RADIO_GENRES = [
 
 
 _RADIO_SNI = "all.api.radio-browser.info"
-
-
-class _RadioHTTPSConnection(http.client.HTTPSConnection):
-    """HTTPSConnection that TCP-connects to a chosen IP but validates SSL against _RADIO_SNI.
-
-    http.client.HTTPSConnection derives server_hostname from self.host, so connecting
-    to a raw IP causes cert verification to fail (cert is issued to the domain, not the
-    IP). Overriding connect() lets us use the correct SNI hostname for SSL while still
-    targeting a specific server IP for load distribution / WinError 10054 avoidance.
-    """
-
-    def connect(self):
-        http.client.HTTPConnection.connect(self)
-        self.sock = self._context.wrap_socket(self.sock, server_hostname=_RADIO_SNI)
+_RADIO_TIMEOUT = 10
 
 
 def _fetch_radio_stations(query: str | None, country: str = "", genre: str = "") -> list[dict]:
@@ -212,19 +196,14 @@ def _fetch_radio_stations(query: str | None, country: str = "", genre: str = "")
     With query           -> fuzzy name search (/json/stations/byname/{encoded}).
     With country/genre   -> filtered search (/json/stations/search).
     Returns list of dicts: name, url_resolved, favicon, tags, country, bitrate.
+
+    Connects by hostname (not a pinned IP) so the OS resolver tries every address
+    (IPv4 + IPv6) and standard SNI/cert validation applies. radio-browser.info has
+    consolidated onto a single host, so the old per-mirror IP-pinning + forced-IPv4
+    was both pointless and brittle -- it surfaced as the DNS failure
+    "[Errno -2] Name or service not known" inside containers.
     User-Agent header required -- radio-browser.info blocks requests without it.
     """
-    try:
-        results = socket.getaddrinfo(_RADIO_SNI, 443, proto=socket.IPPROTO_TCP)
-        ip = random.choice(results)[4][0]
-    except OSError:
-        _fallback = "de1.api.radio-browser.info"
-        try:
-            results = socket.getaddrinfo(_fallback, 443, proto=socket.IPPROTO_TCP)
-            ip = results[0][4][0]
-        except OSError:
-            raise OSError(f"Cannot reach radio-browser.info — check network connectivity")
-
     if query:
         encoded = urllib.parse.quote(query, safe="")
         path = f"/json/stations/byname/{encoded}?limit=50&order=votes&reverse=true&hidebroken=true"
@@ -241,11 +220,21 @@ def _fetch_radio_stations(query: str | None, country: str = "", genre: str = "")
     else:
         path = "/json/stations/topvote?limit=50&hidebroken=true"
 
-    ctx = ssl.create_default_context()
-    conn = _RadioHTTPSConnection(ip, context=ctx)
-    conn.request("GET", path, headers={"User-Agent": "discord-music-bot/1.0", "Host": _RADIO_SNI})
-    resp = conn.getresponse()
-    return json.loads(resp.read())
+    conn = None
+    try:
+        conn = http.client.HTTPSConnection(_RADIO_SNI, timeout=_RADIO_TIMEOUT)
+        conn.request("GET", path, headers={"User-Agent": "discord-music-bot/1.0"})
+        resp = conn.getresponse()
+        data = resp.read()
+    except OSError as e:
+        raise OSError(f"Cannot reach radio-browser.info ({e}) — check network/DNS connectivity") from e
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return json.loads(data)
 
 
 def _build_radio_embed(

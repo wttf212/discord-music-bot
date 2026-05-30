@@ -78,46 +78,47 @@ class TestFetchRadioStations(unittest.TestCase):
         return mock_conn
 
     def _patch(self, data: list):
-        """Context manager: patches HTTPSConnection + socket.getaddrinfo."""
+        """Factory: returns (conn_patch, mock_conn) patching http.client.HTTPSConnection.
+
+        `with conn_patch as mock_cls` yields the patched class; calling it returns
+        mock_conn, so request()/getresponse()/close() on the connection are recorded.
+        """
         mock_conn = self._make_conn_mock(data)
-        conn_patch = patch("commands._RadioHTTPSConnection", return_value=mock_conn)
-        dns_patch = patch("commands.socket.getaddrinfo", return_value=[
-            (None, None, None, None, ("1.2.3.4", 443))
-        ])
-        return conn_patch, dns_patch, mock_conn
+        conn_patch = patch("commands.http.client.HTTPSConnection", return_value=mock_conn)
+        return conn_patch, mock_conn
 
     def test_topvote_url_used_when_no_query(self):
-        conn_p, dns_p, mock_conn = self._patch([])
-        with conn_p, dns_p:
+        conn_p, mock_conn = self._patch([])
+        with conn_p:
             commands._fetch_radio_stations(None)
         path = mock_conn.request.call_args[0][1]
         self.assertIn("topvote", path)
 
     def test_byname_url_used_when_query_given(self):
-        conn_p, dns_p, mock_conn = self._patch([])
-        with conn_p, dns_p:
+        conn_p, mock_conn = self._patch([])
+        with conn_p:
             commands._fetch_radio_stations("jazz")
         path = mock_conn.request.call_args[0][1]
         self.assertIn("byname", path)
         self.assertIn("jazz", path)
 
     def test_user_agent_header_present(self):
-        conn_p, dns_p, mock_conn = self._patch([])
-        with conn_p, dns_p:
+        conn_p, mock_conn = self._patch([])
+        with conn_p:
             commands._fetch_radio_stations(None)
         headers = mock_conn.request.call_args[1]["headers"]
         self.assertIn("User-Agent", headers)
 
     def test_returns_parsed_json(self):
-        conn_p, dns_p, mock_conn = self._patch(SAMPLE_STATIONS[:5])
-        with conn_p, dns_p:
+        conn_p, mock_conn = self._patch(SAMPLE_STATIONS[:5])
+        with conn_p:
             result = commands._fetch_radio_stations(None)
         self.assertEqual(len(result), 5)
         self.assertEqual(result[0]["name"], "Station 0")
 
     def test_search_url_used_when_country_given(self):
-        conn_p, dns_p, mock_conn = self._patch([])
-        with conn_p, dns_p:
+        conn_p, mock_conn = self._patch([])
+        with conn_p:
             commands._fetch_radio_stations(None, country="US")
         path = mock_conn.request.call_args[0][1]
         self.assertIn("search", path)
@@ -125,26 +126,36 @@ class TestFetchRadioStations(unittest.TestCase):
         self.assertIn("US", path)
 
     def test_search_url_used_when_genre_given(self):
-        conn_p, dns_p, mock_conn = self._patch([])
-        with conn_p, dns_p:
+        conn_p, mock_conn = self._patch([])
+        with conn_p:
             commands._fetch_radio_stations(None, genre="jazz")
         path = mock_conn.request.call_args[0][1]
         self.assertIn("search", path)
         self.assertIn("tagList", path)
         self.assertIn("jazz", path)
 
-    def test_ssl_uses_sni_hostname_not_ip(self):
-        """_RadioHTTPSConnection.connect() must wrap with the domain SNI, not a raw IP."""
-        ctx = ssl.create_default_context()
-        # Verify the subclass passes _RADIO_SNI to wrap_socket, not the IP
-        ip = "1.2.3.4"
-        conn = commands._RadioHTTPSConnection(ip, context=ctx)
-        mock_sock = MagicMock()
-        conn.sock = mock_sock
-        with patch.object(ctx, "wrap_socket", return_value=MagicMock()) as mock_wrap, \
-             patch.object(http.client.HTTPConnection, "connect"):
-            conn.connect()
-        mock_wrap.assert_called_once_with(mock_sock, server_hostname=commands._RADIO_SNI)
+    def test_connects_to_hostname_not_ip(self):
+        """Connect by hostname so the OS resolver handles IPv4/IPv6 and SNI is automatic."""
+        conn_p, mock_conn = self._patch([])
+        with conn_p as mock_cls:
+            commands._fetch_radio_stations(None)
+        # Host is the first positional arg to HTTPSConnection(host, timeout=...)
+        self.assertEqual(mock_cls.call_args[0][0], commands._RADIO_SNI)
+
+    def test_connection_closed_after_use(self):
+        conn_p, mock_conn = self._patch([])
+        with conn_p:
+            commands._fetch_radio_stations(None)
+        mock_conn.close.assert_called_once()
+
+    def test_dns_failure_raises_friendly_error(self):
+        """A getaddrinfo/connect failure becomes a clear, attributed OSError."""
+        mock_conn = MagicMock()
+        mock_conn.request.side_effect = OSError("[Errno -2] Name or service not known")
+        with patch("commands.http.client.HTTPSConnection", return_value=mock_conn):
+            with self.assertRaises(OSError) as cm:
+                commands._fetch_radio_stations("jazz")
+        self.assertIn("radio-browser.info", str(cm.exception))
 
 
 class TestRadioPickerView(unittest.TestCase):
