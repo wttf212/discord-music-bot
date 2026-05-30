@@ -19,7 +19,6 @@ from guild_settings import (
 )
 
 
-PLAYLIST_EMOJI = "\u2705"  # ✅
 
 
 
@@ -107,7 +106,7 @@ def _build_search_embed(query: str, results: list[dict]) -> discord.Embed:
         lines.append(f"**{i}.** {r['title']}")
         lines.append(f"    {r['uploader']} • {r['duration_str']}")
     embed = discord.Embed(
-        title=f"🔍 Results for \"{query_display}\"",
+        title=f"Results for \"{query_display}\"",
         description="\n".join(lines) if lines else "No results.",
         color=0x3498db,
     )
@@ -116,14 +115,14 @@ def _build_search_embed(query: str, results: list[dict]) -> discord.Embed:
 
 
 _RADIO_REGIONS = [
-    ("🌐 Worldwide", "worldwide"),
-    ("🇪🇺 Northern Europe", "europe_north"),
-    ("🇪🇺 Western Europe", "europe_west"),
-    ("🇪🇺 Southern Europe", "europe_south"),
-    ("🇪🇺 Eastern Europe", "europe_east"),
-    ("🌎 Americas", "americas"),
-    ("🌏 Asia & Pacific", "asia_pacific"),
-    ("🌍 Middle East & Africa", "mideast_africa"),
+    ("Worldwide", "worldwide"),
+    ("Northern Europe", "europe_north"),
+    ("Western Europe", "europe_west"),
+    ("Southern Europe", "europe_south"),
+    ("Eastern Europe", "europe_east"),
+    ("Americas", "americas"),
+    ("Asia & Pacific", "asia_pacific"),
+    ("Middle East & Africa", "mideast_africa"),
 ]
 
 _RADIO_REGION_COUNTRIES: dict[str, list[tuple[str, str]]] = {
@@ -253,12 +252,11 @@ def _build_radio_embed(
     Footer: Page N of M, Powered by radio-browser.info.
     Color: 0x3498db (matches create_np_embed and _build_search_embed).
     """
-    radio_icon = "\U0001f4fb"  # 📻
     bullet = "•"         # •
     if query:
-        title = f"{radio_icon} Results for \"{query[:40]}\""
+        title = f"Results for \"{query[:40]}\""
     else:
-        title = f"{radio_icon} Radio Stations"
+        title = "Radio Stations"
 
     lines = []
     for s in stations:
@@ -305,7 +303,7 @@ class RadioDiscoveryView(discord.ui.View):
         self.clear_items()
 
         region_label = {code: label for label, code in _RADIO_REGIONS}.get(self.region, "")
-        region_placeholder = f"🌍 {region_label}" if self.region != "worldwide" else "🌍 Region..."
+        region_placeholder = region_label if self.region != "worldwide" else "Region…"
         region_select = discord.ui.Select(
             placeholder=region_placeholder,
             options=[
@@ -318,7 +316,7 @@ class RadioDiscoveryView(discord.ui.View):
         self.add_item(region_select)
 
         country_select = discord.ui.Select(
-            placeholder="🏳️ Country...",
+            placeholder="Country…",
             options=self._country_options(),
             custom_id="discovery_country",
         )
@@ -326,7 +324,7 @@ class RadioDiscoveryView(discord.ui.View):
         self.add_item(country_select)
 
         genre_select = discord.ui.Select(
-            placeholder="🎵 Genre...",
+            placeholder="Genre…",
             options=[discord.SelectOption(label=label, value=tag) for label, tag in _RADIO_GENRES],
             custom_id="discovery_genre",
         )
@@ -361,7 +359,7 @@ class RadioDiscoveryView(discord.ui.View):
         self.stop()
         for child in self.children:
             child.disabled = True
-        await interaction.response.edit_message(content="📻 Loading stations...", embed=None, view=self)
+        await interaction.response.edit_message(content="Loading stations…", embed=None, view=self)
         try:
             stations = await asyncio.get_event_loop().run_in_executor(
                 None, _fetch_radio_stations, None, self.country, self.genre
@@ -466,7 +464,7 @@ class RadioPickerView(discord.ui.View):
         self.add_item(select)
 
         btn_prev = discord.ui.Button(
-            label="⏮️ Prev",
+            label="◄ Prev",
             style=discord.ButtonStyle.secondary,
             custom_id="radio_btn_prev",
             disabled=(self.page == 0),
@@ -475,7 +473,7 @@ class RadioPickerView(discord.ui.View):
         self.add_item(btn_prev)
 
         btn_next = discord.ui.Button(
-            label="Next ⏭️",
+            label="Next ►",
             style=discord.ButtonStyle.secondary,
             custom_id="radio_btn_next",
             disabled=(self.page >= self._total_pages - 1),
@@ -488,7 +486,7 @@ class RadioPickerView(discord.ui.View):
         self.stop()
         for child in self.children:
             child.disabled = True
-        await interaction.response.edit_message(content="▶️ Loading...", embed=None, view=self)
+        await interaction.response.edit_message(content="Loading…", embed=None, view=self)
         station = self.stations[int(interaction.data["values"][0])]
         # Validate stream URL scheme before passing to FFmpeg (T-09-05)
         url = station.get("url_resolved") or ""
@@ -639,7 +637,7 @@ class SearchPickerView(discord.ui.View):
         self.stop()
         for child in self.children:
             child.disabled = True
-        await interaction.response.edit_message(content="▶️ Loading...", embed=None, view=self)
+        await interaction.response.edit_message(content="Loading…", embed=None, view=self)
         selected_url = interaction.data["values"][0]
         await _play_selected(self.bot, self.ctx, selected_url, self.status_msg)
 
@@ -1260,7 +1258,7 @@ def _check_vote(bot, guild, user, action: str) -> tuple[bool, str]:
         votes_set.clear()
         return True, ""
 
-    msg = f"🗳️ `{action}` vote from {user.display_name} recorded! ({len(votes_set)}/{req} votes needed, fairness: {pct}%)"
+    msg = f"`{action}` vote from {user.display_name} recorded! ({len(votes_set)}/{req} votes needed, fairness: {pct}%)"
     return False, msg
 
 
@@ -1300,7 +1298,7 @@ class MusicCog(commands.Cog):
 
         query = _strip_ytsearch_prefix(query)
         await ctx.defer()
-        status_msg = await ctx.send("🔍 Searching...")
+        status_msg = await ctx.send("Searching…")
         try:
             results = await asyncio.get_event_loop().run_in_executor(
                 None, _search_youtube, query
@@ -1339,7 +1337,7 @@ class MusicCog(commands.Cog):
         if _is_search_query(query):
             # Plain text query — resolve to the top YouTube result automatically
             await ctx.defer()
-            _search_status_msg = await ctx.send("🔍 Finding best match...")
+            _search_status_msg = await ctx.send("Finding best match…")
             try:
                 results = await asyncio.get_event_loop().run_in_executor(
                     None, _search_youtube, query
@@ -1351,13 +1349,13 @@ class MusicCog(commands.Cog):
                 await _search_status_msg.edit(content=f"No results found for \"{query[:50]}\".")
                 return
             query = results[0]["url"]
-            await _search_status_msg.edit(content="▶️ Loading...")
+            await _search_status_msg.edit(content="Loading…")
 
         # ---------------------------------------------------------------
         # Playlist detection: play first track, offer to add the rest
         # ---------------------------------------------------------------
         if is_playlist_url(query):
-            status_msg = await ctx.send("🔍 Fetching playlist info...")
+            status_msg = await ctx.send("Fetching playlist info…")
             try:
                 yt_client = self.bot.config.get("youtube", {}).get("client", "web")
                 playlist_info = await asyncio.get_event_loop().run_in_executor(
@@ -1405,11 +1403,11 @@ class MusicCog(commands.Cog):
                 count = len(remaining_tracks)
                 if count > 0:
                     extra = (
-                        f"📋 **{playlist_title}** has **{count}** more tracks.\n"
+                        f"**{playlist_title}** has **{count}** more tracks.\n"
                         f"Click 'Load playlist' to add them to the queue."
                     )
                 else:
-                    extra = f"📋 Added **{playlist_title}** (1 track) to the queue."
+                    extra = f"Added **{playlist_title}** (1 track) to the queue."
 
                 current = gs.queue.current
                 if current:
@@ -1478,7 +1476,7 @@ class MusicCog(commands.Cog):
                 # Show offer to load the rest
                 count = len(remaining_tracks)
                 extra = (
-                    f"📋 **{playlist_title}** has **{count}** more tracks.\n"
+                    f"**{playlist_title}** has **{count}** more tracks.\n"
                     f"Click 'Load playlist' to add them to the queue."
                 )
                 await status_msg.delete()
@@ -1513,7 +1511,7 @@ class MusicCog(commands.Cog):
                 if removed:
                     try:
                         expired_extra = (
-                            f"📋 **{playlist_title}** had **{count}** more tracks.\n"
+                            f"**{playlist_title}** had **{count}** more tracks.\n"
                             f"~~Click Load playlist~~ *(expired)*"
                         )
                         expired_view = build_player_view(self.bot, title, expired_extra, guild_id=ctx.guild.id)
@@ -1601,7 +1599,7 @@ class MusicCog(commands.Cog):
                 await ctx.message.delete()
             except Exception:
                 pass
-            status_msg = _search_status_msg or await ctx.send("▶️ Resolving...")
+            status_msg = _search_status_msg or await ctx.send("Resolving…")
             try:
                 info = await gs.player.play(query)
                 title = info["title"]
@@ -1648,9 +1646,9 @@ class MusicCog(commands.Cog):
 
         if not query:
             # Discovery mode: let user narrow by country + genre before loading stations
-            status_msg = await ctx.send("📻 Discover Radio")
+            status_msg = await ctx.send("Discover radio")
             embed = discord.Embed(
-                title="📻 Discover Radio",
+                title="Discover radio",
                 description="Pick a country and genre to browse stations, or leave either as \"Any\" to browse all.",
                 color=0x3498db,
             )
@@ -1659,7 +1657,7 @@ class MusicCog(commands.Cog):
             return
 
         # Search mode: go straight to byname results
-        status_msg = await ctx.send("📻 Searching stations...")
+        status_msg = await ctx.send("Searching stations…")
         try:
             stations = await asyncio.get_event_loop().run_in_executor(
                 None, _fetch_radio_stations, query
@@ -1845,7 +1843,7 @@ class MusicCog(commands.Cog):
             track = Track(query=t["url"], title=t["title"], requested_by=user_id, url=t["url"])
             gs.queue.add(track)
 
-        await ctx.send(f"📋 Added **{len(tracks)}** tracks to the queue.")
+        await ctx.send(f"Added **{len(tracks)}** tracks to the queue.")
 
         # Start playback if nothing is currently playing
         if not gs.player.is_playing:
