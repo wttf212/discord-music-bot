@@ -112,7 +112,7 @@ def main():
             "Install with: pip install 'yt-dlp[default,curl-cffi]'"
         )
 
-    with open("config.yaml", "r") as f:
+    with open(os.path.join(_base_dir, "config.yaml"), "r") as f:
         config = yaml.safe_load(f)
 
     token = config["bot_token"]
