@@ -584,7 +584,7 @@ async def _play_radio_selected(bot, ctx: commands.Context, station: dict,
         await gs.player.play_radio(track)
         gs.queue.current = track
 
-        embed = create_np_embed(
+        view = build_player_view(
             bot, station_name,
             extra_desc="\U0001f534 LIVE",
             thumbnail=favicon,
@@ -594,7 +594,7 @@ async def _play_radio_selected(bot, ctx: commands.Context, station: dict,
             guild_id=ctx.guild.id,
         )
         await picker_msg.delete()
-        await send_new_np(bot, channel_id, embed)
+        await send_new_np(bot, channel_id, view)
         _start_auto_next(bot, channel_id, ctx.guild.id)
     except Exception as e:
         await picker_msg.edit(
@@ -711,7 +711,7 @@ async def _play_selected(bot, ctx: commands.Context, url: str,
         current = gs.queue.current
         if current:
             requester_name = f"<@{current.requested_by}>" if getattr(current, "requested_by", None) else ""
-            embed = create_np_embed(
+            view = build_player_view(
                 bot, current.title,
                 thumbnail=current.thumbnail,
                 url=current.url,
@@ -719,7 +719,7 @@ async def _play_selected(bot, ctx: commands.Context, url: str,
                 queue_tracks=gs.queue.preview_fair_order(),
                 guild_id=ctx.guild.id,
             )
-            await update_np_embed(bot, channel_id, embed)
+            await update_np_embed(bot, channel_id, view)
     else:
         # Start-playback path: nothing playing yet
         try:
@@ -733,7 +733,7 @@ async def _play_selected(bot, ctx: commands.Context, url: str,
                 thumbnail=track_thumbnail, url=track_url,
             )
 
-            embed = create_np_embed(
+            view = build_player_view(
                 bot, title,
                 thumbnail=track_thumbnail,
                 url=track_url,
@@ -742,7 +742,7 @@ async def _play_selected(bot, ctx: commands.Context, url: str,
                 guild_id=ctx.guild.id,
             )
             await picker_msg.delete()
-            await send_new_np(bot, channel_id, embed)
+            await send_new_np(bot, channel_id, view)
             _start_auto_next(bot, channel_id, ctx.guild.id)
         except Exception as e:
             await picker_msg.edit(
@@ -751,81 +751,334 @@ async def _play_selected(bot, ctx: commands.Context, url: str,
             )
 
 
-def create_np_embed(bot, title: str, extra_desc: str = "",
-                    thumbnail: str = "", url: str = "",
-                    requester_name: str = "",
-                    queue_tracks: list | None = None,
-                    guild_id: int | None = None) -> discord.Embed:
-    """Creates an embed for Now Playing with thumbnail, link, and queue preview."""
-    gs = bot.get_guild_state(guild_id) if guild_id else None
-    kbps = gs.player.get_bitrate_for_guild(guild_id) // 1000 if gs else bot.config.get("audio", {}).get("bitrate", 128)
-    # Artist + duration come from the player's current-track state (set in play()).
-    # Guard on the title so a stale artist/duration never attaches to a different
-    # track (e.g. radio sets no artist) — degrade to just the title when unmatched.
-    artist = ""
-    duration_str = ""
-    if gs and gs.player.current_track_title == title:
-        artist = gs.player.current_artist or ""
-        if gs.player.current_duration:
-            duration_str = _fmt_duration(gs.player.current_duration)
+class _ControlsRow(discord.ui.ActionRow):
+    """The five Now-Playing control buttons, rendered INSIDE the player Container.
 
-    # Main line: **Title**[ by Artist][ `[m:ss]`] — title links to the source when known.
-    title_md = f"[{title}]({url})" if url else title
-    desc = f"**{title_md}**"
-    if artist:
-        desc += f" by {artist}"
-    if duration_str:
-        desc += f" `[{duration_str}]`"
-    if extra_desc:
-        desc += f"\n\n{extra_desc}"
+    Icon-only monochrome glyphs (no colorful emoji). custom_ids are preserved from
+    the old PlayerControls so existing interactions/tests keep matching. `self.view`
+    is the parent PlayerView; bot/guild/channel come from it and the interaction.
+    """
 
-    # Force the embed to be wider using an invisible spacer line
-    desc += "\n\n" + "⠀" * 45
+    @discord.ui.button(label="‖", style=discord.ButtonStyle.success, custom_id="btn_playpause")  # ‖
+    async def playpause_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.view.evaluate_vote(interaction, "playpause"): return
+        guild_id = interaction.guild_id
+        gs = self.view.bot.get_guild_state(guild_id)
+        if gs.player.is_playing and not gs.player.is_paused:
+            gs.player.pause()
+        elif gs.player.is_paused:
+            gs.player.resume()
+        # Rebuild the card with the paused flag flipped to its new state.
+        new_view = build_player_view(**{**self.view._kwargs, "paused": gs.player.is_paused})
+        await interaction.response.edit_message(view=new_view)
 
-    embed = discord.Embed(
-        title="▶️ Now Playing",
-        description=desc,
-        color=NP_EMBED_COLOR,
-    )
+    @discord.ui.button(label="◄", style=discord.ButtonStyle.primary, custom_id="btn_prev")  # ◄
+    async def prev_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.view.evaluate_vote(interaction, "prev"): return
+        await interaction.response.defer()
+        guild_id = interaction.guild_id
+        gs = self.view.bot.get_guild_state(guild_id)
+        prev_track = gs.queue.previous()
+        if not prev_track:
+            await interaction.followup.send("No previous track in history.", ephemeral=True)
+            return
 
-    # Set thumbnail from the track
-    if thumbnail:
-        embed.set_thumbnail(url=thumbnail)
+        if gs.auto_next_task and not gs.auto_next_task.done():
+            gs.auto_next_task.cancel()
+            gs.auto_next_task = None
+        gs.auto_next_gen += 1
+        gs.player.stop_playback()
 
-    # Add queue preview (next 5 songs)
-    if queue_tracks:
+        try:
+            info = await gs.player.play(prev_track.query)
+            title = info["title"]
+            prev_track.title = title
+            prev_track.thumbnail = info.get("thumbnail", "")
+            prev_track.url = info.get("webpage_url", "")
+            view = build_player_view(self.view.bot, title,
+                                     thumbnail=prev_track.thumbnail,
+                                     url=prev_track.url,
+                                     requester_name=_get_requester_name(self.view.bot, prev_track.requested_by),
+                                     queue_tracks=gs.queue.preview_fair_order(),
+                                     guild_id=guild_id)
+            await send_new_np(self.view.bot, interaction.channel.id, view)
+            _start_auto_next(self.view.bot, interaction.channel.id, guild_id)
+        except Exception as e:
+            await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+
+    @discord.ui.button(label="►", style=discord.ButtonStyle.primary, custom_id="btn_next")  # ►
+    async def next_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.view.evaluate_vote(interaction, "next"): return
+        await interaction.response.defer()
+        guild_id = interaction.guild_id
+        gs = self.view.bot.get_guild_state(guild_id)
+        if gs.auto_next_task and not gs.auto_next_task.done():
+            gs.auto_next_task.cancel()
+            gs.auto_next_task = None
+        gs.auto_next_gen += 1
+        gs.player.stop_playback()
+        next_track = gs.queue.next()
+        if next_track:
+            try:
+                info = await gs.player.play(next_track.query)
+                title = info["title"]
+                next_track.title = title
+                next_track.thumbnail = info.get("thumbnail", "")
+                next_track.url = info.get("webpage_url", "")
+                view = build_player_view(self.view.bot, title,
+                                         thumbnail=next_track.thumbnail,
+                                         url=next_track.url,
+                                         requester_name=_get_requester_name(self.view.bot, next_track.requested_by),
+                                         queue_tracks=gs.queue.preview_fair_order(),
+                                         guild_id=guild_id)
+                await send_new_np(self.view.bot, interaction.channel.id, view)
+                _start_auto_next(self.view.bot, interaction.channel.id, guild_id)
+            except Exception as e:
+                await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+        else:
+            await update_np_stopped(self.view.bot, interaction.channel.id)
+
+    @discord.ui.button(label="■", style=discord.ButtonStyle.danger, custom_id="btn_stop")  # ■
+    async def stop_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.view.evaluate_vote(interaction, "stop"): return
+        await interaction.response.defer()
+        guild_id = interaction.guild_id
+        gs = self.view.bot.get_guild_state(guild_id)
+        if gs.auto_next_task and not gs.auto_next_task.done():
+            gs.auto_next_task.cancel()
+            gs.auto_next_task = None
+        gs.player.stop_playback()
+        gs.queue.clear()
+        await gs.player.disconnect()
+        await update_np_stopped(self.view.bot, interaction.channel.id)
+
+    @discord.ui.button(label="☰", style=discord.ButtonStyle.secondary, custom_id="btn_queue")  # ☰
+    async def queue_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Read-only: show the queue privately (ephemeral), no fairness vote required.
+        guild_id = interaction.guild_id
+        gs = self.view.bot.get_guild_state(guild_id)
+        tracks = gs.queue.list()
         lines = []
-        for i, t in enumerate(queue_tracks[:5], 1):
-            req_tag = ""
-            if t.requested_by:
-                req_tag = f" — *<@{t.requested_by}>*"
-            if t.url:
-                lines.append(f"`{i}.` [{t.title}]({t.url}){req_tag}")
-            else:
+        if gs.player.current_track_title:
+            lines.append(f"**Now playing:** {gs.player.current_track_title}")
+        if tracks:
+            for i, t in enumerate(tracks, 1):
+                req_tag = f" — <@{t.requested_by}>" if t.requested_by else ""
                 lines.append(f"`{i}.` {t.title}{req_tag}")
-        remaining = (len(gs.queue.list()) - 5) if gs else (len(queue_tracks) - 5)
-        if remaining > 0:
-            lines.append(f"*...and {remaining} more*")
-        embed.add_field(name="Up Next", value="\n".join(lines), inline=False)
-    else:
-        embed.add_field(name="Up Next", value="*No songs in queue*", inline=False)
+        else:
+            lines.append("*Queue is empty.*")
+        text = "\n".join(lines)
+        if len(text) > 1900:
+            text = text[:1900].rsplit("\n", 1)[0] + "\n*…more*"
+        await interaction.response.send_message(text, ephemeral=True)
 
-    if gs and guild_id is not None:
-        eq_bass, eq_treble = gs.player.get_eq_for_guild(guild_id)
-    else:
-        eq_bass, eq_treble = (0, 0)
-    eq_label = get_eq_preset_name(eq_bass, eq_treble)
 
-    # Footer: requester (resolved to name + avatar, since footers can't render
-    # mentions) folded together with the audio/EQ summary.
-    req_name, req_icon = _resolve_requester_display(bot, requester_name)
-    footer_bits = []
-    if req_name:
-        footer_bits.append(f"Track requested by {req_name}")
-    footer_bits.append(f"{kbps}kbps")
-    footer_bits.append(f"EQ {eq_label}")
-    embed.set_footer(text="  •  ".join(footer_bits), icon_url=req_icon or None)
-    return embed
+class _LoadPlaylistRow(discord.ui.ActionRow):
+    """Single "Load playlist" button folded into the player Container when a pending
+    playlist exists for this guild. Adds the remaining tracks then rebuilds the card."""
+
+    @discord.ui.button(label="Load playlist", style=discord.ButtonStyle.success, custom_id="btn_load_playlist")
+    async def load_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        bot = self.view.bot
+        guild_id = interaction.guild_id
+        channel_id = interaction.channel.id
+        gs = bot.get_guild_state(guild_id)
+        pending = bot.pending_playlists.pop(str(channel_id), None)
+        if not pending:
+            await interaction.followup.send("Playlist already loaded or expired.", ephemeral=True)
+            current = gs.queue.current
+            if current:
+                view = build_player_view(bot, current.title,
+                                         thumbnail=current.thumbnail,
+                                         url=current.url,
+                                         requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
+                                         queue_tracks=gs.queue.preview_fair_order(),
+                                         guild_id=guild_id)
+                await interaction.message.edit(view=view)
+            return
+
+        tracks = pending["tracks"]
+        user_id = str(interaction.user.id)
+
+        for t in tracks:
+            track = Track(query=t["url"], title=t["title"], requested_by=user_id, url=t["url"])
+            gs.queue.add(track)
+
+        current = gs.queue.current
+        if current:
+            view = build_player_view(bot, current.title,
+                                     thumbnail=current.thumbnail,
+                                     url=current.url,
+                                     requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
+                                     queue_tracks=gs.queue.preview_fair_order(),
+                                     guild_id=guild_id)
+            await interaction.message.edit(view=view)
+
+            channel = bot.get_channel(channel_id)
+            if channel:
+                await channel.send(f"Added **{len(tracks)}** tracks to the queue.")
+
+
+class PlayerView(discord.ui.LayoutView):
+    """Components V2 Now-Playing card: an accent-barred Container holding the song
+    info (with thumbnail Section), the Up-Next preview, a Separator, the control
+    row(s), and a small-text footer. Replaces the old embed + separate action row."""
+
+    def __init__(self, bot, *, title: str, extra_desc: str = "",
+                 thumbnail: str = "", url: str = "",
+                 requester_name: str = "",
+                 queue_tracks: list | None = None,
+                 guild_id: int | None = None,
+                 paused: bool = False,
+                 finished: bool = False):
+        super().__init__(timeout=None)
+        self.bot = bot
+        # Store every kwarg so a button can rebuild the card (e.g. play/pause flip).
+        self._kwargs = {
+            "title": title, "extra_desc": extra_desc, "thumbnail": thumbnail,
+            "url": url, "requester_name": requester_name,
+            "queue_tracks": queue_tracks, "guild_id": guild_id, "paused": paused,
+        }
+        self._title = title
+        self._extra_desc = extra_desc
+        self._thumbnail = thumbnail
+        self._url = url
+        self._requester_name = requester_name
+        self._queue_tracks = queue_tracks
+        self._guild_id = guild_id
+        self._paused = paused
+        self._finished = finished
+        self._build()
+
+    def _build(self):
+        bot = self.bot
+        guild_id = self._guild_id
+        finished = self._finished
+        paused = self._paused
+
+        gs = bot.get_guild_state(guild_id) if guild_id else None
+        kbps = gs.player.get_bitrate_for_guild(guild_id) // 1000 if gs else bot.config.get("audio", {}).get("bitrate", 128)
+
+        accent = NP_EMBED_COLOR if not finished else 0x95a5a6
+        c = discord.ui.Container(accent_colour=discord.Colour(accent))
+
+        # Header line
+        header = "**Paused**" if paused else ("**Queue finished**" if finished else "**Now Playing**")
+        c.add_item(discord.ui.TextDisplay(header))
+
+        if not finished:
+            # Artist + duration come from the player's current-track state (set in
+            # play()). Guard on the title so a stale artist/duration never attaches
+            # to a different track (e.g. radio sets no artist).
+            artist = ""
+            duration_str = ""
+            if gs and gs.player.current_track_title == self._title:
+                artist = gs.player.current_artist or ""
+                if gs.player.current_duration:
+                    duration_str = _fmt_duration(gs.player.current_duration)
+
+            title_md = f"[{self._title}]({self._url})" if self._url else self._title
+            body = f"**{title_md}**"
+            if artist:
+                body += f" by {artist}"
+            if duration_str:
+                body += f" `[{duration_str}]`"
+
+            if self._thumbnail:
+                sec = discord.ui.Section(accessory=discord.ui.Thumbnail(self._thumbnail))
+                sec.add_item(discord.ui.TextDisplay(body))
+                c.add_item(sec)
+            else:
+                c.add_item(discord.ui.TextDisplay(body))
+
+            if self._extra_desc:
+                c.add_item(discord.ui.TextDisplay(self._extra_desc))
+
+        # Up Next preview (next 5 + "...and N more")
+        if not finished and self._queue_tracks:
+            lines = []
+            for i, t in enumerate(self._queue_tracks[:5], 1):
+                req_tag = f" — *<@{t.requested_by}>*" if t.requested_by else ""
+                if t.url:
+                    lines.append(f"`{i}.` [{t.title}]({t.url}){req_tag}")
+                else:
+                    lines.append(f"`{i}.` {t.title}{req_tag}")
+            remaining = (len(gs.queue.list()) - 5) if gs else (len(self._queue_tracks) - 5)
+            if remaining > 0:
+                lines.append(f"*...and {remaining} more*")
+            c.add_item(discord.ui.TextDisplay("**Up Next**\n" + "\n".join(lines)))
+        elif finished:
+            c.add_item(discord.ui.TextDisplay("**Up Next**\n*Queue is empty*"))
+        else:
+            c.add_item(discord.ui.TextDisplay("**Up Next**\n*No songs in queue*"))
+
+        c.add_item(discord.ui.Separator())
+
+        # Controls live ABOVE the requester/footer line (matching the reference).
+        if not finished:
+            c.add_item(_ControlsRow())
+            # Add the Load row when any pending playlist exists for this guild.
+            # (The channel isn't known at build time, so match on guild_id.)
+            has_pending = any(
+                p.get("guild_id") in (guild_id, str(guild_id))
+                for p in bot.pending_playlists.values()
+            ) if guild_id is not None else False
+            if has_pending:
+                c.add_item(_LoadPlaylistRow())
+
+        # Footer: requester mention (renders as a pill) + audio/EQ summary, small text.
+        if gs and guild_id is not None:
+            eq_bass, eq_treble = gs.player.get_eq_for_guild(guild_id)
+        else:
+            eq_bass, eq_treble = (0, 0)
+        eq_label = get_eq_preset_name(eq_bass, eq_treble)
+        foot = "-# " + (f"Track requested by {self._requester_name} · " if self._requester_name else "") + f"{kbps}kbps · EQ {eq_label}"
+        c.add_item(discord.ui.TextDisplay(foot))
+
+        self.add_item(c)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        guild_id = str(interaction.guild_id) if interaction.guild_id else None
+        if not guild_id:
+            return True
+        allowed = get_allowed_channel(guild_id)
+        if allowed and str(interaction.channel_id) != allowed:
+            await interaction.response.send_message(f"Please use controls in <#{allowed}>.", ephemeral=True)
+            return False
+
+        bot_voice = interaction.guild.voice_client
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.response.send_message("You need to be in a voice channel to use controls.", ephemeral=True)
+            return False
+
+        if bot_voice and bot_voice.is_connected():
+            if interaction.user.voice.channel != bot_voice.channel:
+                await interaction.response.send_message("You must be in the same voice channel as the bot to use controls.", ephemeral=True)
+                return False
+
+        return True
+
+    async def evaluate_vote(self, interaction: discord.Interaction, action: str) -> bool:
+        passes, msg = _check_vote(self.bot, interaction.guild, interaction.user, action)
+        if not passes:
+            await interaction.response.send_message(msg, ephemeral=False)
+        return passes
+
+
+def build_player_view(bot, title: str, extra_desc: str = "",
+                      thumbnail: str = "", url: str = "",
+                      requester_name: str = "",
+                      queue_tracks: list | None = None,
+                      guild_id: int | None = None,
+                      paused: bool = False,
+                      finished: bool = False) -> PlayerView:
+    """Build the Components V2 Now-Playing card (replaces create_np_embed)."""
+    return PlayerView(
+        bot, title=title, extra_desc=extra_desc, thumbnail=thumbnail, url=url,
+        requester_name=requester_name, queue_tracks=queue_tracks,
+        guild_id=guild_id, paused=paused, finished=finished,
+    )
 
 
 def _get_requester_name(bot, user_id: str) -> str:
@@ -833,24 +1086,6 @@ def _get_requester_name(bot, user_id: str) -> str:
     if not user_id:
         return ""
     return f"<@{user_id}>"
-
-
-def _resolve_requester_display(bot, requester_name: str) -> tuple[str, str]:
-    """Resolve a "<@id>" mention to (display_name, avatar_url) for an embed footer.
-
-    Footers can't render mentions, so look up the cached user. Returns ("", "") when
-    there's no requester or the user isn't cached; returns the raw string (no icon)
-    when it isn't a mention.
-    """
-    if not requester_name:
-        return "", ""
-    m = re.match(r"<@!?(\d+)>", requester_name)
-    if not m:
-        return requester_name, ""
-    user = bot.get_user(int(m.group(1)))
-    if user:
-        return user.display_name, user.display_avatar.url
-    return "", ""
 
 
 async def check_channel(ctx: commands.Context) -> bool:
@@ -879,17 +1114,16 @@ async def check_channel(ctx: commands.Context) -> bool:
     return False
 
 
-async def _do_update_np_embed(bot, channel, msg_id, embed):
-    """Helper to update NP embed in a separate task."""
+async def _do_update_np_embed(bot, channel, msg_id, view):
+    """Helper to update the NP card (Components V2 view) in a separate task."""
     try:
         msg = await channel.fetch_message(msg_id)
-        view = _create_player_controls(bot, channel.id)
-        await msg.edit(embed=embed, view=view)
+        await msg.edit(view=view)
     except Exception as e:
-        print(f"[commands] Failed to update NP embed: {e}")
+        print(f"[commands] Failed to update NP card: {e}")
 
-async def update_np_embed(bot, channel_id: int, embed: discord.Embed):
-    """Edit the existing NP message embed in-place (no new message)."""
+async def update_np_embed(bot, channel_id: int, view: "PlayerView"):
+    """Edit the existing NP message card in-place (no new message)."""
     channel = bot.get_channel(channel_id)
     if not channel or not hasattr(channel, 'guild') or not channel.guild:
         return
@@ -898,11 +1132,11 @@ async def update_np_embed(bot, channel_id: int, embed: discord.Embed):
     msg_id = gs.np_message_id
     if not msg_id:
         return
-    asyncio.create_task(_do_update_np_embed(bot, channel, msg_id, embed))
+    asyncio.create_task(_do_update_np_embed(bot, channel, msg_id, view))
 
 
 async def update_np_stopped(bot, channel_id: int):
-    """Update the NP embed to a stopped/queue-finished state and remove all buttons."""
+    """Update the NP card to a stopped/queue-finished state and remove all buttons."""
     channel = bot.get_channel(channel_id)
     if not channel or not hasattr(channel, 'guild') or not channel.guild:
         return
@@ -911,61 +1145,12 @@ async def update_np_stopped(bot, channel_id: int):
     msg_id = gs.np_message_id
     if not msg_id:
         return
-    embed = discord.Embed(
-        title="⏹ Queue Finished",
-        color=0x95a5a6,
-    )
-    embed.add_field(name="Up Next", value="*Queue is empty*", inline=False)
-    kbps = gs.player.get_bitrate_for_guild(guild_id) // 1000
-    eq_bass, eq_treble = gs.player.get_eq_for_guild(guild_id)
-    eq_label = get_eq_preset_name(eq_bass, eq_treble)
-    embed.set_footer(text=f"{kbps}kbps  •  EQ {eq_label}")
+    view = build_player_view(bot, title="", finished=True, guild_id=guild_id)
     try:
         msg = await channel.fetch_message(msg_id)
-        await msg.edit(embed=embed, view=None)
+        await msg.edit(view=view)
     except Exception as e:
-        print(f"[commands] Failed to update stopped NP embed: {e}")
-
-
-class LoadPlaylistButton(discord.ui.Button):
-    def __init__(self, bot, channel_id):
-        super().__init__(label="Load Playlist Tracks", style=discord.ButtonStyle.success, emoji="✅", custom_id="btn_load_playlist")
-        self.bot = bot
-        self.channel_id = channel_id
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        guild_id = interaction.guild_id
-        gs = self.bot.get_guild_state(guild_id)
-        pending = self.bot.pending_playlists.pop(str(self.channel_id), None)
-        if not pending:
-            await interaction.followup.send("Playlist already loaded or expired.", ephemeral=True)
-            view = _create_player_controls(self.bot, self.channel_id)
-            await interaction.message.edit(view=view)
-            return
-
-        tracks = pending["tracks"]
-        user_id = str(interaction.user.id)
-
-        for t in tracks:
-            track = Track(query=t["url"], title=t["title"], requested_by=user_id, url=t["url"])
-            gs.queue.add(track)
-
-        current = gs.queue.current
-        if current:
-            embed = create_np_embed(self.bot, current.title,
-                                    thumbnail=current.thumbnail,
-                                    url=current.url,
-                                    requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
-                                    queue_tracks=gs.queue.preview_fair_order(),
-                                    guild_id=guild_id)
-
-            view = _create_player_controls(self.bot, self.channel_id)
-            await interaction.message.edit(embed=embed, view=view)
-
-            channel = self.bot.get_channel(self.channel_id)
-            if channel:
-                await channel.send(f"📋 Added **{len(tracks)}** tracks to the queue.")
+        print(f"[commands] Failed to update stopped NP card: {e}")
 
 
 async def _resolve_track_info(bot, channel_id: int, track: Track):
@@ -990,7 +1175,7 @@ async def _resolve_track_info(bot, channel_id: int, track: Track):
         current = gs.queue.current
         if current:
             requester_name = _get_requester_name(bot, current.requested_by)
-            embed = create_np_embed(
+            view = build_player_view(
                 bot,
                 current.title,
                 thumbnail=current.thumbnail,
@@ -999,11 +1184,11 @@ async def _resolve_track_info(bot, channel_id: int, track: Track):
                 queue_tracks=gs.queue.preview_fair_order(),
                 guild_id=guild_id,
             )
-            asyncio.create_task(update_np_embed(bot, channel_id, embed))
+            asyncio.create_task(update_np_embed(bot, channel_id, view))
     except Exception as e:
         print(f"[commands] Failed background resolve for {track.query}: {e}")
 
-async def send_new_np(bot, channel_id: int, embed: discord.Embed):
+async def send_new_np(bot, channel_id: int, view: "PlayerView"):
     channel = bot.get_channel(channel_id)
     if not channel or not hasattr(channel, 'guild') or not channel.guild:
         return
@@ -1024,18 +1209,11 @@ async def send_new_np(bot, channel_id: int, embed: discord.Embed):
         except Exception:
             pass
 
-    view = _create_player_controls(bot, channel_id)
     try:
-        new_msg = await channel.send(embed=embed, view=view)
+        new_msg = await channel.send(view=view)
         gs.np_message_id = new_msg.id
     except Exception as e:
         print(f"[commands] Failed to send NP message: {e}")
-
-def _create_player_controls(bot, channel_id):
-    view = PlayerControls(bot, channel_id)
-    if str(channel_id) in bot.pending_playlists:
-        view.add_item(LoadPlaylistButton(bot, channel_id))
-    return view
 
 import math as _math
 
@@ -1084,162 +1262,6 @@ def _check_vote(bot, guild, user, action: str) -> tuple[bool, str]:
 
     msg = f"🗳️ `{action}` vote from {user.display_name} recorded! ({len(votes_set)}/{req} votes needed, fairness: {pct}%)"
     return False, msg
-
-
-class PlayerControls(discord.ui.View):
-    def __init__(self, bot, channel_id):
-        super().__init__(timeout=None)
-        self.bot = bot
-        self.channel_id = channel_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        guild_id = str(interaction.guild_id) if interaction.guild_id else None
-        if not guild_id:
-            return True
-        allowed = get_allowed_channel(guild_id)
-        if allowed and str(interaction.channel_id) != allowed:
-            await interaction.response.send_message(f"Please use controls in <#{allowed}>.", ephemeral=True)
-            return False
-
-        bot_voice = interaction.guild.voice_client
-        if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message("You need to be in a voice channel to use controls.", ephemeral=True)
-            return False
-
-        if bot_voice and bot_voice.is_connected():
-            if interaction.user.voice.channel != bot_voice.channel:
-                await interaction.response.send_message("You must be in the same voice channel as the bot to use controls.", ephemeral=True)
-                return False
-
-        return True
-
-    async def evaluate_vote(self, interaction: discord.Interaction, action: str) -> bool:
-        passes, msg = _check_vote(self.bot, interaction.guild, interaction.user, action)
-        if not passes:
-            await interaction.response.send_message(msg, ephemeral=False)
-        return passes
-
-    @discord.ui.button(label="⏸️ Pause", style=discord.ButtonStyle.success, custom_id="btn_playpause")
-    async def playpause_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.evaluate_vote(interaction, "playpause"): return
-        guild_id = interaction.guild_id
-        gs = self.bot.get_guild_state(guild_id)
-        if gs.player.is_playing and not gs.player.is_paused:
-            gs.player.pause()
-        elif gs.player.is_paused:
-            gs.player.resume()
-
-        embed = interaction.message.embeds[0] if interaction.message.embeds else None
-        if gs.player.is_paused:
-            button.label = "▶️ Resume"
-            if embed:
-                embed.title = "⏸️ Paused"
-        else:
-            button.label = "⏸️ Pause"
-            if embed:
-                embed.title = "▶️ Now Playing"
-
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(label="⏮️ Prev", style=discord.ButtonStyle.primary, custom_id="btn_prev")
-    async def prev_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.evaluate_vote(interaction, "prev"): return
-        await interaction.response.defer()
-        guild_id = interaction.guild_id
-        gs = self.bot.get_guild_state(guild_id)
-        prev_track = gs.queue.previous()
-        if not prev_track:
-            await interaction.followup.send("No previous track in history.", ephemeral=True)
-            return
-
-        if gs.auto_next_task and not gs.auto_next_task.done():
-            gs.auto_next_task.cancel()
-            gs.auto_next_task = None
-        gs.auto_next_gen += 1
-        gs.player.stop_playback()
-
-        try:
-            info = await gs.player.play(prev_track.query)
-            title = info["title"]
-            prev_track.title = title
-            prev_track.thumbnail = info.get("thumbnail", "")
-            prev_track.url = info.get("webpage_url", "")
-            embed = create_np_embed(self.bot, title,
-                                    thumbnail=prev_track.thumbnail,
-                                    url=prev_track.url,
-                                    requester_name=_get_requester_name(self.bot, prev_track.requested_by),
-                                    queue_tracks=gs.queue.preview_fair_order(),
-                                    guild_id=guild_id)
-            await send_new_np(self.bot, self.channel_id, embed)
-            _start_auto_next(self.bot, self.channel_id, guild_id)
-        except Exception as e:
-            await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
-
-    @discord.ui.button(label="⏭️ Next", style=discord.ButtonStyle.primary, custom_id="btn_next")
-    async def next_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.evaluate_vote(interaction, "next"): return
-        await interaction.response.defer()
-        guild_id = interaction.guild_id
-        gs = self.bot.get_guild_state(guild_id)
-        if gs.auto_next_task and not gs.auto_next_task.done():
-            gs.auto_next_task.cancel()
-            gs.auto_next_task = None
-        gs.auto_next_gen += 1
-        gs.player.stop_playback()
-        next_track = gs.queue.next()
-        if next_track:
-            try:
-                info = await gs.player.play(next_track.query)
-                title = info["title"]
-                next_track.title = title
-                next_track.thumbnail = info.get("thumbnail", "")
-                next_track.url = info.get("webpage_url", "")
-                embed = create_np_embed(self.bot, title,
-                                        thumbnail=next_track.thumbnail,
-                                        url=next_track.url,
-                                        requester_name=_get_requester_name(self.bot, next_track.requested_by),
-                                        queue_tracks=gs.queue.preview_fair_order(),
-                                        guild_id=guild_id)
-                await send_new_np(self.bot, self.channel_id, embed)
-                _start_auto_next(self.bot, self.channel_id, guild_id)
-            except Exception as e:
-                await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
-        else:
-            await update_np_stopped(self.bot, self.channel_id)
-
-    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger, custom_id="btn_stop")
-    async def stop_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.evaluate_vote(interaction, "stop"): return
-        await interaction.response.defer()
-        guild_id = interaction.guild_id
-        gs = self.bot.get_guild_state(guild_id)
-        if gs.auto_next_task and not gs.auto_next_task.done():
-            gs.auto_next_task.cancel()
-            gs.auto_next_task = None
-        gs.player.stop_playback()
-        gs.queue.clear()
-        await gs.player.disconnect()
-        await update_np_stopped(self.bot, self.channel_id)
-
-    @discord.ui.button(label="📋 Queue", style=discord.ButtonStyle.secondary, custom_id="btn_queue")
-    async def queue_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Read-only: show the queue privately (ephemeral), no fairness vote required.
-        guild_id = interaction.guild_id
-        gs = self.bot.get_guild_state(guild_id)
-        tracks = gs.queue.list()
-        lines = []
-        if gs.player.current_track_title:
-            lines.append(f"**Now playing:** {gs.player.current_track_title}")
-        if tracks:
-            for i, t in enumerate(tracks, 1):
-                req_tag = f" — <@{t.requested_by}>" if t.requested_by else ""
-                lines.append(f"`{i}.` {t.title}{req_tag}")
-        else:
-            lines.append("*Queue is empty.*")
-        text = "\n".join(lines)
-        if len(text) > 1900:
-            text = text[:1900].rsplit("\n", 1)[0] + "\n*…more*"
-        await interaction.response.send_message(text, ephemeral=True)
 
 
 class MusicCog(commands.Cog):
@@ -1384,21 +1406,21 @@ class MusicCog(commands.Cog):
                 if count > 0:
                     extra = (
                         f"📋 **{playlist_title}** has **{count}** more tracks.\n"
-                        f"Click 'Load Playlist Tracks' to add them to the queue."
+                        f"Click 'Load playlist' to add them to the queue."
                     )
                 else:
                     extra = f"📋 Added **{playlist_title}** (1 track) to the queue."
 
                 current = gs.queue.current
                 if current:
-                    embed = create_np_embed(self.bot, current.title, extra,
+                    view = build_player_view(self.bot, current.title, extra,
                                             thumbnail=current.thumbnail,
                                             url=current.url,
                                             requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
                                             queue_tracks=gs.queue.preview_fair_order(),
                                             guild_id=ctx.guild.id)
                     await status_msg.delete()
-                    await update_np_embed(self.bot, channel_id, embed)
+                    await update_np_embed(self.bot, channel_id, view)
 
             else:
                 # Join voice if not already connected
@@ -1441,7 +1463,7 @@ class MusicCog(commands.Cog):
                     return
 
                 if not remaining_tracks:
-                    embed = create_np_embed(self.bot, title,
+                    view = build_player_view(self.bot, title,
                                             f"From playlist: **{playlist_title}**",
                                             thumbnail=track_thumbnail,
                                             url=track_url,
@@ -1449,7 +1471,7 @@ class MusicCog(commands.Cog):
                                             queue_tracks=gs.queue.preview_fair_order(),
                                             guild_id=ctx.guild.id)
                     await status_msg.delete()
-                    await send_new_np(self.bot, channel_id, embed)
+                    await send_new_np(self.bot, channel_id, view)
                     _start_auto_next(self.bot, channel_id, ctx.guild.id)
                     return
 
@@ -1457,18 +1479,11 @@ class MusicCog(commands.Cog):
                 count = len(remaining_tracks)
                 extra = (
                     f"📋 **{playlist_title}** has **{count}** more tracks.\n"
-                    f"Click 'Load Playlist Tracks' to add them to the queue."
+                    f"Click 'Load playlist' to add them to the queue."
                 )
-                embed = create_np_embed(self.bot, title, extra,
-                                        thumbnail=track_thumbnail,
-                                        url=track_url,
-                                        requester_name=f"<@{user_id}>",
-                                        queue_tracks=gs.queue.preview_fair_order(),
-                                        guild_id=ctx.guild.id)
                 await status_msg.delete()
-                await send_new_np(self.bot, channel_id, embed)
 
-            # Store pending playlist
+            # Store pending playlist BEFORE building the card so the Load row renders.
             self.bot.pending_playlists[str(channel_id)] = {
                 "query": query,
                 "user_id": str(ctx.author.id),
@@ -1478,10 +1493,17 @@ class MusicCog(commands.Cog):
                 "playlist_title": playlist_title,
             }
 
+            current = gs.queue.current
+            view = build_player_view(self.bot, current.title, extra,
+                                     thumbnail=current.thumbnail,
+                                     url=current.url,
+                                     requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
+                                     queue_tracks=gs.queue.preview_fair_order(),
+                                     guild_id=ctx.guild.id)
             if voice_actually_playing:
-                await update_np_embed(self.bot, channel_id, embed)
+                await update_np_embed(self.bot, channel_id, view)
             else:
-                await send_new_np(self.bot, channel_id, embed)
+                await send_new_np(self.bot, channel_id, view)
                 _start_auto_next(self.bot, channel_id, ctx.guild.id)
 
             # Auto-expire after 120 seconds
@@ -1492,10 +1514,10 @@ class MusicCog(commands.Cog):
                     try:
                         expired_extra = (
                             f"📋 **{playlist_title}** had **{count}** more tracks.\n"
-                            f"~~Click Load Playlist Tracks~~ *(expired)*"
+                            f"~~Click Load playlist~~ *(expired)*"
                         )
-                        expired_embed = create_np_embed(self.bot, title, expired_extra, guild_id=ctx.guild.id)
-                        await update_np_embed(self.bot, ch_id, expired_embed)
+                        expired_view = build_player_view(self.bot, title, expired_extra, guild_id=ctx.guild.id)
+                        await update_np_embed(self.bot, ch_id, expired_view)
                     except Exception:
                         pass
 
@@ -1563,7 +1585,7 @@ class MusicCog(commands.Cog):
             current = gs.queue.current
             if current:
                 requester_name = f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else ""
-                embed = create_np_embed(
+                view = build_player_view(
                     self.bot,
                     current.title,
                     thumbnail=current.thumbnail,
@@ -1572,7 +1594,7 @@ class MusicCog(commands.Cog):
                     queue_tracks=gs.queue.preview_fair_order(),
                     guild_id=ctx.guild.id,
                 )
-                await update_np_embed(self.bot, channel_id, embed)
+                await update_np_embed(self.bot, channel_id, view)
         else:
             # Delete the user's command message to keep chat clean
             try:
@@ -1594,14 +1616,14 @@ class MusicCog(commands.Cog):
 
                 requester_name = f"<@{user_id}>"
 
-                embed = create_np_embed(self.bot, title,
+                view = build_player_view(self.bot, title,
                                         thumbnail=track_thumbnail,
                                         url=track_url,
                                         requester_name=requester_name,
                                         queue_tracks=gs.queue.preview_fair_order(),
                                         guild_id=ctx.guild.id)
                 await status_msg.delete()
-                await send_new_np(self.bot, channel_id, embed)
+                await send_new_np(self.bot, channel_id, view)
                 _start_auto_next(self.bot, channel_id, ctx.guild.id)
             except Exception as e:
                 await status_msg.edit(content=f"Error playing track: {e}")
@@ -1744,14 +1766,14 @@ class MusicCog(commands.Cog):
                 next_track.title = title
                 next_track.thumbnail = info.get("thumbnail", "")
                 next_track.url = info.get("webpage_url", "")
-                embed = create_np_embed(self.bot, title,
+                view = build_player_view(self.bot, title,
                                         thumbnail=next_track.thumbnail,
                                         url=next_track.url,
                                         requester_name=_get_requester_name(self.bot, next_track.requested_by),
                                         queue_tracks=gs.queue.preview_fair_order(),
                                         guild_id=ctx.guild.id)
                 await ctx.send("Skipped.", delete_after=3)
-                await send_new_np(self.bot, channel_id, embed)
+                await send_new_np(self.bot, channel_id, view)
                 _start_auto_next(self.bot, channel_id, ctx.guild.id)
             except Exception as e:
                 await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
@@ -1835,13 +1857,13 @@ class MusicCog(commands.Cog):
                     next_track.title = title
                     next_track.thumbnail = info.get("thumbnail", "")
                     next_track.url = info.get("webpage_url", "")
-                    embed = create_np_embed(self.bot, title,
+                    view = build_player_view(self.bot, title,
                                             thumbnail=next_track.thumbnail,
                                             url=next_track.url,
                                             requester_name=f"<@{next_track.requested_by}>",
                                             queue_tracks=gs.queue.preview_fair_order(),
                                             guild_id=ctx.guild.id)
-                    await send_new_np(self.bot, channel_id, embed)
+                    await send_new_np(self.bot, channel_id, view)
                     _start_auto_next(self.bot, channel_id, ctx.guild.id)
                 except Exception as e:
                     await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
@@ -2141,13 +2163,13 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 next_track.thumbnail = info.get("thumbnail", "")
                 next_track.url = info.get("webpage_url", "")
                 consecutive_errors = 0  # reset on success
-                embed = create_np_embed(bot, title,
+                view = build_player_view(bot, title,
                                         thumbnail=next_track.thumbnail,
                                         url=next_track.url,
                                         requester_name=_get_requester_name(bot, next_track.requested_by),
                                         queue_tracks=gs.queue.preview_fair_order(),
                                         guild_id=guild_id)
-                await send_new_np(bot, channel_id, embed)
+                await send_new_np(bot, channel_id, view)
             except Exception as e:
                 consecutive_errors += 1
                 channel = bot.get_channel(channel_id)
