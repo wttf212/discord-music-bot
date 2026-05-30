@@ -1015,7 +1015,12 @@ class PlayerView(discord.ui.LayoutView):
 
         # Controls live ABOVE the requester/footer line (matching the reference).
         if not finished:
-            c.add_item(_ControlsRow())
+            controls = _ControlsRow()
+            # Reflect paused state on the play/pause glyph (▶ = resume, ‖ = pause).
+            for _item in controls.children:
+                if getattr(_item, "custom_id", None) == "btn_playpause":
+                    _item.label = "▶" if paused else "‖"
+            c.add_item(controls)
             # Add the Load row when any pending playlist exists for this guild.
             # (The channel isn't known at build time, so match on guild_id.)
             has_pending = any(
