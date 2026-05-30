@@ -584,7 +584,7 @@ async def _play_radio_selected(bot, ctx: commands.Context, station: dict,
 
         view = build_player_view(
             bot, station_name,
-            extra_desc="\U0001f534 LIVE",
+            extra_desc="● LIVE",
             thumbnail=favicon,
             url="",
             requester_name=f"<@{user_id}>",
@@ -1414,16 +1414,7 @@ class MusicCog(commands.Cog):
                 else:
                     extra = f"Added **{playlist_title}** (1 track) to the queue."
 
-                current = gs.queue.current
-                if current:
-                    view = build_player_view(self.bot, current.title, extra,
-                                            thumbnail=current.thumbnail,
-                                            url=current.url,
-                                            requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
-                                            queue_tracks=gs.queue.preview_fair_order(),
-                                            guild_id=ctx.guild.id)
-                    await status_msg.delete()
-                    await update_np_embed(self.bot, channel_id, view)
+                await status_msg.delete()
 
             else:
                 # Join voice if not already connected
