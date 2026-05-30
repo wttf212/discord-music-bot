@@ -370,10 +370,11 @@ class TestCallSite(unittest.TestCase):
             return fh.read()
 
     def test_play_uses_get_audio_url_with_retry(self):
-        src = self._read_source()
-        self.assertIn("run_in_executor(None, get_audio_url_with_retry,", src,
+        # Collapse all whitespace so multi-line formatting of the call doesn't matter
+        src = "".join(self._read_source().split())
+        self.assertIn("run_in_executor(None,get_audio_url_with_retry,", src,
                       "AudioPlayer.play() must use get_audio_url_with_retry, not get_audio_url")
-        self.assertNotIn("run_in_executor(None, get_audio_url,", src,
+        self.assertNotIn("run_in_executor(None,get_audio_url,", src,
                          "Old call site with bare get_audio_url must be removed")
 
     def test_no_retry_on_subprocess_path(self):
