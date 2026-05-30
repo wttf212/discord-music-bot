@@ -23,6 +23,9 @@ PLAYLIST_EMOJI = "\u2705"  # ✅
 
 
 
+NP_EMBED_COLOR = 0xF59E0B  # amber/gold — Now Playing accent
+
+
 def _fmt_duration(seconds):
     """Convert seconds (int|float|None) to 'mm:ss' string. None -> '?'."""
     if seconds is None:
@@ -756,15 +759,23 @@ def create_np_embed(bot, title: str, extra_desc: str = "",
     """Creates an embed for Now Playing with thumbnail, link, and queue preview."""
     gs = bot.get_guild_state(guild_id) if guild_id else None
     kbps = gs.player.get_bitrate_for_guild(guild_id) // 1000 if gs else bot.config.get("audio", {}).get("bitrate", 128)
-    p = bot.command_prefix
+    # Artist + duration come from the player's current-track state (set in play()).
+    # Guard on the title so a stale artist/duration never attaches to a different
+    # track (e.g. radio sets no artist) — degrade to just the title when unmatched.
+    artist = ""
+    duration_str = ""
+    if gs and gs.player.current_track_title == title:
+        artist = gs.player.current_artist or ""
+        if gs.player.current_duration:
+            duration_str = _fmt_duration(gs.player.current_duration)
 
-    # Make the title a clickable link if we have a URL
-    if url:
-        desc = f"**[{title}]({url})**"
-    else:
-        desc = f"**{title}**"
-    if requester_name:
-        desc += f"\n*Requested by {requester_name}*"
+    # Main line: **Title**[ by Artist][ `[m:ss]`] — title links to the source when known.
+    title_md = f"[{title}]({url})" if url else title
+    desc = f"**{title_md}**"
+    if artist:
+        desc += f" by {artist}"
+    if duration_str:
+        desc += f" `[{duration_str}]`"
     if extra_desc:
         desc += f"\n\n{extra_desc}"
 
@@ -774,7 +785,7 @@ def create_np_embed(bot, title: str, extra_desc: str = "",
     embed = discord.Embed(
         title="▶️ Now Playing",
         description=desc,
-        color=0x3498db,
+        color=NP_EMBED_COLOR,
     )
 
     # Set thumbnail from the track
@@ -804,7 +815,16 @@ def create_np_embed(bot, title: str, extra_desc: str = "",
     else:
         eq_bass, eq_treble = (0, 0)
     eq_label = get_eq_preset_name(eq_bass, eq_treble)
-    embed.set_footer(text=f"Audio: {kbps} kbps • EQ: {eq_label} • {p}bitrate | {p}eq to change")
+
+    # Footer: requester (resolved to name + avatar, since footers can't render
+    # mentions) folded together with the audio/EQ summary.
+    req_name, req_icon = _resolve_requester_display(bot, requester_name)
+    footer_bits = []
+    if req_name:
+        footer_bits.append(f"Track requested by {req_name}")
+    footer_bits.append(f"{kbps}kbps")
+    footer_bits.append(f"EQ {eq_label}")
+    embed.set_footer(text="  •  ".join(footer_bits), icon_url=req_icon or None)
     return embed
 
 
@@ -813,6 +833,24 @@ def _get_requester_name(bot, user_id: str) -> str:
     if not user_id:
         return ""
     return f"<@{user_id}>"
+
+
+def _resolve_requester_display(bot, requester_name: str) -> tuple[str, str]:
+    """Resolve a "<@id>" mention to (display_name, avatar_url) for an embed footer.
+
+    Footers can't render mentions, so look up the cached user. Returns ("", "") when
+    there's no requester or the user isn't cached; returns the raw string (no icon)
+    when it isn't a mention.
+    """
+    if not requester_name:
+        return "", ""
+    m = re.match(r"<@!?(\d+)>", requester_name)
+    if not m:
+        return requester_name, ""
+    user = bot.get_user(int(m.group(1)))
+    if user:
+        return user.display_name, user.display_avatar.url
+    return "", ""
 
 
 async def check_channel(ctx: commands.Context) -> bool:
@@ -878,11 +916,10 @@ async def update_np_stopped(bot, channel_id: int):
         color=0x95a5a6,
     )
     embed.add_field(name="Up Next", value="*Queue is empty*", inline=False)
-    p = bot.command_prefix
     kbps = gs.player.get_bitrate_for_guild(guild_id) // 1000
     eq_bass, eq_treble = gs.player.get_eq_for_guild(guild_id)
     eq_label = get_eq_preset_name(eq_bass, eq_treble)
-    embed.set_footer(text=f"Audio: {kbps} kbps • EQ: {eq_label} • {p}bitrate | {p}eq to change")
+    embed.set_footer(text=f"{kbps}kbps  •  EQ {eq_label}")
     try:
         msg = await channel.fetch_message(msg_id)
         await msg.edit(embed=embed, view=None)
@@ -1082,7 +1119,29 @@ class PlayerControls(discord.ui.View):
             await interaction.response.send_message(msg, ephemeral=False)
         return passes
 
-    @discord.ui.button(label="⏮️ Prev", style=discord.ButtonStyle.secondary, custom_id="btn_prev")
+    @discord.ui.button(label="⏸️ Pause", style=discord.ButtonStyle.success, custom_id="btn_playpause")
+    async def playpause_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.evaluate_vote(interaction, "playpause"): return
+        guild_id = interaction.guild_id
+        gs = self.bot.get_guild_state(guild_id)
+        if gs.player.is_playing and not gs.player.is_paused:
+            gs.player.pause()
+        elif gs.player.is_paused:
+            gs.player.resume()
+
+        embed = interaction.message.embeds[0] if interaction.message.embeds else None
+        if gs.player.is_paused:
+            button.label = "▶️ Resume"
+            if embed:
+                embed.title = "⏸️ Paused"
+        else:
+            button.label = "⏸️ Pause"
+            if embed:
+                embed.title = "▶️ Now Playing"
+
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="⏮️ Prev", style=discord.ButtonStyle.primary, custom_id="btn_prev")
     async def prev_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.evaluate_vote(interaction, "prev"): return
         await interaction.response.defer()
@@ -1116,39 +1175,7 @@ class PlayerControls(discord.ui.View):
         except Exception as e:
             await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
 
-    @discord.ui.button(label="⏯️ Play/Pause", style=discord.ButtonStyle.primary, custom_id="btn_playpause")
-    async def playpause_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.evaluate_vote(interaction, "playpause"): return
-        guild_id = interaction.guild_id
-        gs = self.bot.get_guild_state(guild_id)
-        if gs.player.is_playing and not gs.player.is_paused:
-            gs.player.pause()
-        elif gs.player.is_paused:
-            gs.player.resume()
-
-        embed = interaction.message.embeds[0] if interaction.message.embeds else None
-        if embed and gs.player.is_paused:
-            embed.title = "⏸️ Paused"
-        elif embed:
-            embed.title = "▶️ Now Playing"
-
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger, custom_id="btn_stop")
-    async def stop_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.evaluate_vote(interaction, "stop"): return
-        await interaction.response.defer()
-        guild_id = interaction.guild_id
-        gs = self.bot.get_guild_state(guild_id)
-        if gs.auto_next_task and not gs.auto_next_task.done():
-            gs.auto_next_task.cancel()
-            gs.auto_next_task = None
-        gs.player.stop_playback()
-        gs.queue.clear()
-        await gs.player.disconnect()
-        await update_np_stopped(self.bot, self.channel_id)
-
-    @discord.ui.button(label="⏭️ Next", style=discord.ButtonStyle.secondary, custom_id="btn_next")
+    @discord.ui.button(label="⏭️ Next", style=discord.ButtonStyle.primary, custom_id="btn_next")
     async def next_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.evaluate_vote(interaction, "next"): return
         await interaction.response.defer()
@@ -1179,6 +1206,40 @@ class PlayerControls(discord.ui.View):
                 await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
             await update_np_stopped(self.bot, self.channel_id)
+
+    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger, custom_id="btn_stop")
+    async def stop_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.evaluate_vote(interaction, "stop"): return
+        await interaction.response.defer()
+        guild_id = interaction.guild_id
+        gs = self.bot.get_guild_state(guild_id)
+        if gs.auto_next_task and not gs.auto_next_task.done():
+            gs.auto_next_task.cancel()
+            gs.auto_next_task = None
+        gs.player.stop_playback()
+        gs.queue.clear()
+        await gs.player.disconnect()
+        await update_np_stopped(self.bot, self.channel_id)
+
+    @discord.ui.button(label="📋 Queue", style=discord.ButtonStyle.secondary, custom_id="btn_queue")
+    async def queue_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Read-only: show the queue privately (ephemeral), no fairness vote required.
+        guild_id = interaction.guild_id
+        gs = self.bot.get_guild_state(guild_id)
+        tracks = gs.queue.list()
+        lines = []
+        if gs.player.current_track_title:
+            lines.append(f"**Now playing:** {gs.player.current_track_title}")
+        if tracks:
+            for i, t in enumerate(tracks, 1):
+                req_tag = f" — <@{t.requested_by}>" if t.requested_by else ""
+                lines.append(f"`{i}.` {t.title}{req_tag}")
+        else:
+            lines.append("*Queue is empty.*")
+        text = "\n".join(lines)
+        if len(text) > 1900:
+            text = text[:1900].rsplit("\n", 1)[0] + "\n*…more*"
+        await interaction.response.send_message(text, ephemeral=True)
 
 
 class MusicCog(commands.Cog):

@@ -354,6 +354,8 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
             "thumbnail": info.get("thumbnail", ""),
             "webpage_url": info.get("webpage_url", ""),
             "is_audio_only": is_audio_only,
+            "duration": info.get("duration"),
+            "artist": info.get("artist") or info.get("uploader") or info.get("channel") or "",
         }
 
 
@@ -557,6 +559,8 @@ class AudioPlayer:
         self.is_playing = False
         self.is_paused = False
         self.current_track_title: str | None = None
+        self.current_artist: str = ""
+        self.current_duration: int | None = None
         self._playback_done = asyncio.Event()
         self._ytdlp_proc: subprocess.Popen | None = None
         self._playback_gen = 0  # Incremented at start of play()/play_radio() to guard stale after_playback callbacks
@@ -716,6 +720,8 @@ class AudioPlayer:
         self.is_playing = True
         self.is_paused = False
         self.current_track_title = title
+        self.current_artist = info.get("artist") or ""
+        self.current_duration = info.get("duration")
         self._playback_done.clear()
 
         def after_playback(error):
@@ -778,6 +784,8 @@ class AudioPlayer:
         self.is_playing = False
         self.is_paused = False
         self.current_track_title = None
+        self.current_artist = ""
+        self.current_duration = None
         if self._voice_client and (self._voice_client.is_playing() or self._voice_client.is_paused()):
             self._voice_client.stop()
         # Terminate the yt-dlp pipe subprocess (frees network connection and CPU)
