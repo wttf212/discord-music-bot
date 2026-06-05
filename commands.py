@@ -1379,12 +1379,6 @@ class MusicCog(commands.Cog):
             first_track_info = tracks[0]
             remaining_tracks = tracks[1:]
 
-            # Delete the user's command message to keep chat clean
-            try:
-                await ctx.message.delete()
-            except Exception:
-                pass
-
             # Check if audio is actually playing in this guild
             voice_actually_playing = (
                 gs.player.is_playing
@@ -1399,11 +1393,6 @@ class MusicCog(commands.Cog):
                 # Add the first track to the queue silently
                 track = Track(query=first_track_info["url"], title=first_track_info["title"], requested_by=user_id, url=first_track_info["url"])
                 gs.queue.add(track)
-
-                try:
-                    await ctx.message.delete()
-                except Exception:
-                    pass
 
                 count = len(remaining_tracks)
                 if count > 0:
@@ -1564,11 +1553,7 @@ class MusicCog(commands.Cog):
             # Start background task to fetch actual title/thumbnail
             asyncio.create_task(_resolve_track_info(self.bot, channel_id, track))
 
-            # Delete the user's command message and any search status message
-            try:
-                await ctx.message.delete()
-            except Exception:
-                pass
+            # Delete the bot's transient search status message (keep the user's command in chat)
             if _search_status_msg:
                 try:
                     await _search_status_msg.delete()
@@ -1590,11 +1575,6 @@ class MusicCog(commands.Cog):
                 )
                 await update_np_embed(self.bot, channel_id, view)
         else:
-            # Delete the user's command message to keep chat clean
-            try:
-                await ctx.message.delete()
-            except Exception:
-                pass
             status_msg = _search_status_msg or await ctx.send("Resolving…")
             try:
                 info = await gs.player.play(query)
