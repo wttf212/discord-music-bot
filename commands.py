@@ -1301,6 +1301,12 @@ class MusicCog(commands.Cog):
             await ctx.send("You need to be in a voice channel.")
             return
 
+        # Block queueing from outside the bot's current voice channel (mirrors button controls)
+        bot_voice = ctx.guild.voice_client
+        if bot_voice and bot_voice.is_connected() and ctx.author.voice.channel != bot_voice.channel:
+            await ctx.send("You must be in the same voice channel as the bot to queue songs.")
+            return
+
         query = _strip_ytsearch_prefix(query)
         await ctx.defer()
         status_msg = await ctx.send("Searching…")
@@ -1333,6 +1339,11 @@ class MusicCog(commands.Cog):
             return
 
         voice_channel = ctx.author.voice.channel
+        # Block queueing from outside the bot's current voice channel (mirrors button controls)
+        bot_voice = ctx.guild.voice_client
+        if bot_voice and bot_voice.is_connected() and voice_channel != bot_voice.channel:
+            await ctx.send("You must be in the same voice channel as the bot to queue songs.")
+            return
         guild_id = str(ctx.guild.id)
         gs = self.bot.get_guild_state(ctx.guild.id)
 
@@ -1616,6 +1627,12 @@ class MusicCog(commands.Cog):
 
         if not ctx.author.voice or not ctx.author.voice.channel:
             await ctx.send("You need to be in a voice channel.")
+            return
+
+        # Block queueing from outside the bot's current voice channel (mirrors button controls)
+        bot_voice = ctx.guild.voice_client
+        if bot_voice and bot_voice.is_connected() and ctx.author.voice.channel != bot_voice.channel:
+            await ctx.send("You must be in the same voice channel as the bot to start a station.")
             return
 
         await ctx.defer()
