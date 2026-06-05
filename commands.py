@@ -277,6 +277,16 @@ def _build_radio_embed(
     return embed
 
 
+async def _picker_author_check(interaction: discord.Interaction, ctx: commands.Context) -> bool:
+    """Allow only the user who opened a picker to interact with it."""
+    if interaction.user.id != ctx.author.id:
+        await interaction.response.send_message(
+            "Only the person who ran the command can use this picker.", ephemeral=True
+        )
+        return False
+    return True
+
+
 class RadioDiscoveryView(discord.ui.View):
     """Region → country → genre cascade picker for /radio with no search term.
 
@@ -294,6 +304,9 @@ class RadioDiscoveryView(discord.ui.View):
         self.country = ""   # ISO-3166-1 alpha-2, or "" for no filter
         self.genre = ""     # tag string, or "" for no filter
         self._build_items()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await _picker_author_check(interaction, self.ctx)
 
     def _country_options(self) -> list[discord.SelectOption]:
         entries = _RADIO_REGION_COUNTRIES.get(self.region, [("Any country", "any_country")])
@@ -433,6 +446,9 @@ class RadioPickerView(discord.ui.View):
         self.selected = False
         self._total_pages = max(1, (len(self.stations) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
         self._rebuild_items()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await _picker_author_check(interaction, self.ctx)
 
     def _page_stations(self) -> list[dict]:
         start = self.page * self.PAGE_SIZE
@@ -631,6 +647,9 @@ class SearchPickerView(discord.ui.View):
         )
         select.callback = self._on_select
         self.add_item(select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await _picker_author_check(interaction, self.ctx)
 
     async def _on_select(self, interaction: discord.Interaction):
         self.selected = True
