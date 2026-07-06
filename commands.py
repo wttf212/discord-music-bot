@@ -662,7 +662,14 @@ class SearchPickerView(discord.ui.View):
             child.disabled = True
         await interaction.response.edit_message(content="Loading…", embed=None, view=self)
         selected_url = interaction.data["values"][0]
-        await _play_selected(self.bot, self.ctx, selected_url, self.status_msg)
+        # Carry the full result dict so playback reuses the flat-search metadata
+        # (title/thumbnail) instead of re-fetching it with a full /player call.
+        selected = next((r for r in self.results if r.get("url") == selected_url), None)
+        await _play_selected(
+            self.bot, self.ctx,
+            selected or {"url": selected_url, "title": selected_url},
+            self.status_msg,
+        )
 
     async def on_timeout(self):
         for child in self.children:
@@ -677,21 +684,60 @@ class SearchPickerView(discord.ui.View):
             pass
 
 
-async def _play_selected(bot, ctx: commands.Context, url: str,
+async def _play_selected(bot, ctx: commands.Context, result: dict,
                          picker_msg: discord.Message):
-    """Continue the play flow with a pre-resolved YouTube URL chosen from the picker.
+    """Continue the play flow with a chosen search result dict {url, title, thumbnail, ...}.
 
-    Mirrors the single-track flow in MusicCog.play() (lines 624-712) but uses
-    picker_msg for status instead of a fresh ctx.send().
+    Mirrors the single-track flow in MusicCog.play() but uses picker_msg for status.
+    Trusts the flat-search metadata for display (so a queue-add skips the redundant
+    background full resolve) and overlaps the URL resolve with the voice connect.
     """
     guild_id = str(ctx.guild.id)
     gs = bot.get_guild_state(ctx.guild.id)
     voice_channel = ctx.author.voice.channel
     user_id = str(ctx.author.id)
     channel_id = ctx.channel.id
+    loop = asyncio.get_event_loop()
 
-    # --- Join voice if not already connected ---
+    url = result["url"]
+    r_title = result.get("title") or url
+    r_thumb = result.get("thumbnail", "")
+
     voice_client = ctx.guild.voice_client
+    voice_actually_playing = (
+        gs.player.is_playing
+        and voice_client
+        and voice_client.is_playing()
+    )
+
+    if voice_actually_playing:
+        # Queue-add path: trust flat-search metadata (url set → no background resolve).
+        track = Track(query=url, title=r_title, requested_by=user_id, thumbnail=r_thumb, url=url)
+        gs.queue.add(track)
+        _schedule_prefetch(bot, ctx.guild.id)
+        await picker_msg.edit(content="Added to queue.", embed=None, view=None)
+        current = gs.queue.current
+        if current:
+            requester_name = f"<@{current.requested_by}>" if getattr(current, "requested_by", None) else ""
+            view = build_player_view(
+                bot, current.title,
+                thumbnail=current.thumbnail,
+                url=current.url,
+                requester_name=requester_name,
+                queue_tracks=gs.queue.preview_fair_order(),
+                guild_id=ctx.guild.id,
+            )
+            await update_np_embed(bot, channel_id, view)
+        return
+
+    # Start-playback path: overlap the URL resolve with the voice connect.
+    yt_cfg = bot.config.get("youtube", {})
+    resolve_fut = loop.run_in_executor(
+        None, get_audio_url_with_retry, url,
+        yt_cfg.get("client", "web"), bot.config.get("debug", False),
+        yt_cfg.get("cookies_file") or None,
+    )
+
     if not voice_client or not voice_client.is_connected():
         if voice_client:  # stale client — force-disconnect before reconnecting
             try:
@@ -710,66 +756,50 @@ async def _play_selected(bot, ctx: commands.Context, url: str,
             if saved_bass != 0 or saved_treble != 0:
                 await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
         except Exception as e:
+            _discard_future(resolve_fut)
             await picker_msg.edit(
                 content=f"Failed to join voice channel: {e}",
                 embed=None, view=None,
             )
             return
 
-    # --- Determine playback state ---
-    voice_actually_playing = (
-        gs.player.is_playing
-        and ctx.guild.voice_client
-        and ctx.guild.voice_client.is_playing()
-    )
+    try:
+        info = await resolve_fut
+    except Exception as e:
+        await picker_msg.edit(
+            content=f"Error playing track: {_friendly_ytdlp_error(e)}",
+            embed=None, view=None,
+        )
+        return
 
-    if voice_actually_playing:
-        # Queue-add path: bot already playing something
-        track = Track(query=url, title=url, requested_by=user_id)
-        gs.queue.add(track)
-        asyncio.create_task(_resolve_track_info(bot, channel_id, track))
-        await picker_msg.edit(content="Added to queue.", embed=None, view=None)
-        current = gs.queue.current
-        if current:
-            requester_name = f"<@{current.requested_by}>" if getattr(current, "requested_by", None) else ""
-            view = build_player_view(
-                bot, current.title,
-                thumbnail=current.thumbnail,
-                url=current.url,
-                requester_name=requester_name,
-                queue_tracks=gs.queue.preview_fair_order(),
-                guild_id=ctx.guild.id,
-            )
-            await update_np_embed(bot, channel_id, view)
-    else:
-        # Start-playback path: nothing playing yet
-        try:
-            info = await gs.player.play(url)
-            title = info["title"]
-            track_thumbnail = info.get("thumbnail", "")
-            track_url = info.get("webpage_url", url)
+    resolved_at = time.time()
+    try:
+        played = await gs.player.play(url, info, resolved_at)
+        title = played["title"]
+        track_thumbnail = played.get("thumbnail", "")
+        track_url = played.get("webpage_url", url)
 
-            gs.queue.current = Track(
-                query=url, title=title, requested_by=user_id,
-                thumbnail=track_thumbnail, url=track_url,
-            )
+        gs.queue.current = Track(
+            query=url, title=title, requested_by=user_id,
+            thumbnail=track_thumbnail, url=track_url,
+        )
 
-            view = build_player_view(
-                bot, title,
-                thumbnail=track_thumbnail,
-                url=track_url,
-                requester_name=f"<@{user_id}>",
-                queue_tracks=gs.queue.preview_fair_order(),
-                guild_id=ctx.guild.id,
-            )
-            await picker_msg.delete()
-            await send_new_np(bot, channel_id, view)
-            _start_auto_next(bot, channel_id, ctx.guild.id)
-        except Exception as e:
-            await picker_msg.edit(
-                content=f"Error playing track: {e}",
-                embed=None, view=None,
-            )
+        view = build_player_view(
+            bot, title,
+            thumbnail=track_thumbnail,
+            url=track_url,
+            requester_name=f"<@{user_id}>",
+            queue_tracks=gs.queue.preview_fair_order(),
+            guild_id=ctx.guild.id,
+        )
+        await picker_msg.delete()
+        await send_new_np(bot, channel_id, view)
+        _start_auto_next(bot, channel_id, ctx.guild.id)
+    except Exception as e:
+        await picker_msg.edit(
+            content=f"Error playing track: {e}",
+            embed=None, view=None,
+        )
 
 
 class _ControlsRow(discord.ui.ActionRow):
@@ -1115,6 +1145,28 @@ def _get_requester_name(bot, user_id: str) -> str:
     return f"<@{user_id}>"
 
 
+async def _safe_delete(msg):
+    """Delete a message, ignoring errors (already gone / missing perms)."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+def _discard_future(fut):
+    """Retrieve and swallow a future's result/exception so a discarded in-flight
+    resolve (e.g. after a failed voice connect) doesn't log 'never retrieved'."""
+    def _swallow(f):
+        try:
+            f.result()
+        except Exception:
+            pass
+    try:
+        fut.add_done_callback(_swallow)
+    except Exception:
+        pass
+
+
 async def check_channel(ctx: commands.Context) -> bool:
     """Check if command is in the allowed channel. Deletes message and notifies if not."""
     guild_id = str(ctx.guild.id) if ctx.guild else None
@@ -1434,23 +1486,12 @@ class MusicCog(commands.Cog):
 
         query = _strip_ytsearch_prefix(query)
 
-        _search_status_msg = None
-        if _is_search_query(query):
-            # Plain text query — resolve to the top YouTube result automatically
+        # Acknowledge the slash interaction up front — voice-connect + resolve can
+        # exceed the 3s deadline. Plain-text queries no longer run a separate
+        # pre-search: get_audio_url resolves `ytsearch:<text>` in a single pass
+        # (one YoutubeDL session instead of a flat ytsearch5 hop + a full resolve).
+        if ctx.interaction:
             await ctx.defer()
-            _search_status_msg = await ctx.send("Finding best match…")
-            try:
-                results = await asyncio.get_event_loop().run_in_executor(
-                    None, _search_youtube, query
-                )
-            except Exception as e:
-                await _search_status_msg.edit(content=f"Search error: {e}")
-                return
-            if not results:
-                await _search_status_msg.edit(content=f"No results found for \"{query[:50]}\".")
-                return
-            query = results[0]["url"]
-            await _search_status_msg.edit(content="Loading…")
 
         # ---------------------------------------------------------------
         # Playlist detection: play first track, offer to add the rest
@@ -1607,9 +1648,55 @@ class MusicCog(commands.Cog):
         # ---------------------------------------------------------------
         # Single track flow
         # ---------------------------------------------------------------
+        user_id = str(ctx.author.id)
+        channel_id = ctx.channel.id
+        loop = asyncio.get_event_loop()
 
-        # Join voice if not already connected
         voice_client = ctx.guild.voice_client
+        voice_actually_playing = (
+            gs.player.is_playing
+            and voice_client
+            and voice_client.is_playing()
+        )
+
+        if voice_actually_playing:
+            # Queue-add path: bot already playing something.
+            track = Track(query=query, title=query, requested_by=user_id)
+            gs.queue.add(track)
+
+            # Resolve title/thumbnail in the background (also caches the CDN URL for play).
+            asyncio.create_task(_resolve_track_info(self.bot, channel_id, track))
+
+            # Ack — also closes a deferred slash interaction (keeps the user's command in chat).
+            try:
+                await ctx.send("Added to queue.", delete_after=5)
+            except Exception:
+                pass
+
+            current = gs.queue.current
+            if current:
+                requester_name = f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else ""
+                view = build_player_view(
+                    self.bot,
+                    current.title,
+                    thumbnail=current.thumbnail,
+                    url=current.url,
+                    requester_name=requester_name,
+                    queue_tracks=gs.queue.preview_fair_order(),
+                    guild_id=ctx.guild.id,
+                )
+                await update_np_embed(self.bot, channel_id, view)
+            return
+
+        # Start-playback path: overlap the URL resolve with the voice connect
+        # (they are independent — connect needs no resolved URL, resolve needs no voice).
+        yt_cfg = self.bot.config.get("youtube", {})
+        resolve_fut = loop.run_in_executor(
+            None, get_audio_url_with_retry, query,
+            yt_cfg.get("client", "web"), self.bot.config.get("debug", False),
+            yt_cfg.get("cookies_file") or None,
+        )
+
         if not voice_client or not voice_client.is_connected():
             if voice_client:  # stale client — force-disconnect before reconnecting
                 try:
@@ -1630,74 +1717,41 @@ class MusicCog(commands.Cog):
                 if saved_bass != 0 or saved_treble != 0:
                     await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
             except Exception as e:
+                _discard_future(resolve_fut)  # let the in-flight resolve finish and drop it
                 await ctx.send(f"Failed to join voice channel: {e}")
                 return
 
-        user_id = str(ctx.author.id)
-        channel_id = ctx.channel.id
+        status_msg = await ctx.send("Resolving…")
+        try:
+            info = await resolve_fut
+        except Exception as e:
+            await status_msg.edit(content=f"Error playing track: {_friendly_ytdlp_error(e)}")
+            return
 
-        # Check if audio is actually playing (verify with voice client, not just the flag)
-        voice_actually_playing = (
-            gs.player.is_playing
-            and ctx.guild.voice_client
-            and ctx.guild.voice_client.is_playing()
-        )
+        resolved_at = time.time()
+        try:
+            played = await gs.player.play(query, info, resolved_at)
+            title = played["title"]
+            track_thumbnail = played.get("thumbnail", "")
+            track_url = played.get("webpage_url", "")
 
-        if voice_actually_playing:
-            track = Track(query=query, title=query, requested_by=user_id)
-            gs.queue.add(track)
+            # Store as current track so queue-add updates can reference it
+            gs.queue.current = Track(
+                query=query, title=title, requested_by=user_id,
+                thumbnail=track_thumbnail, url=track_url,
+            )
 
-            # Start background task to fetch actual title/thumbnail
-            asyncio.create_task(_resolve_track_info(self.bot, channel_id, track))
-
-            # Delete the bot's transient search status message (keep the user's command in chat)
-            if _search_status_msg:
-                try:
-                    await _search_status_msg.delete()
-                except Exception:
-                    pass
-
-            # Rebuild and update the existing NP embed with the new queue
-            current = gs.queue.current
-            if current:
-                requester_name = f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else ""
-                view = build_player_view(
-                    self.bot,
-                    current.title,
-                    thumbnail=current.thumbnail,
-                    url=current.url,
-                    requester_name=requester_name,
-                    queue_tracks=gs.queue.preview_fair_order(),
-                    guild_id=ctx.guild.id,
-                )
-                await update_np_embed(self.bot, channel_id, view)
-        else:
-            status_msg = _search_status_msg or await ctx.send("Resolving…")
-            try:
-                info = await gs.player.play(query)
-                title = info["title"]
-                track_thumbnail = info.get("thumbnail", "")
-                track_url = info.get("webpage_url", "")
-
-                # Store as current track so queue-add updates can reference it
-                gs.queue.current = Track(
-                    query=query, title=title, requested_by=user_id,
-                    thumbnail=track_thumbnail, url=track_url,
-                )
-
-                requester_name = f"<@{user_id}>"
-
-                view = build_player_view(self.bot, title,
-                                        thumbnail=track_thumbnail,
-                                        url=track_url,
-                                        requester_name=requester_name,
-                                        queue_tracks=gs.queue.preview_fair_order(),
-                                        guild_id=ctx.guild.id)
-                await status_msg.delete()
-                await send_new_np(self.bot, channel_id, view)
-                _start_auto_next(self.bot, channel_id, ctx.guild.id)
-            except Exception as e:
-                await status_msg.edit(content=f"Error playing track: {e}")
+            view = build_player_view(self.bot, title,
+                                    thumbnail=track_thumbnail,
+                                    url=track_url,
+                                    requester_name=f"<@{user_id}>",
+                                    queue_tracks=gs.queue.preview_fair_order(),
+                                    guild_id=ctx.guild.id)
+            asyncio.create_task(_safe_delete(status_msg))
+            await send_new_np(self.bot, channel_id, view)
+            _start_auto_next(self.bot, channel_id, ctx.guild.id)
+        except Exception as e:
+            await status_msg.edit(content=f"Error playing track: {e}")
 
     @commands.hybrid_command(name="radio", description="Browse or search internet radio stations")
     @app_commands.describe(query="Station name to search, or leave blank to browse by country/genre")
