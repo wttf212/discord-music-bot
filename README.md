@@ -10,6 +10,7 @@ A Discord music bot with YouTube, SoundCloud, and Spotify. (Use it at your own r
 - 🔁 Loop the current track or the whole queue (`!loop`)
 - 🧰 Queue tools — remove, move, skip-to, clear, and dedupe
 - 📩 Grab — DM yourself the currently playing track (`!grab`)
+- 🏎️ Next F1 race + local weather shown on the player card (per-server `!setlocation` / `!settimezone`)
 - 📻 Internet radio browser — region/country/genre discovery or name search across 30k+ stations
 - 📋 Playlist support — plays the first track immediately, load the rest with `!loadall`
 - 🔀 Queue with fair-play interleaving and shuffle
@@ -117,6 +118,8 @@ All commands work with the prefix (default `!`) and as slash commands (e.g. `/pl
 | `!eq treble <-10..10>` | Boost or cut treble (dB) |
 | `!eq preset <name>` | Apply a named preset (e.g. `bass`, `vocal`, `flat`) |
 | `!eq reset` | Reset equalizer to flat |
+| `!setlocation <city>` | Set the city for the weather shown on the player card *(admin)* |
+| `!settimezone <tz>` | Set the timezone for F1 race times, e.g. `Europe/Riga` *(admin)* |
 
 ### Admin *(bot admin required)*
 

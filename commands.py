@@ -16,12 +16,15 @@ from audio_player import (
 )
 from spotify import is_spotify_url, resolve_spotify, SpotifyError
 import weather
+import f1
 from guild_settings import (
     get_allowed_channel, set_allowed_channel,
     get_bitrate, set_bitrate,
     get_admins, add_admin, remove_admin,
     get_eq_bass, set_eq_bass, get_eq_treble, set_eq_treble,
     EQ_PRESETS, get_eq_preset_name,
+    get_weather_location, set_weather_location, get_timezone, set_timezone,
+    get_display_prefs, DEFAULT_WEATHER_LOCATION,
 )
 
 
@@ -1151,10 +1154,22 @@ class PlayerView(discord.ui.LayoutView):
         requester = _plain_names(bot, guild, self._requester_name)
         loop_suffix = "" if loop_mode == "off" else f" · Loop {loop_mode}"
         autoplay_suffix = " · Autoplay" if (gs and gs.autoplay) else ""
-        weather_suffix = f" · {_weather_cache['text']}" if _weather_cache["text"] else ""
         foot = ("-# " + (f"Track requested by {requester} · " if requester else "")
-                + f"{kbps}kbps · EQ {eq_label}{loop_suffix}{autoplay_suffix}{weather_suffix}")
+                + f"{kbps}kbps · EQ {eq_label}{loop_suffix}{autoplay_suffix}")
         c.add_item(discord.ui.TextDisplay(foot))
+
+        # Flourish line: current weather (guild location) + next F1 race (guild tz).
+        prefs = (get_display_prefs(str(guild_id)) if guild_id
+                 else {"location": dict(DEFAULT_WEATHER_LOCATION), "timezone": None})
+        info_bits = []
+        w = _weather_text_for(prefs["location"])
+        if w:
+            info_bits.append(w)
+        f1_txt = f1.format_race(_f1_cache.get("race"), prefs.get("timezone"))
+        if f1_txt:
+            info_bits.append(f1_txt)
+        if info_bits:
+            c.add_item(discord.ui.TextDisplay("-# " + " · ".join(info_bits)))
 
         self.add_item(c)
 
@@ -1234,32 +1249,64 @@ def _plain_names(bot, guild, text: str) -> str:
     return _MENTION_RE.sub(lambda m: _get_requester_name(bot, m.group(1), guild) or "someone", text)
 
 
-# --- Riga weather (footer flourish) -------------------------------------------
-# Cached with a TTL and refreshed off-loop; the card build only reads the cache,
-# so it never blocks the event loop or hits the network on every render.
-_weather_cache = {"text": "", "ts": 0.0}
-_weather_refreshing = False
-_WEATHER_TTL = 600.0  # 10 minutes
+# --- Weather + next-F1-race card flourishes -----------------------------------
+# Both are cached and refreshed off-loop; the card build only reads the caches,
+# so it never blocks the event loop or hits the network on every render. Weather
+# is keyed by rounded lat/lon (guilds sharing a location share the fetch); F1 is
+# global (same for everyone) and formatted per-guild timezone at render time.
+_weather_cache: dict = {}  # "lat,lon" -> {"text", "ts", "busy"}
+_WEATHER_TTL = 600.0       # 10 minutes
+_f1_cache = {"race": None, "ts": 0.0, "busy": False}
+_F1_TTL = 3600.0           # 1 hour (the schedule changes rarely)
 
 
-async def _refresh_weather_if_stale():
-    """Fetch Riga weather in the background if the cache is stale (no-op otherwise)."""
-    global _weather_refreshing
+def _loc_key(lat, lon) -> str:
+    return f"{round(float(lat), 2)},{round(float(lon), 2)}"
+
+
+def _weather_text_for(location: dict) -> str:
+    return _weather_cache.get(_loc_key(location["lat"], location["lon"]), {}).get("text", "")
+
+
+async def _refresh_weather_for(location: dict):
+    """Fetch weather for one location if its cache is stale (no-op otherwise)."""
+    key = _loc_key(location["lat"], location["lon"])
+    entry = _weather_cache.setdefault(key, {"text": "", "ts": 0.0, "busy": False})
     now = time.monotonic()
-    if _weather_refreshing:
+    if entry["busy"] or (entry["ts"] and now - entry["ts"] < _WEATHER_TTL):
         return
-    if _weather_cache["ts"] and (now - _weather_cache["ts"] < _WEATHER_TTL):
-        return
-    _weather_refreshing = True
-    _weather_cache["ts"] = now  # throttle attempts (success or failure) to the TTL
+    entry["busy"] = True
+    entry["ts"] = now  # throttle attempts (success or failure) to the TTL
     try:
-        text = await asyncio.get_event_loop().run_in_executor(None, weather.get_riga_weather)
+        text = await asyncio.get_event_loop().run_in_executor(
+            None, weather.get_weather, location["lat"], location["lon"], location["name"]
+        )
         if text:
-            _weather_cache["text"] = text
+            entry["text"] = text
     except Exception:
         pass
     finally:
-        _weather_refreshing = False
+        entry["busy"] = False
+
+
+async def _refresh_weather_if_stale(bot, guild_id):
+    """Refresh the weather for a guild's configured location."""
+    await _refresh_weather_for(get_display_prefs(str(guild_id))["location"])
+
+
+async def _refresh_f1_if_stale():
+    """Fetch the next F1 race in the background if the cache is stale."""
+    now = time.monotonic()
+    if _f1_cache["busy"] or (_f1_cache["ts"] and now - _f1_cache["ts"] < _F1_TTL):
+        return
+    _f1_cache["busy"] = True
+    _f1_cache["ts"] = now
+    try:
+        _f1_cache["race"] = await asyncio.get_event_loop().run_in_executor(None, f1.get_next_race)
+    except Exception:
+        pass
+    finally:
+        _f1_cache["busy"] = False
 
 
 def _build_grab_embed(gs, track) -> discord.Embed:
@@ -1530,8 +1577,9 @@ async def send_new_np(bot, channel_id: int, view: "PlayerView"):
     guild_id = channel.guild.id
     gs = bot.get_guild_state(guild_id)
 
-    # Keep the footer's Riga weather reasonably fresh (background, no-op if recent).
-    asyncio.create_task(_refresh_weather_if_stale())
+    # Keep the weather + F1 flourishes reasonably fresh (background, no-op if recent).
+    asyncio.create_task(_refresh_weather_if_stale(bot, guild_id))
+    asyncio.create_task(_refresh_f1_if_stale())
 
     # Reset votes whenever a new NP message is sent / track changes
     gs.prev_votes.clear()
@@ -2287,6 +2335,53 @@ class MusicCog(commands.Cog):
                 ephemeral=True,
             )
 
+    @commands.hybrid_command(name="setlocation", description="Set the city shown for weather on the player card")
+    @app_commands.describe(city="City name, e.g. 'Riga' or 'London'")
+    async def setlocation(self, ctx: commands.Context, *, city: str = None):
+        if not await check_channel(ctx):
+            return
+        if not ctx.guild:
+            return
+        if not await self._check_admin(ctx):
+            return
+        gid = str(ctx.guild.id)
+        if not city:
+            cur = get_weather_location(gid)
+            await ctx.send(f"Weather location: **{cur['name']}**. Usage: `{self.bot.command_prefix}setlocation <city>`")
+            return
+        geo = await asyncio.get_event_loop().run_in_executor(None, weather.geocode, city)
+        if not geo:
+            await ctx.send(f"Couldn't find '{city[:60]}'. Try another spelling or add a country, e.g. `Riga, LV`.")
+            return
+        name, lat, lon = geo
+        set_weather_location(gid, name, lat, lon)
+        await _refresh_weather_for({"name": name, "lat": lat, "lon": lon})
+        await ctx.send(f"Weather location set to **{name}**.")
+        await self._refresh_np_card(ctx)
+
+    @commands.hybrid_command(name="settimezone", description="Set the timezone for F1 race times (IANA name)")
+    @app_commands.describe(tz="IANA timezone, e.g. 'Europe/Riga' or 'America/New_York'")
+    async def settimezone(self, ctx: commands.Context, tz: str = None):
+        if not await check_channel(ctx):
+            return
+        if not ctx.guild:
+            return
+        if not await self._check_admin(ctx):
+            return
+        gid = str(ctx.guild.id)
+        if not tz:
+            await ctx.send(f"Timezone: **{get_timezone(gid)}**. Usage: `{self.bot.command_prefix}settimezone <IANA tz>` (e.g. `Europe/Riga`)")
+            return
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(tz)
+        except Exception:
+            await ctx.send(f"Unknown timezone '{tz[:60]}'. Use an IANA name like `Europe/Riga` or `America/New_York`.")
+            return
+        set_timezone(gid, tz)
+        await ctx.send(f"Timezone set to **{tz}** — F1 race times will show in this zone.")
+        await self._refresh_np_card(ctx)
+
     @commands.hybrid_command(name="loop", description="Set repeat mode: off, track, or queue")
     @app_commands.describe(mode="off, track (repeat current), or queue (repeat all) — omit to cycle")
     async def loop(self, ctx: commands.Context, mode: str = None):
@@ -2747,6 +2842,8 @@ class MusicCog(commands.Cog):
             f"`{p}radio <name>` — Search 30k+ radio stations by name\n"
             f"`{p}bitrate [kbps]` — Show or set audio encoding bitrate\n"
             f"`{p}eq [bass|treble <N> | preset | reset]` — Per-guild equalizer, -10..+10 dB *(admin only)*\n"
+            f"`{p}setlocation <city>` — Set the city for the weather line on the player *(admin only)*\n"
+            f"`{p}settimezone <tz>` — Set the timezone for F1 race times, e.g. Europe/Riga *(admin only)*\n"
             f"`{p}fairplay on|off` — Toggle user interleaving mode for queues *(admin only)*\n"
             f"`{p}fairness <0-100>` — Set the percentage of users strictly needed to skip/stop songs *(admin only)*\n"
             f"`{p}addadmin @user` — Add a user as a bot admin for this server *(owner only)*\n"
@@ -2856,4 +2953,6 @@ async def _auto_next(bot, channel_id, guild_id, generation):
 
 async def setup(bot):
     await bot.add_cog(MusicCog(bot))
-    asyncio.create_task(_refresh_weather_if_stale())  # warm the Riga weather cache
+    # Warm the flourish caches so the first card shows them.
+    asyncio.create_task(_refresh_weather_for(dict(DEFAULT_WEATHER_LOCATION)))
+    asyncio.create_task(_refresh_f1_if_stale())
