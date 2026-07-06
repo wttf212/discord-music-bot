@@ -528,6 +528,39 @@ def _start_ytdlp_stream(
     return subprocess.Popen(cmd, **kwargs)
 
 
+def _youtube_video_id(url: str) -> str | None:
+    """Extract the video id from a youtube.com/watch?v= or youtu.be/ URL."""
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    host = parsed.netloc or ""
+    if "youtu.be" in host:
+        vid = parsed.path.lstrip("/").split("/")[0]
+        return vid or None
+    if "youtube.com" in host:
+        return parse_qs(parsed.query).get("v", [None])[0]
+    return None
+
+
+def get_related_tracks(seed_url: str, client: str, limit: int = 25) -> list[dict]:
+    """Return related YouTube tracks via the seed video's Mix (RD) playlist, for
+    autoplay/endless mode. Returns [{"url", "title"}, ...] excluding the seed.
+    Empty list for non-YouTube seeds (autoplay only supports YouTube)."""
+    vid = _youtube_video_id(seed_url or "")
+    if not vid:
+        return []
+    mix_url = f"https://www.youtube.com/watch?v={vid}&list=RD{vid}"
+    seed_watch = f"https://www.youtube.com/watch?v={vid}"
+    try:
+        info = extract_playlist_info(mix_url, client, limit=limit)
+    except Exception:
+        return []
+    return [t for t in info.get("tracks", []) if t.get("url") and t["url"] != seed_watch]
+
+
 def _reap_process(proc):
     """Wait on an already-terminate()'d subprocess, killing it if it overruns.
 

@@ -12,7 +12,7 @@ from discord import app_commands
 from track_queue import Track
 from audio_player import (
     is_playlist_url, extract_playlist_info, get_audio_url_with_retry,
-    is_stream_info_fresh,
+    is_stream_info_fresh, get_related_tracks,
 )
 from guild_settings import (
     get_allowed_channel, set_allowed_channel,
@@ -1132,7 +1132,8 @@ class PlayerView(discord.ui.LayoutView):
         eq_label = get_eq_preset_name(eq_bass, eq_treble)
         requester = _plain_names(bot, guild, self._requester_name)
         loop_suffix = "" if loop_mode == "off" else f" · Loop {loop_mode}"
-        foot = "-# " + (f"Track requested by {requester} · " if requester else "") + f"{kbps}kbps · EQ {eq_label}{loop_suffix}"
+        autoplay_suffix = " · Autoplay" if (gs and gs.autoplay) else ""
+        foot = "-# " + (f"Track requested by {requester} · " if requester else "") + f"{kbps}kbps · EQ {eq_label}{loop_suffix}{autoplay_suffix}"
         c.add_item(discord.ui.TextDisplay(foot))
 
         self.add_item(c)
@@ -1355,6 +1356,64 @@ def _schedule_prefetch(bot, guild_id):
     if gs.prefetch_task and not gs.prefetch_task.done():
         return  # one already running
     gs.prefetch_task = asyncio.create_task(_prefetch_next_track(bot, guild_id))
+
+
+# --- Autoplay / endless mode --------------------------------------------------
+#
+# When autoplay is on and the queue would otherwise drain, keep the music going
+# with tracks from the last song's YouTube Mix. Anti-ban: the Mix is fetched once
+# (flat metadata) and cached in gs.autoplay_pool, so many autoplay tracks come
+# from a single call; each track's stream URL is then resolved lazily by the same
+# prefetch path. autoplay_history avoids repeats.
+async def _autoplay_pick(bot, guild_id, seed):
+    """Pick one related track for autoplay, refilling the Mix pool if needed.
+    Returns a Track (attributed to the seed's requester) or None."""
+    gs = bot.get_guild_state(guild_id)
+    try:
+        if not gs.autoplay_pool:
+            yt_client = bot.config.get("youtube", {}).get("client", "web")
+            seed_url = seed.url or seed.query
+            related = await asyncio.get_event_loop().run_in_executor(
+                None, get_related_tracks, seed_url, yt_client, 25
+            )
+            gs.autoplay_pool = [t for t in related if t.get("url") and t["url"] not in gs.autoplay_history]
+        while gs.autoplay_pool:
+            cand = gs.autoplay_pool.pop(0)
+            if cand["url"] in gs.autoplay_history:
+                continue
+            gs.autoplay_history.add(cand["url"])
+            if len(gs.autoplay_history) > 200:  # bound memory; keep the recent tail
+                gs.autoplay_history = set(list(gs.autoplay_history)[-100:])
+            return Track(query=cand["url"], title=cand.get("title", "Unknown"),
+                         requested_by=seed.requested_by, url=cand["url"])
+    except Exception as e:
+        print(f"[commands] Autoplay pick failed: {e}")
+    return None
+
+
+async def _autoplay_topup(bot, guild_id):
+    """If autoplay is on and the queue is empty, proactively queue one related
+    track (while the current one still plays) so the transition stays seamless."""
+    gs = bot.get_guild_state(guild_id)
+    if not gs.autoplay or not gs.queue.is_empty():
+        return
+    seed = gs.queue.current
+    if not seed or seed.is_radio:
+        return
+    track = await _autoplay_pick(bot, guild_id, seed)
+    if track and gs.autoplay and gs.queue.is_empty():
+        gs.queue.add(track)
+        _schedule_prefetch(bot, guild_id)
+
+
+def _schedule_autoplay_topup(bot, guild_id):
+    """Single-in-flight proactive autoplay top-up (no-op when autoplay is off)."""
+    gs = bot.get_guild_state(guild_id)
+    if not gs.autoplay:
+        return
+    if gs.autoplay_task and not gs.autoplay_task.done():
+        return
+    gs.autoplay_task = asyncio.create_task(_autoplay_topup(bot, guild_id))
 
 
 async def _resolve_track_info(bot, channel_id: int, track: Track):
@@ -2172,6 +2231,33 @@ class MusicCog(commands.Cog):
         await ctx.send(f"Removed **{n}** duplicate(s) from the queue." if n else "No duplicates in the queue.")
         await self._refresh_np_card(ctx)
 
+    @commands.hybrid_command(name="autoplay", description="Keep playing related tracks when the queue ends")
+    @app_commands.describe(mode="on or off — omit to toggle")
+    async def autoplay(self, ctx: commands.Context, mode: str = None):
+        if not await check_channel(ctx):
+            return
+        if not ctx.guild:
+            return
+        gs = self.bot.get_guild_state(ctx.guild.id)
+        if mode is None:
+            gs.autoplay = not gs.autoplay
+        else:
+            m = mode.strip().lower()
+            if m in ("on", "enable", "true", "yes", "1"):
+                gs.autoplay = True
+            elif m in ("off", "disable", "false", "no", "0"):
+                gs.autoplay = False
+            else:
+                await ctx.send(f"Usage: `{self.bot.command_prefix}autoplay [on|off]`")
+                return
+        if gs.autoplay:
+            await ctx.send("Autoplay **on** — I'll keep the music going with related tracks when the queue runs out.")
+            _schedule_autoplay_topup(self.bot, ctx.guild.id)  # top up now if idle-queued
+        else:
+            gs.autoplay_pool = []  # drop the cached Mix so re-enabling reseeds fresh
+            await ctx.send("Autoplay **off**.")
+        await self._refresh_np_card(ctx)
+
     @commands.command(name="loadall")
     async def loadall(self, ctx: commands.Context):
         """Load remaining playlist tracks from the most recent pending playlist."""
@@ -2470,6 +2556,7 @@ class MusicCog(commands.Cog):
             f"`{p}skipto <pos>` — Jump straight to a queued track\n"
             f"`{p}clear` — Clear the upcoming queue (keeps the current track)\n"
             f"`{p}dedupe` — Remove duplicate tracks from the queue\n"
+            f"`{p}autoplay [on|off]` — Keep playing related tracks when the queue ends\n"
             f"`{p}loadall` — Load all remaining tracks from the last pending playlist\n"
             f"`{p}radio` — Browse internet radio by region/country/genre\n"
             f"`{p}radio <name>` — Search 30k+ radio stations by name\n"
@@ -2492,8 +2579,10 @@ def _start_auto_next(bot, channel_id, guild_id):
     gen = gs.auto_next_gen + 1
     gs.auto_next_gen = gen
     gs.auto_next_task = asyncio.create_task(_auto_next(bot, channel_id, guild_id, gen))
-    # Current track just (re)started — prefetch the predicted next track's CDN URL.
+    # Current track just (re)started — prefetch the predicted next track's CDN URL,
+    # and (if autoplay is on and nothing is queued) proactively queue a related one.
     _schedule_prefetch(bot, guild_id)
+    _schedule_autoplay_topup(bot, guild_id)
 
 
 async def _auto_next(bot, channel_id, guild_id, generation):
@@ -2512,11 +2601,20 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 return
             if gs.player.is_playing:
                 break  # something else started playing
+            prev_current = gs.queue.current  # track that just finished (autoplay seed)
             next_track = gs.queue.next()
             if not next_track:
-                # Queue drained — update embed to stopped state and strip buttons
-                await update_np_stopped(bot, channel_id)
-                break
+                # Autoplay: keep the music going with a related track before giving up
+                # (fallback if the proactive top-up didn't fill the queue in time).
+                if gs.autoplay and prev_current and not prev_current.is_radio:
+                    fill = await _autoplay_pick(bot, guild_id, prev_current)
+                    if fill:
+                        gs.queue.add(fill)
+                        next_track = gs.queue.next()
+                if not next_track:
+                    # Queue drained — update embed to stopped state and strip buttons
+                    await update_np_stopped(bot, channel_id)
+                    break
             try:
                 info = await gs.player.play(
                     next_track.query, next_track.resolved_info, next_track.resolved_at
@@ -2533,8 +2631,10 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                                         queue_tracks=gs.queue.preview_fair_order(),
                                         guild_id=guild_id)
                 await send_new_np(bot, channel_id, view)
-                # Prefetch the following track while this one plays.
+                # Prefetch the following track while this one plays; if autoplay is on
+                # and nothing is queued, proactively queue a related track too.
                 _schedule_prefetch(bot, guild_id)
+                _schedule_autoplay_topup(bot, guild_id)
             except Exception as e:
                 consecutive_errors += 1
                 channel = bot.get_channel(channel_id)
