@@ -914,7 +914,8 @@ class _ControlsRow(discord.ui.ActionRow):
             lines.append(f"**Now playing:** {gs.player.current_track_title}")
         if tracks:
             for i, t in enumerate(tracks, 1):
-                req_tag = f" — <@{t.requested_by}>" if t.requested_by else ""
+                req_name = _get_requester_name(self.view.bot, t.requested_by, interaction.guild) if t.requested_by else ""
+                req_tag = f" — {req_name}" if req_name else ""
                 lines.append(f"`{i}.` {t.title}{req_tag}")
         else:
             lines.append("*Queue is empty.*")
@@ -1010,6 +1011,7 @@ class PlayerView(discord.ui.LayoutView):
         paused = self._paused
 
         gs = bot.get_guild_state(guild_id) if guild_id else None
+        guild = bot.get_guild(guild_id) if guild_id else None
         kbps = gs.player.get_bitrate_for_guild(guild_id) // 1000 if gs else bot.config.get("audio", {}).get("bitrate", 128)
 
         accent = NP_EMBED_COLOR if not finished else 0x95a5a6
@@ -1051,7 +1053,8 @@ class PlayerView(discord.ui.LayoutView):
         if not finished and self._queue_tracks:
             lines = []
             for i, t in enumerate(self._queue_tracks[:5], 1):
-                req_tag = f" — *<@{t.requested_by}>*" if t.requested_by else ""
+                req_name = _get_requester_name(bot, t.requested_by, guild) if t.requested_by else ""
+                req_tag = f" — *{req_name}*" if req_name else ""
                 if t.url:
                     lines.append(f"`{i}.` [{t.title}]({t.url}){req_tag}")
                 else:
@@ -1084,13 +1087,15 @@ class PlayerView(discord.ui.LayoutView):
             if has_pending:
                 c.add_item(_LoadPlaylistRow())
 
-        # Footer: requester mention (renders as a pill) + audio/EQ summary, small text.
+        # Footer: requester name (plain — never a mention, so card refreshes don't
+        # ping) + audio/EQ summary, small text.
         if gs and guild_id is not None:
             eq_bass, eq_treble = gs.player.get_eq_for_guild(guild_id)
         else:
             eq_bass, eq_treble = (0, 0)
         eq_label = get_eq_preset_name(eq_bass, eq_treble)
-        foot = "-# " + (f"Track requested by {self._requester_name} · " if self._requester_name else "") + f"{kbps}kbps · EQ {eq_label}"
+        requester = _plain_names(bot, guild, self._requester_name)
+        foot = "-# " + (f"Track requested by {requester} · " if requester else "") + f"{kbps}kbps · EQ {eq_label}"
         c.add_item(discord.ui.TextDisplay(foot))
 
         self.add_item(c)
@@ -1138,11 +1143,37 @@ def build_player_view(bot, title: str, extra_desc: str = "",
     )
 
 
-def _get_requester_name(bot, user_id: str) -> str:
-    """Resolve a user ID to their mention."""
+_MENTION_RE = re.compile(r"<@!?(\d+)>")
+
+
+def _get_requester_name(bot, user_id, guild=None) -> str:
+    """Resolve a user ID to a plain display name — never a mention.
+
+    Rendering <@id> in the persistent Now-Playing card pinged the requester every
+    time the card refreshed (and every queued user in the Up-Next list). Plain
+    names show who requested a track without the notification spam.
+    """
     if not user_id:
         return ""
-    return f"<@{user_id}>"
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return ""
+    if guild is not None:
+        member = guild.get_member(uid)
+        if member:
+            return member.display_name
+    user = bot.get_user(uid)
+    if user:
+        return user.display_name
+    return "someone"
+
+
+def _plain_names(bot, guild, text: str) -> str:
+    """Replace any <@id> mentions in a string with plain, non-pinging display names."""
+    if not text or "<@" not in text:
+        return text
+    return _MENTION_RE.sub(lambda m: _get_requester_name(bot, m.group(1), guild) or "someone", text)
 
 
 async def _safe_delete(msg):
@@ -1939,7 +1970,9 @@ class MusicCog(commands.Cog):
             for i, t in enumerate(tracks, 1):
                 req_tag = ""
                 if t.requested_by:
-                    req_tag = f" — *<@{t.requested_by}>*"
+                    req_name = _get_requester_name(self.bot, t.requested_by, ctx.guild)
+                    if req_name:
+                        req_tag = f" — *{req_name}*"
                 lines.append(f"{i}. {t.title}{req_tag}")
             msg = "\n".join(lines)
         await ctx.send(msg)
