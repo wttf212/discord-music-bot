@@ -214,6 +214,64 @@ class TestRetryWithBackoff(unittest.TestCase):
         self.assertGreaterEqual(sleeps[1], 7.5)
         self.assertLessEqual(sleeps[1], 12.5)
 
+    def test_connection_error_uses_fast_tier(self):
+        """A transient connection error retries on the fast tier, not the 5s rate-limit tier."""
+        sleeps = []
+
+        def fn(*a, **k):
+            raise ConnectionError("Connection reset by peer")
+
+        with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
+            with self.assertRaises(ConnectionError):
+                _retry_with_backoff(fn, "q", "c", False, None,
+                                    max_attempts=2, base_delay=5.0, fast_delay=1.5, jitter=0.0)
+
+        # fast_delay * 2^0 = 1.5 (well under the 5s rate-limit base)
+        self.assertEqual(len(sleeps), 1)
+        self.assertAlmostEqual(sleeps[0], 1.5, places=5)
+
+    def test_timed_out_message_uses_fast_tier(self):
+        """A 'timed out' message is a transient connection error → fast tier."""
+        sleeps = []
+
+        def fn(*a, **k):
+            raise DownloadError("ERROR: [youtube] abc: Read timed out")
+
+        with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
+            with self.assertRaises(DownloadError):
+                _retry_with_backoff(fn, "q", "c", False, None,
+                                    max_attempts=2, base_delay=5.0, fast_delay=1.5, jitter=0.0)
+
+        self.assertAlmostEqual(sleeps[0], 1.5, places=5)
+
+    def test_429_stays_on_slow_tier(self):
+        """Rate-limit (429) errors keep the conservative 5s base delay (anti-ban)."""
+        sleeps = []
+
+        def fn(*a, **k):
+            raise DownloadError("ERROR: HTTP Error 429: Too Many Requests")
+
+        with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
+            with self.assertRaises(DownloadError):
+                _retry_with_backoff(fn, "q", "c", False, None,
+                                    max_attempts=2, base_delay=5.0, fast_delay=1.5, jitter=0.0)
+
+        self.assertAlmostEqual(sleeps[0], 5.0, places=5)
+
+    def test_ambiguous_error_stays_on_slow_tier(self):
+        """Unrecognised errors could be soft-blocks — keep them on the slow tier."""
+        sleeps = []
+
+        def fn(*a, **k):
+            raise DownloadError("some unfamiliar error text")
+
+        with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
+            with self.assertRaises(DownloadError):
+                _retry_with_backoff(fn, "q", "c", False, None,
+                                    max_attempts=2, base_delay=5.0, fast_delay=1.5, jitter=0.0)
+
+        self.assertAlmostEqual(sleeps[0], 5.0, places=5)
+
     def test_non_retryable_raises_immediately_no_sleep(self):
         calls = []
         sleeps = []
