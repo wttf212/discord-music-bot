@@ -1497,152 +1497,159 @@ class MusicCog(commands.Cog):
         # Playlist detection: play first track, offer to add the rest
         # ---------------------------------------------------------------
         if is_playlist_url(query):
-            status_msg = await ctx.send("Fetching playlist info…")
-            try:
-                yt_client = self.bot.config.get("youtube", {}).get("client", "web")
-                playlist_info = await asyncio.get_event_loop().run_in_executor(
-                    None, extract_playlist_info, query, yt_client
-                )
-            except Exception as e:
-                await status_msg.edit(content=f"Error fetching playlist: {e}")
-                return
-
-            tracks = playlist_info["tracks"]
-            if not tracks:
-                await status_msg.edit(content="No tracks found in this playlist.")
-                return
-
-            playlist_title = playlist_info["title"]
-            first_track_info = tracks[0]
-            remaining_tracks = tracks[1:]
-
-            # Check if audio is actually playing in this guild
-            voice_actually_playing = (
-                gs.player.is_playing
-                and ctx.guild.voice_client
-                and ctx.guild.voice_client.is_playing()
-            )
-
+            loop = asyncio.get_event_loop()
+            yt_client = self.bot.config.get("youtube", {}).get("client", "web")
             channel_id = ctx.channel.id
             user_id = str(ctx.author.id)
+            voice_client = ctx.guild.voice_client
+            voice_actually_playing = (
+                gs.player.is_playing and voice_client and voice_client.is_playing()
+            )
+
+            def _pending_and_expire(remaining, playlist_title, current_title):
+                """Store the pending-playlist offer and schedule its 120s expiry."""
+                count = len(remaining)
+                self.bot.pending_playlists[str(channel_id)] = {
+                    "query": query, "user_id": user_id, "guild_id": guild_id,
+                    "channel_id": channel_id, "tracks": remaining,
+                    "playlist_title": playlist_title,
+                }
+
+                async def _expire_playlist(ch_id: int):
+                    await asyncio.sleep(120)
+                    if self.bot.pending_playlists.pop(str(ch_id), None):
+                        try:
+                            expired_extra = (
+                                f"**{playlist_title}** had **{count}** more tracks.\n"
+                                f"~~Click Load playlist~~ *(expired)*"
+                            )
+                            expired_view = build_player_view(self.bot, current_title, expired_extra, guild_id=ctx.guild.id)
+                            await update_np_embed(self.bot, ch_id, expired_view)
+                        except Exception:
+                            pass
+
+                asyncio.create_task(_expire_playlist(channel_id))
 
             if voice_actually_playing:
-                # Add the first track to the queue silently
-                track = Track(query=first_track_info["url"], title=first_track_info["title"], requested_by=user_id, url=first_track_info["url"])
+                # Already playing — no rush to start track 1; enumerate fully then queue.
+                status_msg = await ctx.send("Fetching playlist info…")
+                try:
+                    playlist_info = await loop.run_in_executor(None, extract_playlist_info, query, yt_client)
+                except Exception as e:
+                    await status_msg.edit(content=f"Error fetching playlist: {e}")
+                    return
+                tracks = playlist_info["tracks"]
+                if not tracks:
+                    await status_msg.edit(content="No tracks found in this playlist.")
+                    return
+                playlist_title = playlist_info["title"]
+                remaining_tracks = tracks[1:]
+
+                track = Track(query=tracks[0]["url"], title=tracks[0]["title"], requested_by=user_id, url=tracks[0]["url"])
                 gs.queue.add(track)
                 _schedule_prefetch(self.bot, ctx.guild.id)
+                asyncio.create_task(_safe_delete(status_msg))
 
                 count = len(remaining_tracks)
                 if count > 0:
-                    extra = (
-                        f"**{playlist_title}** has **{count}** more tracks.\n"
-                        f"Click 'Load playlist' to add them to the queue."
-                    )
+                    extra = (f"**{playlist_title}** has **{count}** more tracks.\n"
+                             f"Click 'Load playlist' to add them to the queue.")
+                    _pending_and_expire(remaining_tracks, playlist_title, gs.queue.current.title if gs.queue.current else "")
                 else:
                     extra = f"Added **{playlist_title}** (1 track) to the queue."
 
-                await status_msg.delete()
-
-            else:
-                # Join voice if not already connected
-                voice_client = ctx.guild.voice_client
-                if not voice_client or not voice_client.is_connected():
-                    if voice_client:  # stale client — force-disconnect before reconnecting
-                        try:
-                            await voice_client.disconnect(force=True)
-                        except Exception:
-                            pass
-                        gs.player._voice_client = None
-                    try:
-                        voice_client = await voice_channel.connect()
-                        gs.player.set_voice_client(voice_client)
-                        # Restore saved bitrate for this guild
-                        saved_br = get_bitrate(guild_id)
-                        if saved_br:
-                            await gs.player.set_bitrate(ctx.guild.id, saved_br)
-                        # Restore saved EQ for this guild (per D-09)
-                        saved_bass = get_eq_bass(guild_id)
-                        saved_treble = get_eq_treble(guild_id)
-                        if saved_bass != 0 or saved_treble != 0:
-                            await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
-                    except Exception as e:
-                        await status_msg.edit(content=f"Failed to join voice channel: {e}")
-                        return
-
-                # Play the first track immediately
-                try:
-                    info = await gs.player.play(first_track_info["url"])
-                    title = info["title"]
-                    track_thumbnail = info.get("thumbnail", "")
-                    track_url = info.get("webpage_url", "")
-
-                    # Explicitly set the current track state since we bypassed queueing
-                    track = Track(query=first_track_info["url"], title=title, requested_by=user_id, thumbnail=track_thumbnail, url=track_url)
-                    gs.queue.current = track
-                except Exception as e:
-                    await status_msg.edit(content=f"Error playing first track: {e}")
-                    return
-
-                if not remaining_tracks:
-                    view = build_player_view(self.bot, title,
-                                            f"From playlist: **{playlist_title}**",
-                                            thumbnail=track_thumbnail,
-                                            url=track_url,
-                                            requester_name=f"<@{user_id}>",
-                                            queue_tracks=gs.queue.preview_fair_order(),
-                                            guild_id=ctx.guild.id)
-                    await status_msg.delete()
-                    await send_new_np(self.bot, channel_id, view)
-                    _start_auto_next(self.bot, channel_id, ctx.guild.id)
-                    return
-
-                # Show offer to load the rest
-                count = len(remaining_tracks)
-                extra = (
-                    f"**{playlist_title}** has **{count}** more tracks.\n"
-                    f"Click 'Load playlist' to add them to the queue."
-                )
-                await status_msg.delete()
-
-            # Store pending playlist BEFORE building the card so the Load row renders.
-            self.bot.pending_playlists[str(channel_id)] = {
-                "query": query,
-                "user_id": str(ctx.author.id),
-                "guild_id": guild_id,
-                "channel_id": channel_id,
-                "tracks": remaining_tracks,
-                "playlist_title": playlist_title,
-            }
-
-            current = gs.queue.current
-            view = build_player_view(self.bot, current.title, extra,
-                                     thumbnail=current.thumbnail,
-                                     url=current.url,
-                                     requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
-                                     queue_tracks=gs.queue.preview_fair_order(),
-                                     guild_id=ctx.guild.id)
-            if voice_actually_playing:
+                current = gs.queue.current
+                view = build_player_view(self.bot, current.title, extra,
+                                         thumbnail=current.thumbnail, url=current.url,
+                                         requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
+                                         queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
                 await update_np_embed(self.bot, channel_id, view)
-            else:
-                await send_new_np(self.bot, channel_id, view)
-                _start_auto_next(self.bot, channel_id, ctx.guild.id)
+                return
 
-            # Auto-expire after 120 seconds
-            async def _expire_playlist(ch_id: int):
-                await asyncio.sleep(120)
-                removed = self.bot.pending_playlists.pop(str(ch_id), None)
-                if removed:
+            # Not playing: EARLY START — enumerate the full playlist in the background
+            # while a fast limit=1 fetch gets track 1, so audio starts ~1-2.5s sooner.
+            status_msg = await ctx.send("Loading playlist…")
+            full_fut = loop.run_in_executor(None, extract_playlist_info, query, yt_client)
+            try:
+                first_info = await loop.run_in_executor(None, extract_playlist_info, query, yt_client, 1)
+            except Exception as e:
+                _discard_future(full_fut)
+                await status_msg.edit(content=f"Error fetching playlist: {e}")
+                return
+            first_tracks = first_info["tracks"]
+            if not first_tracks:
+                _discard_future(full_fut)
+                await status_msg.edit(content="No tracks found in this playlist.")
+                return
+            playlist_title = first_info["title"]
+            first_track_info = first_tracks[0]
+
+            # Join voice if not already connected
+            if not voice_client or not voice_client.is_connected():
+                if voice_client:  # stale client — force-disconnect before reconnecting
                     try:
-                        expired_extra = (
-                            f"**{playlist_title}** had **{count}** more tracks.\n"
-                            f"~~Click Load playlist~~ *(expired)*"
-                        )
-                        expired_view = build_player_view(self.bot, title, expired_extra, guild_id=ctx.guild.id)
-                        await update_np_embed(self.bot, ch_id, expired_view)
+                        await voice_client.disconnect(force=True)
                     except Exception:
                         pass
+                    gs.player._voice_client = None
+                try:
+                    voice_client = await voice_channel.connect()
+                    gs.player.set_voice_client(voice_client)
+                    saved_br = get_bitrate(guild_id)
+                    if saved_br:
+                        await gs.player.set_bitrate(ctx.guild.id, saved_br)
+                    saved_bass = get_eq_bass(guild_id)
+                    saved_treble = get_eq_treble(guild_id)
+                    if saved_bass != 0 or saved_treble != 0:
+                        await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+                except Exception as e:
+                    _discard_future(full_fut)
+                    await status_msg.edit(content=f"Failed to join voice channel: {e}")
+                    return
 
-            asyncio.create_task(_expire_playlist(channel_id))
+            # Start track 1 immediately (do not wait for full enumeration).
+            try:
+                played = await gs.player.play(first_track_info["url"])
+                title = played["title"]
+                track_thumbnail = played.get("thumbnail", "")
+                track_url = played.get("webpage_url", "")
+                gs.queue.current = Track(query=first_track_info["url"], title=title,
+                                         requested_by=user_id, thumbnail=track_thumbnail, url=track_url)
+            except Exception as e:
+                _discard_future(full_fut)
+                await status_msg.edit(content=f"Error playing first track: {e}")
+                return
+
+            # Audio is now playing — show the card and arm auto-next before the (possibly
+            # slower) full enumeration lands.
+            view = build_player_view(self.bot, title, f"From playlist: **{playlist_title}**",
+                                     thumbnail=track_thumbnail, url=track_url,
+                                     requester_name=f"<@{user_id}>",
+                                     queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
+            asyncio.create_task(_safe_delete(status_msg))
+            await send_new_np(self.bot, channel_id, view)
+            _start_auto_next(self.bot, channel_id, ctx.guild.id)
+
+            # Finish enumerating; when done, offer the rest via the Load button.
+            try:
+                full_info = await full_fut
+            except Exception as e:
+                print(f"[commands] Playlist enumeration failed after start: {e}")
+                return
+            remaining_tracks = full_info["tracks"][1:] if full_info.get("tracks") else []
+            if not remaining_tracks:
+                return
+            _pending_and_expire(remaining_tracks, playlist_title, title)
+            count = len(remaining_tracks)
+            extra = (f"**{playlist_title}** has **{count}** more tracks.\n"
+                     f"Click 'Load playlist' to add them to the queue.")
+            current = gs.queue.current
+            if current:
+                view = build_player_view(self.bot, current.title, extra,
+                                         thumbnail=current.thumbnail, url=current.url,
+                                         requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
+                                         queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
+                await update_np_embed(self.bot, channel_id, view)
             return
 
         # ---------------------------------------------------------------

@@ -566,18 +566,21 @@ def is_playlist_url(query: str) -> bool:
 MAX_PLAYLIST_TRACKS = 200  # hard cap on tracks loaded from a single playlist
 
 
-def extract_playlist_info(query: str, client: str) -> dict:
+def extract_playlist_info(query: str, client: str, limit: int = MAX_PLAYLIST_TRACKS) -> dict:
     """Extract playlist title and track list using yt-dlp (metadata only, no streams).
 
     Returns {"title": str, "tracks": [{"url": str, "title": str}, ...]},
-    capped at MAX_PLAYLIST_TRACKS entries.
+    capped at ``limit`` entries (default MAX_PLAYLIST_TRACKS). Pass limit=1 to
+    fetch just the first track fast (one page) so playback can start before the
+    full enumeration finishes.
     """
+    limit = max(1, min(limit, MAX_PLAYLIST_TRACKS))
     ydl_opts = {
         "extract_flat": "in_playlist",  # resolve each entry but don't fetch streams
         "quiet": True,
         "no_warnings": True,
         "noplaylist": False,            # allow playlist extraction
-        "playlistend": MAX_PLAYLIST_TRACKS,  # stop enumerating after the cap (huge-playlist guard)
+        "playlistend": limit,           # stop enumerating after the cap (huge-playlist guard)
     }
 
     if _is_youtube(query):
@@ -606,7 +609,7 @@ def extract_playlist_info(query: str, client: str) -> dict:
 
     return {
         "title": info.get("title", "Unknown Playlist"),
-        "tracks": tracks[:MAX_PLAYLIST_TRACKS],
+        "tracks": tracks[:limit],
     }
 
 
