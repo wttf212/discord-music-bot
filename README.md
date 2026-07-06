@@ -10,7 +10,7 @@ A Discord music bot with YouTube, SoundCloud, and Spotify. (Use it at your own r
 - 🔁 Loop the current track or the whole queue (`!loop`)
 - 🧰 Queue tools — remove, move, skip-to, clear, and dedupe
 - 📩 Grab — DM yourself the currently playing track (`!grab`)
-- 🏎️ Next F1 race + local weather shown on the player card (per-server `!setlocation` / `!settimezone`)
+- 🛰️ Live flourishes on the card — local weather, aurora forecast, next F1 race, and next rocket launch (per-server `!setlocation` / `!settimezone`; sensible Riga/Europe defaults if unset)
 - 📻 Internet radio browser — region/country/genre discovery or name search across 30k+ stations
 - 📋 Playlist support — plays the first track immediately, load the rest with `!loadall`
 - 🔀 Queue with fair-play interleaving and shuffle

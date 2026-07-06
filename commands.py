@@ -17,6 +17,8 @@ from audio_player import (
 from spotify import is_spotify_url, resolve_spotify, SpotifyError
 import weather
 import f1
+import rocket
+import aurora
 from guild_settings import (
     get_allowed_channel, set_allowed_channel,
     get_bitrate, set_bitrate,
@@ -1173,18 +1175,31 @@ class PlayerView(discord.ui.LayoutView):
                 + f"{kbps}kbps · EQ {eq_label}{loop_suffix}{autoplay_suffix}")
         c.add_item(discord.ui.TextDisplay(foot))
 
-        # Flourish line: current weather (guild location) + next F1 race (guild tz).
+        # Flourish lines (small text): sky conditions, then upcoming events.
+        # All use the guild's configured location/timezone, defaulting to Riga.
         prefs = (get_display_prefs(str(guild_id)) if guild_id
                  else {"location": dict(DEFAULT_WEATHER_LOCATION), "timezone": None})
-        info_bits = []
-        w = _weather_text_for(prefs["location"])
+        loc, tz = prefs["location"], prefs.get("timezone")
+
+        sky = []
+        w = _weather_text_for(loc)
         if w:
-            info_bits.append(w)
-        f1_txt = f1.format_race(_f1_cache.get("race"), prefs.get("timezone"))
+            sky.append(w)
+        a = aurora.format_aurora(aurora.aurora_at(_aurora_cache.get("grid"), loc["lat"], loc["lon"]))
+        if a:
+            sky.append(a)
+        if sky:
+            c.add_item(discord.ui.TextDisplay("-# " + " · ".join(sky)))
+
+        events = []
+        f1_txt = f1.format_race(_f1_cache.get("race"), tz)
         if f1_txt:
-            info_bits.append(f1_txt)
-        if info_bits:
-            c.add_item(discord.ui.TextDisplay("-# " + " · ".join(info_bits)))
+            events.append(f1_txt)
+        r_txt = rocket.format_launch(_rocket_cache.get("launch"), tz)
+        if r_txt:
+            events.append(r_txt)
+        if events:
+            c.add_item(discord.ui.TextDisplay("-# " + " · ".join(events)))
 
         self.add_item(c)
 
@@ -1273,6 +1288,10 @@ _weather_cache: dict = {}  # "lat,lon" -> {"text", "ts", "busy"}
 _WEATHER_TTL = 600.0       # 10 minutes
 _f1_cache = {"race": None, "ts": 0.0, "busy": False}
 _F1_TTL = 3600.0           # 1 hour (the schedule changes rarely)
+_rocket_cache = {"launch": None, "ts": 0.0, "busy": False}
+_ROCKET_TTL = 7200.0       # 2 hours (Launch Library anon throttle is ~15/hr)
+_aurora_cache = {"grid": None, "ts": 0.0, "busy": False}
+_AURORA_TTL = 1800.0       # 30 minutes (OVATION updates ~every 5 min)
 
 
 def _loc_key(lat, lon) -> str:
@@ -1322,6 +1341,38 @@ async def _refresh_f1_if_stale():
         pass
     finally:
         _f1_cache["busy"] = False
+
+
+async def _refresh_rocket_if_stale():
+    """Fetch the next rocket launch in the background if the cache is stale."""
+    now = time.monotonic()
+    if _rocket_cache["busy"] or (_rocket_cache["ts"] and now - _rocket_cache["ts"] < _ROCKET_TTL):
+        return
+    _rocket_cache["busy"] = True
+    _rocket_cache["ts"] = now
+    try:
+        _rocket_cache["launch"] = await asyncio.get_event_loop().run_in_executor(None, rocket.get_next_launch)
+    except Exception:
+        pass
+    finally:
+        _rocket_cache["busy"] = False
+
+
+async def _refresh_aurora_if_stale():
+    """Fetch the OVATION aurora grid in the background if the cache is stale."""
+    now = time.monotonic()
+    if _aurora_cache["busy"] or (_aurora_cache["ts"] and now - _aurora_cache["ts"] < _AURORA_TTL):
+        return
+    _aurora_cache["busy"] = True
+    _aurora_cache["ts"] = now
+    try:
+        grid = await asyncio.get_event_loop().run_in_executor(None, aurora.get_aurora_grid)
+        if grid:
+            _aurora_cache["grid"] = grid
+    except Exception:
+        pass
+    finally:
+        _aurora_cache["busy"] = False
 
 
 def _build_grab_embed(gs, track) -> discord.Embed:
@@ -1609,9 +1660,11 @@ async def send_new_np(bot, channel_id: int, view: "PlayerView"):
     guild_id = channel.guild.id
     gs = bot.get_guild_state(guild_id)
 
-    # Keep the weather + F1 flourishes reasonably fresh (background, no-op if recent).
+    # Keep the card flourishes reasonably fresh (background, no-op if recent).
     asyncio.create_task(_refresh_weather_if_stale(bot, guild_id))
     asyncio.create_task(_refresh_f1_if_stale())
+    asyncio.create_task(_refresh_rocket_if_stale())
+    asyncio.create_task(_refresh_aurora_if_stale())
 
     # Reset votes whenever a new NP message is sent / track changes
     gs.prev_votes.clear()
@@ -2988,3 +3041,5 @@ async def setup(bot):
     # Warm the flourish caches so the first card shows them.
     asyncio.create_task(_refresh_weather_for(dict(DEFAULT_WEATHER_LOCATION)))
     asyncio.create_task(_refresh_f1_if_stale())
+    asyncio.create_task(_refresh_rocket_if_stale())
+    asyncio.create_task(_refresh_aurora_if_stale())
