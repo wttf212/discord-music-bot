@@ -23,6 +23,14 @@ youtube:
   #
   # cookies_file: "/data/cookies.txt"
 
+# Optional: Spotify support. Track links work WITHOUT credentials (via Spotify's
+# public oEmbed). Playlist and album links need API credentials from a free app at
+# https://developer.spotify.com/dashboard (Client ID + Client Secret). Spotify audio
+# is DRM-protected, so links are resolved to the matching track on YouTube.
+# spotify:
+#   client_id: "YOUR_SPOTIFY_CLIENT_ID"
+#   client_secret: "YOUR_SPOTIFY_CLIENT_SECRET"
+
 ffmpeg_path: "ffmpeg"
 
 audio:

@@ -14,6 +14,7 @@ from audio_player import (
     is_playlist_url, extract_playlist_info, get_audio_url_with_retry,
     is_stream_info_fresh, get_related_tracks,
 )
+from spotify import is_spotify_url, resolve_spotify, SpotifyError
 from guild_settings import (
     get_allowed_channel, set_allowed_channel,
     get_bitrate, set_bitrate,
@@ -994,6 +995,22 @@ class _SecondaryRow(discord.ui.ActionRow):
         kwargs = {**self.view._kwargs, "queue_tracks": gs.queue.preview_fair_order()}
         await interaction.response.edit_message(view=build_player_view(self.view.bot, **kwargs))
 
+    @discord.ui.button(label="⤓", style=discord.ButtonStyle.secondary, custom_id="btn_grab")
+    async def grab_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gs = self.view.bot.get_guild_state(interaction.guild_id)
+        current = gs.queue.current
+        if not current or not gs.player.is_playing:
+            await interaction.response.send_message("Nothing is playing to grab.", ephemeral=True)
+            return
+        try:
+            await interaction.user.send(embed=_build_grab_embed(gs, current))
+            await interaction.response.send_message("Sent it to your DMs.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I couldn't DM you — enable **Allow direct messages from server members**.",
+                ephemeral=True,
+            )
+
 
 class PlayerView(discord.ui.LayoutView):
     """Components V2 Now-Playing card: an accent-barred Container holding the song
@@ -1212,6 +1229,24 @@ def _plain_names(bot, guild, text: str) -> str:
     if not text or "<@" not in text:
         return text
     return _MENTION_RE.sub(lambda m: _get_requester_name(bot, m.group(1), guild) or "someone", text)
+
+
+def _build_grab_embed(gs, track) -> discord.Embed:
+    """Build the DM embed for !grab / the grab button (the current track's details)."""
+    title = (gs.player.current_track_title or track.title) if gs else track.title
+    embed = discord.Embed(title=title or "Now Playing", color=NP_EMBED_COLOR)
+    desc = []
+    artist = (getattr(gs.player, "current_artist", "") or "") if gs else ""
+    if artist:
+        desc.append(f"by {artist}")
+    if getattr(track, "url", ""):
+        desc.append(track.url)
+    if desc:
+        embed.description = "\n".join(desc)
+    if getattr(track, "thumbnail", ""):
+        embed.set_thumbnail(url=track.thumbnail)
+    embed.set_footer(text="Grabbed from Now Playing")
+    return embed
 
 
 async def _safe_delete(msg):
@@ -1618,6 +1653,32 @@ class MusicCog(commands.Cog):
         # (one YoutubeDL session instead of a flat ytsearch5 hop + a full resolve).
         if ctx.interaction:
             await ctx.defer()
+
+        # ---------------------------------------------------------------
+        # Spotify: expand the link into "artist - title" searches resolved on
+        # YouTube (Spotify audio is DRM-protected and can't be streamed directly).
+        # ---------------------------------------------------------------
+        if is_spotify_url(query):
+            sp = self.bot.config.get("spotify", {}) or {}
+            try:
+                resolved = await asyncio.get_event_loop().run_in_executor(
+                    None, resolve_spotify, query, sp.get("client_id"), sp.get("client_secret")
+                )
+            except SpotifyError as e:
+                await ctx.send(str(e))
+                return
+            except Exception as e:
+                await ctx.send(f"Couldn't read that Spotify link: {e}")
+                return
+            sp_tracks = resolved.get("tracks") or []
+            if not sp_tracks:
+                await ctx.send("No tracks found on that Spotify link.")
+                return
+            if len(sp_tracks) == 1:
+                query = sp_tracks[0]["query"]  # single track → fall through to the search flow
+            else:
+                await self._queue_spotify(ctx, gs, resolved)
+                return
 
         # ---------------------------------------------------------------
         # Playlist detection: play first track, offer to add the rest
@@ -2103,6 +2164,95 @@ class MusicCog(commands.Cog):
         )
         await update_np_embed(self.bot, ctx.channel.id, view)
 
+    async def _queue_spotify(self, ctx, gs, resolved):
+        """Play/queue a multi-track Spotify playlist or album as YouTube searches.
+
+        Tracks are queued as plain-text "artist - title" queries (title known up
+        front from Spotify), resolved to YouTube lazily on play/prefetch — so a
+        200-track playlist adds instantly without a burst of YouTube calls.
+        """
+        title = resolved.get("title") or "Spotify"
+        sp_tracks = resolved["tracks"]
+        user_id = str(ctx.author.id)
+        channel_id = ctx.channel.id
+        guild_id = str(ctx.guild.id)
+        voice_channel = ctx.author.voice.channel
+        voice_client = ctx.guild.voice_client
+        playing = gs.player.is_playing and voice_client and voice_client.is_playing()
+
+        def mk(t):
+            return Track(query=t["query"], title=t["title"], requested_by=user_id)
+
+        if playing:
+            for t in sp_tracks:
+                gs.queue.add(mk(t))
+            _schedule_prefetch(self.bot, ctx.guild.id)
+            await ctx.send(f"Queued **{len(sp_tracks)}** tracks from **{title}**.")
+            await self._refresh_np_card(ctx)
+            return
+
+        # Join voice if not already connected
+        if not voice_client or not voice_client.is_connected():
+            if voice_client:
+                try:
+                    await voice_client.disconnect(force=True)
+                except Exception:
+                    pass
+                gs.player._voice_client = None
+            try:
+                voice_client = await voice_channel.connect()
+                gs.player.set_voice_client(voice_client)
+                saved_br = get_bitrate(guild_id)
+                if saved_br:
+                    await gs.player.set_bitrate(ctx.guild.id, saved_br)
+                saved_bass = get_eq_bass(guild_id)
+                saved_treble = get_eq_treble(guild_id)
+                if saved_bass != 0 or saved_treble != 0:
+                    await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+            except Exception as e:
+                await ctx.send(f"Failed to join voice channel: {e}")
+                return
+
+        status = await ctx.send(f"Loading **{title}**…")
+        first = sp_tracks[0]
+        try:
+            played = await gs.player.play(first["query"])
+        except Exception as e:
+            await status.edit(content=f"Error playing first track: {_friendly_ytdlp_error(e)}")
+            return
+        gs.queue.current = Track(query=first["query"], title=played["title"], requested_by=user_id,
+                                 thumbnail=played.get("thumbnail", ""), url=played.get("webpage_url", ""))
+        for t in sp_tracks[1:]:
+            gs.queue.add(mk(t))
+        view = build_player_view(self.bot, gs.queue.current.title,
+                                 f"From Spotify: **{title}**",
+                                 thumbnail=gs.queue.current.thumbnail, url=gs.queue.current.url,
+                                 requester_name=_get_requester_name(self.bot, user_id, ctx.guild),
+                                 queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
+        asyncio.create_task(_safe_delete(status))
+        await send_new_np(self.bot, channel_id, view)
+        _start_auto_next(self.bot, channel_id, ctx.guild.id)
+
+    @commands.hybrid_command(name="grab", description="DM yourself the currently playing track")
+    async def grab(self, ctx: commands.Context):
+        if not await check_channel(ctx):
+            return
+        if not ctx.guild:
+            return
+        gs = self.bot.get_guild_state(ctx.guild.id)
+        current = gs.queue.current
+        if not current or not gs.player.is_playing:
+            await ctx.send("Nothing is playing right now.")
+            return
+        try:
+            await ctx.author.send(embed=_build_grab_embed(gs, current))
+            await ctx.send("Sent it to your DMs.", ephemeral=True)
+        except discord.Forbidden:
+            await ctx.send(
+                "I couldn't DM you — enable **Allow direct messages from server members**.",
+                ephemeral=True,
+            )
+
     @commands.hybrid_command(name="loop", description="Set repeat mode: off, track, or queue")
     @app_commands.describe(mode="off, track (repeat current), or queue (repeat all) — omit to cycle")
     async def loop(self, ctx: commands.Context, mode: str = None):
@@ -2542,8 +2692,9 @@ class MusicCog(commands.Cog):
         p = self.bot.command_prefix
         await ctx.send(
             f"**Available commands:**\n"
-            f"`{p}play <url or keywords>` — Play a track or playlist (URL plays directly, text auto-plays top result)\n"
+            f"`{p}play <url or keywords>` — Play from YouTube, SoundCloud, or Spotify (or search text)\n"
             f"`{p}search <keywords>` — Search YouTube and pick a result from a dropdown\n"
+            f"`{p}grab` — DM yourself the currently playing track\n"
             f"`{p}pause` — Pause playback\n"
             f"`{p}resume` — Resume paused playback\n"
             f"`{p}skip` — Skip the current track\n"
