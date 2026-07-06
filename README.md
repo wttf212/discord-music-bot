@@ -1,11 +1,15 @@
 # Discord Music Bot
 
-A Discord music bot with YouTube and SoundCloud. (Use it at your own risk, YouTube loves to ban IPs)
+A Discord music bot with YouTube, SoundCloud, and Spotify. (Use it at your own risk, YouTube loves to ban IPs)
 
 ## Features
 
-- 🎵 Play music from YouTube, SoundCloud, and other supported sites
+- 🎵 Play from YouTube, SoundCloud, and Spotify (Spotify links are resolved to YouTube)
 - 🔍 YouTube search with a dropdown picker (`!search`)
+- ♾️ Autoplay / endless mode — keeps playing related tracks when the queue ends (`!autoplay`)
+- 🔁 Loop the current track or the whole queue (`!loop`)
+- 🧰 Queue tools — remove, move, skip-to, clear, and dedupe
+- 📩 Grab — DM yourself the currently playing track (`!grab`)
 - 📻 Internet radio browser — region/country/genre discovery or name search across 30k+ stations
 - 📋 Playlist support — plays the first track immediately, load the rest with `!loadall`
 - 🔀 Queue with fair-play interleaving and shuffle
@@ -50,6 +54,7 @@ Copy `config.example.yaml` to `config.yaml` and fill in:
 | `owner_id` | Your Discord user ID (for `!settc` and `!shutdown`) |
 | `debug` | Enable verbose logging |
 | `audio.bitrate` | Opus encoding bitrate in kbps (default: 128) |
+| `spotify.client_id` / `spotify.client_secret` | *(optional)* Enable Spotify **playlist/album** links (single track links work without them) |
 
 ## Cookie Auth (Optional)
 
@@ -72,8 +77,9 @@ All commands work with the prefix (default `!`) and as slash commands (e.g. `/pl
 
 | Command | Description |
 |---------|-------------|
-| `!play <url or keywords>` | Play a track or playlist — URL plays directly, plain text auto-plays the top YouTube result (join voice first) |
+| `!play <url or keywords>` | Play from YouTube, SoundCloud, or Spotify — links play directly, plain text auto-plays the top YouTube result (join voice first) |
 | `!search <keywords>` | Search YouTube and pick a result from a dropdown |
+| `!grab` | DM yourself the currently playing track |
 | `!pause` | Pause playback |
 | `!resume` | Resume paused playback |
 | `!skip` | Skip the current track |
@@ -85,6 +91,13 @@ All commands work with the prefix (default `!`) and as slash commands (e.g. `/pl
 |---------|-------------|
 | `!queue` | Show the current queue |
 | `!shuffle` | Shuffle the queued tracks |
+| `!loop [off\|track\|queue]` | Repeat the current track or the whole queue |
+| `!autoplay [on\|off]` | Keep playing related tracks when the queue ends |
+| `!remove <pos>` | Remove a track from the queue by position |
+| `!move <from> <to>` | Move a queued track to a new position |
+| `!skipto <pos>` | Jump straight to a queued track |
+| `!clear` | Clear the upcoming queue (keeps the current track) |
+| `!dedupe` | Remove duplicate tracks from the queue |
 | `!loadall` | Load all remaining tracks from the last pending playlist |
 
 ### Radio
