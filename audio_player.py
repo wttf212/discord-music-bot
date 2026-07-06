@@ -1,4 +1,5 @@
 import asyncio
+import queue
 import random
 import shutil
 import socket
@@ -8,6 +9,7 @@ import os
 import threading
 import time
 from urllib.error import URLError
+from urllib.parse import urlparse, parse_qs
 
 import discord
 from yt_dlp.utils import DownloadError
@@ -112,6 +114,33 @@ _RETRYABLE_SUBSTRINGS = (
     "temporary failure in name resolution",
 )
 
+# Connection/timeout-class errors that are clearly transient (NOT rate-limits).
+# These get the fast backoff tier: a dropped connection or read timeout does not
+# mean YouTube is throttling us, so a 5 s sleep is pure dead air. Rate-limit
+# errors (429 / "too many requests"), 5xx server errors, and any unrecognised
+# (ambiguous) error deliberately stay on the slow tier — an unknown error could
+# be a soft-block, and pacing those conservatively protects against IP bans.
+_FAST_RETRY_SUBSTRINGS = (
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "remote end closed",
+    "timed out",
+    "read timed out",
+    "temporary failure in name resolution",
+)
+
+
+def _retry_base_delay(exc: BaseException, base_delay: float, fast_delay: float) -> float:
+    """Pick the backoff base for this error: fast for transient connection/timeout
+    errors, slow (rate-limit-safe) for 429/5xx/ambiguous."""
+    if isinstance(exc, (ConnectionError, TimeoutError, socket.timeout, URLError)):
+        return fast_delay
+    msg = str(exc).lower()
+    if any(s in msg for s in _FAST_RETRY_SUBSTRINGS):
+        return fast_delay
+    return base_delay
+
 
 def _is_retryable_ytdlp_error(exc: BaseException) -> bool:
     """Classify a yt-dlp (or connection-layer) exception as retryable or not.
@@ -135,13 +164,18 @@ def _is_retryable_ytdlp_error(exc: BaseException) -> bool:
     return True
 
 
-def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.0, jitter: float = 0.25, **kwargs):
+def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.0,
+                        fast_delay: float = 1.5, jitter: float = 0.25, **kwargs):
     """Retry a synchronous callable with exponential backoff + jitter.
 
     Runs inside the executor thread — uses time.sleep (NOT asyncio.sleep).
     Re-raises immediately on non-retryable errors to avoid accelerating IP bans
     when YouTube returns a permanent policy error (video unavailable, sign-in,
     age-restricted, geo-block).
+
+    The backoff base is tiered per error: transient connection/timeout errors use
+    ``fast_delay`` (a dropped socket is not a rate-limit, so a 5 s sleep is wasted
+    dead air), while 429/5xx/ambiguous errors keep the conservative ``base_delay``.
     """
     last_exc = None
     for attempt in range(max_attempts):
@@ -155,7 +189,7 @@ def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.
             if attempt == max_attempts - 1:
                 # Final attempt exhausted.
                 raise
-            exp_delay = base_delay * (2 ** attempt)
+            exp_delay = _retry_base_delay(exc, base_delay, fast_delay) * (2 ** attempt)
             jitter_mult = random.uniform(1.0 - jitter, 1.0 + jitter)
             sleep_seconds = exp_delay * jitter_mult
             exc_class = type(exc).__name__
@@ -167,6 +201,45 @@ def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.
             time.sleep(sleep_seconds)
     # Unreachable (loop always either returns or raises), but keep the invariant explicit.
     raise last_exc  # type: ignore[misc]
+
+
+# A resolved CDN URL may be reused (prefetch / previous-track) only while it is
+# comfortably in the future. googlevideo URLs carry an `expire=<unix>` query param
+# (~6 h out); we require this much headroom left before trusting a cached URL so a
+# transition never hands FFmpeg a URL about to 403. Non-YouTube URLs (e.g.
+# SoundCloud) usually lack `expire=`, so a conservative wall-clock TTL is used.
+STREAM_URL_SAFETY_MARGIN = 30 * 60      # need >= 30 min left on the CDN URL
+STREAM_INFO_FALLBACK_TTL = 4 * 60 * 60  # trust an expiry-less URL for 4 h
+
+
+def _stream_url_expiry(url: str) -> float | None:
+    """Return the unix expiry embedded in a googlevideo CDN URL, or None if absent."""
+    if not url:
+        return None
+    try:
+        exp = parse_qs(urlparse(url).query).get("expire", [None])[0]
+        return float(exp) if exp else None
+    except (ValueError, TypeError):
+        return None
+
+
+def is_stream_info_fresh(info: dict | None, resolved_at: float = 0.0,
+                         now: float | None = None) -> bool:
+    """True if a cached get_audio_url() result can still be streamed safely.
+
+    Primary guard is the CDN URL's own `expire=` timestamp (with a safety margin);
+    when the URL has no expiry param, fall back to a conservative wall-clock TTL
+    measured from resolved_at. Returns False for missing/empty info.
+    """
+    if not info or not info.get("url"):
+        return False
+    now = time.time() if now is None else now
+    expiry = _stream_url_expiry(info["url"])
+    if expiry is not None:
+        return (expiry - now) > STREAM_URL_SAFETY_MARGIN
+    if resolved_at:
+        return (now - resolved_at) < STREAM_INFO_FALLBACK_TTL
+    return False
 
 
 def get_audio_url_with_retry(query: str, client: str, debug: bool = False, cookies_file: str | None = None) -> dict:
@@ -456,6 +529,56 @@ def _start_ytdlp_stream(
     return subprocess.Popen(cmd, **kwargs)
 
 
+def _youtube_video_id(url: str) -> str | None:
+    """Extract the video id from a youtube.com/watch?v= or youtu.be/ URL."""
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    host = parsed.netloc or ""
+    if "youtu.be" in host:
+        vid = parsed.path.lstrip("/").split("/")[0]
+        return vid or None
+    if "youtube.com" in host:
+        return parse_qs(parsed.query).get("v", [None])[0]
+    return None
+
+
+def get_related_tracks(seed_url: str, client: str, limit: int = 25) -> list[dict]:
+    """Return related YouTube tracks via the seed video's Mix (RD) playlist, for
+    autoplay/endless mode. Returns [{"url", "title"}, ...] excluding the seed.
+    Empty list for non-YouTube seeds (autoplay only supports YouTube)."""
+    vid = _youtube_video_id(seed_url or "")
+    if not vid:
+        return []
+    mix_url = f"https://www.youtube.com/watch?v={vid}&list=RD{vid}"
+    seed_watch = f"https://www.youtube.com/watch?v={vid}"
+    try:
+        info = extract_playlist_info(mix_url, client, limit=limit)
+    except Exception:
+        return []
+    return [t for t in info.get("tracks", []) if t.get("url") and t["url"] != seed_watch]
+
+
+def _reap_process(proc):
+    """Wait on an already-terminate()'d subprocess, killing it if it overruns.
+
+    Meant to run on a daemon thread so the event loop never blocks on the
+    wait()/kill() teardown (which can be slow on a throttled/loaded host).
+    """
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def is_playlist_url(query: str) -> bool:
     """Check if a URL points to a playlist (YouTube or SoundCloud)."""
     if not query.startswith(("http://", "https://")):
@@ -477,18 +600,21 @@ def is_playlist_url(query: str) -> bool:
 MAX_PLAYLIST_TRACKS = 200  # hard cap on tracks loaded from a single playlist
 
 
-def extract_playlist_info(query: str, client: str) -> dict:
+def extract_playlist_info(query: str, client: str, limit: int = MAX_PLAYLIST_TRACKS) -> dict:
     """Extract playlist title and track list using yt-dlp (metadata only, no streams).
 
     Returns {"title": str, "tracks": [{"url": str, "title": str}, ...]},
-    capped at MAX_PLAYLIST_TRACKS entries.
+    capped at ``limit`` entries (default MAX_PLAYLIST_TRACKS). Pass limit=1 to
+    fetch just the first track fast (one page) so playback can start before the
+    full enumeration finishes.
     """
+    limit = max(1, min(limit, MAX_PLAYLIST_TRACKS))
     ydl_opts = {
         "extract_flat": "in_playlist",  # resolve each entry but don't fetch streams
         "quiet": True,
         "no_warnings": True,
         "noplaylist": False,            # allow playlist extraction
-        "playlistend": MAX_PLAYLIST_TRACKS,  # stop enumerating after the cap (huge-playlist guard)
+        "playlistend": limit,           # stop enumerating after the cap (huge-playlist guard)
     }
 
     if _is_youtube(query):
@@ -517,7 +643,7 @@ def extract_playlist_info(query: str, client: str) -> dict:
 
     return {
         "title": info.get("title", "Unknown Playlist"),
-        "tracks": tracks[:MAX_PLAYLIST_TRACKS],
+        "tracks": tracks[:limit],
     }
 
 
@@ -548,6 +674,87 @@ class _PrimedAudioSource(discord.AudioSource):
 
     def cleanup(self):
         self._source.cleanup()
+
+
+# One 20 ms Discord voice frame = 48000 Hz * 0.02 s * 2 channels * 2 bytes (s16le).
+try:
+    from discord.opus import Encoder as _OpusEncoder
+    _PCM_FRAME_SIZE = _OpusEncoder.FRAME_SIZE
+except Exception:  # pragma: no cover - libopus/discord internals absent
+    _PCM_FRAME_SIZE = 3840
+
+
+class _BufferedAudioSource(discord.AudioSource):
+    """Jitter buffer that decouples discord.py's real-time audio thread from
+    yt-dlp/FFmpeg pipeline stalls.
+
+    A daemon thread pre-reads PCM frames from the wrapped source into a bounded
+    queue. read() pops a ready frame (near-instant), so the player thread never
+    blocks on the pipe — which is what makes it fall behind and then rush frames
+    to catch up (audible fast-forward). On a rare underrun (buffer momentarily
+    empty but stream not finished) it returns a silent frame instead of blocking:
+    a tiny gap rather than a speed-up. On EOF it returns b'' so playback ends.
+
+    The bounded queue also applies backpressure: when full, the reader blocks, so
+    FFmpeg/yt-dlp pause — memory stays bounded (~buffer_frames * 3840 bytes).
+    """
+
+    _SILENCE = b"\x00" * _PCM_FRAME_SIZE
+
+    def __init__(self, source, first_frame: bytes = b"", buffer_frames: int = 400):
+        self._source = source
+        self._queue: queue.Queue = queue.Queue(maxsize=buffer_frames)
+        self._eof = threading.Event()
+        self._closed = threading.Event()
+        self._first_frame = first_frame
+        self._first_pending = bool(first_frame)
+        self._thread = threading.Thread(target=self._fill, daemon=True, name="pcm-jitter-buffer")
+        self._thread.start()
+
+    def _fill(self):
+        try:
+            while not self._closed.is_set():
+                data = self._source.read()
+                if not data:
+                    break  # EOF
+                while not self._closed.is_set():
+                    try:
+                        self._queue.put(data, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue  # buffer full → backpressure; retry until space or closed
+        except Exception:
+            pass
+        finally:
+            self._eof.set()
+
+    def prefill(self, target: int = 15, timeout: float = 0.5):
+        """Block briefly until the buffer has a small cushion (or timeout/EOF)."""
+        end = time.monotonic() + timeout
+        while (self._queue.qsize() < target and not self._eof.is_set()
+               and not self._closed.is_set() and time.monotonic() < end):
+            time.sleep(0.02)
+
+    def read(self) -> bytes:
+        if self._first_pending:
+            self._first_pending = False
+            return self._first_frame
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            if self._eof.is_set():
+                return b""  # stream finished and drained → stop playback
+            return self._SILENCE  # transient underrun → gap, not a rushed catch-up
+
+    def is_opus(self) -> bool:
+        return False
+
+    def cleanup(self):
+        self._closed.set()
+        try:
+            self._source.cleanup()
+        except Exception:
+            pass
 
 
 class AudioPlayer:
@@ -608,8 +815,14 @@ class AudioPlayer:
         if self._debug:
             print(f"[debug][player] EQ set for guild {guild_id}: bass={bass_db}dB treble={treble_db}dB (applies next track)")
 
-    async def play(self, url_or_query: str) -> dict:
+    async def play(self, url_or_query: str, prefetched_info: dict | None = None,
+                   prefetched_at: float = 0.0) -> dict:
         """Resolve a URL/query and start playback. Returns dict with title, thumbnail, webpage_url.
+
+        ``prefetched_info`` is an optional get_audio_url() result resolved earlier
+        (background prefetch or enqueue). When still fresh it is reused instead of
+        resolving again, collapsing the transition resolve to an instant handoff;
+        a stale/revoked cached URL transparently falls back to a fresh resolve.
 
         Architecture: yt-dlp subprocess pipes audio bytes to FFmpeg's stdin (pipe=True).
         FFmpeg only decodes — it never makes HTTP requests to YouTube CDN.
@@ -631,43 +844,114 @@ class AudioPlayer:
         _gen = self._playback_gen
         self.stop_playback()
 
-        # Resolve metadata first (in-process yt-dlp), then start the stream subprocess
-        # with the already-resolved CDN URL so it skips the redundant YouTube API round-trip.
+        # Resolve → stream. A background prefetch / enqueue may already have resolved
+        # this track; reuse that CDN URL while it is comfortably fresh so the transition
+        # skips the ~1.3 s resolve entirely. On a stale/revoked cached URL (immediate
+        # subprocess exit or an empty first frame) we transparently fall back to a fresh
+        # resolve so the user never gets dead air.
         #
-        # Previously both ran concurrently via asyncio.gather, but the subprocess had to
-        # independently resolve the same query (2–5 s Python init + bgutil CLI PO token
-        # overhead), making it the bottleneck regardless.  The new flow:
-        #   1. get_audio_url → resolves query, returns CDN URL + metadata  (~2-5 s)
-        #   2. _start_ytdlp_stream(direct_url=...) → Popen with pre-resolved URL (~instant)
-        # Total latency ≈ step 1 only (step 2 is near-instant), saving 2–5 s per track.
+        # Streaming itself is unchanged: get_audio_url returns the CDN URL, then
+        # _start_ytdlp_stream(direct_url=...) pipes its bytes to FFmpeg's stdin (FFmpeg
+        # never makes HTTP requests to YouTube CDN — that would 403 on its TLS fingerprint).
+        candidate = prefetched_info if is_stream_info_fresh(prefetched_info, prefetched_at) else None
+
+        # EQ / FFmpeg options are independent of the resolved URL — compute once.
+        # Always decode-only (-vn) plus an optional EQ filter chain. When EQ is flat
+        # (0,0) _build_ffmpeg_af_options returns "" so we emit exactly "-vn" (no regression).
+        guild_id_for_eq = self._voice_client.guild.id if (self._voice_client and hasattr(self._voice_client, 'guild')) else None
+        eq_bass, eq_treble = self.get_eq_for_guild(guild_id_for_eq)
+        af_flag = _build_ffmpeg_af_options(eq_bass, eq_treble)
+        ffmpeg_options = "-vn" if not af_flag else f"-vn -af {af_flag}"
         if self._debug:
-            print(f"[debug][player] Resolving audio URL via in-process yt-dlp")
+            print(f"[debug][player] FFmpeg options: {ffmpeg_options}")
 
-        try:
-            info: dict = await loop.run_in_executor(
-                None, get_audio_url_with_retry, url_or_query, yt["client"], self._debug, cookies_file
-            )
-        except Exception as exc:
-            raise exc
+        def _drain_stderr(proc, prefix):
+            """Drain a subprocess stderr pipe to console (prevents full-pipe deadlock)."""
+            try:
+                for raw in proc.stderr:
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    if line:
+                        print(f"{prefix} {line}")
+            except Exception:
+                pass
 
-        if self._debug:
-            print(f"[debug][player] Metadata resolved — starting yt-dlp pipe subprocess with direct URL")
+        info: dict | None = None
+        source = None
+        first_frame = b""
+        for _attempt in range(2):
+            used_cache = candidate is not None
+            if used_cache:
+                info = candidate
+                if self._debug:
+                    print("[debug][player] Using prefetched resolve (skipping in-process yt-dlp)")
+            else:
+                if self._debug:
+                    print("[debug][player] Resolving audio URL via in-process yt-dlp")
+                info = await loop.run_in_executor(
+                    None, get_audio_url_with_retry, url_or_query, yt["client"], self._debug, cookies_file
+                )
 
-        try:
-            proc_result: subprocess.Popen = await loop.run_in_executor(
+            proc = await loop.run_in_executor(
                 None, _start_ytdlp_stream, url_or_query, yt["client"], cookies_file, info["url"]
             )
-        except Exception as exc:
-            raise exc
+            self._ytdlp_proc = proc  # track immediately so a concurrent stop reaps it
 
-        # Guard: subprocess may have exited immediately (e.g. invalid URL passed through).
-        if proc_result.poll() is not None:
-            stderr = proc_result.stderr.read().decode(errors="replace") if proc_result.stderr else ""
-            raise RuntimeError(
-                f"yt-dlp stream subprocess exited {proc_result.returncode} before playback started: {stderr[:500]}"
+            # Subprocess may exit immediately (invalid/expired URL). A cached URL that
+            # fails is re-resolved fresh; a fresh resolve that fails is a hard error.
+            if proc.poll() is not None:
+                stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+                if used_cache:
+                    self._ytdlp_proc = None
+                    candidate = None
+                    if self._debug:
+                        print("[debug][player] Cached stream URL failed immediately — re-resolving fresh")
+                    continue
+                raise RuntimeError(
+                    f"yt-dlp stream subprocess exited {proc.returncode} before playback started: {stderr[:500]}"
+                )
+
+            # Build the FFmpeg source off the event loop — Popen spawn is blocking
+            # (~10-80 ms on Windows with AV) and would otherwise stall every guild.
+            # FFmpeg still reads only from the yt-dlp stdout pipe (pipe=True).
+            proc_stdout = proc.stdout
+            src = await loop.run_in_executor(
+                None,
+                lambda: discord.FFmpegPCMAudio(
+                    proc_stdout,
+                    executable=self._ffmpeg_path,
+                    pipe=True,
+                    options=ffmpeg_options,
+                    stderr=subprocess.PIPE,
+                ),
             )
 
-        self._ytdlp_proc: subprocess.Popen = proc_result
+            # Drain both stderr pipes before priming so a full pipe can't deadlock read().
+            threading.Thread(target=_drain_stderr, args=(src._process, "[ffmpeg]"), daemon=True).start()
+            threading.Thread(target=_drain_stderr, args=(proc, "[yt-dlp-pipe]"), daemon=True).start()
+
+            # Block in the executor until FFmpeg produces its first PCM frame. An empty
+            # frame from a cached URL means the stream produced no audio (stale/revoked) —
+            # tear down and re-resolve fresh. A fresh resolve is accepted as-is.
+            frame = await loop.run_in_executor(None, src.read)
+            if not frame and used_cache:
+                if self._debug:
+                    print("[debug][player] Cached stream URL produced no audio — re-resolving fresh")
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                threading.Thread(target=_reap_process, args=(proc,), daemon=True).start()
+                try:
+                    src.cleanup()
+                except Exception:
+                    pass
+                self._ytdlp_proc = None
+                candidate = None
+                continue
+
+            source = src
+            first_frame = frame
+            break
 
         title = info["title"]
         thumbnail = info.get("thumbnail", "")
@@ -676,51 +960,6 @@ class AudioPlayer:
         if self._debug:
             print(f"[debug][player] Resolved title: {title}")
             print(f"[debug][player] yt-dlp pipe subprocess PID: {self._ytdlp_proc.pid}")
-
-        # FFmpeg reads from yt-dlp's stdout pipe — no HTTP requests to YouTube CDN.
-        # Note: FFmpegPCMAudio already appends -f s16le -ar 48000 -ac 2 pipe:1;
-        # do NOT add -ar/-ac in options or audio will be corrupted.
-        # Build FFmpeg options: always decode-only (-vn), plus optional EQ filter chain.
-        # When EQ is flat (0,0), _build_ffmpeg_af_options returns "" so we emit exactly "-vn" (no regression).
-        guild_id_for_eq = self._voice_client.guild.id if (self._voice_client and hasattr(self._voice_client, 'guild')) else None
-        eq_bass, eq_treble = self.get_eq_for_guild(guild_id_for_eq)
-        af_flag = _build_ffmpeg_af_options(eq_bass, eq_treble)
-        ffmpeg_options = "-vn" if not af_flag else f"-vn -af {af_flag}"
-        if self._debug:
-            print(f"[debug][player] FFmpeg options: {ffmpeg_options}")
-        source = discord.FFmpegPCMAudio(
-            self._ytdlp_proc.stdout,
-            executable=self._ffmpeg_path,
-            pipe=True,
-            options=ffmpeg_options,
-            stderr=subprocess.PIPE,
-        )
-
-        # Log FFmpeg stderr in background so errors are visible in console
-        def _log_ffmpeg_stderr(proc):
-            try:
-                for raw in proc.stderr:
-                    line = raw.decode("utf-8", errors="replace").rstrip()
-                    if line:
-                        print(f"[ffmpeg] {line}")
-            except Exception:
-                pass
-        threading.Thread(
-            target=_log_ffmpeg_stderr, args=(source._process,), daemon=True
-        ).start()
-
-        # Log yt-dlp subprocess stderr (PO token messages, format selection, errors)
-        def _log_ytdlp_pipe_stderr(proc):
-            try:
-                for raw in proc.stderr:
-                    line = raw.decode("utf-8", errors="replace").rstrip()
-                    if line:
-                        print(f"[yt-dlp-pipe] {line}")
-            except Exception:
-                pass
-        threading.Thread(
-            target=_log_ytdlp_pipe_stderr, args=(self._ytdlp_proc,), daemon=True
-        ).start()
 
         self.is_playing = True
         self.is_paused = False
@@ -738,11 +977,12 @@ class AudioPlayer:
             self.current_track_title = None
             loop.call_soon_threadsafe(self._playback_done.set)
 
-        # Block in the executor until FFmpeg produces its first PCM frame, then
-        # hand discord.py a pre-primed source whose first read() is instant.
-        first_frame = await loop.run_in_executor(None, source.read)
-        if first_frame:
-            source = _PrimedAudioSource(source, first_frame)
+        # Wrap in a jitter buffer: a background thread pre-buffers PCM so the audio
+        # thread never blocks on a pipeline stall (which makes it rush/catch-up).
+        # The already-read first_frame is emitted first; a short prefill builds a
+        # small cushion before playback starts.
+        source = _BufferedAudioSource(source, first_frame=first_frame)
+        await loop.run_in_executor(None, source.prefill)
 
         # Configure Opus encoder before play() so first frames use music settings.
         # discord.py defaults: fec=True, expected_packet_loss=0.15, signal_type='auto'
@@ -793,17 +1033,19 @@ class AudioPlayer:
         self.current_duration = None
         if self._voice_client and (self._voice_client.is_playing() or self._voice_client.is_paused()):
             self._voice_client.stop()
-        # Terminate the yt-dlp pipe subprocess (frees network connection and CPU)
+        # Terminate the yt-dlp pipe subprocess (frees network connection and CPU).
+        # terminate() is instant; the wait()/kill() reap runs on a daemon thread so a
+        # slow-dying subprocess never freezes the event loop mid-skip. The local handle
+        # is already detached from self._ytdlp_proc, so the reaper cannot race the next
+        # track's subprocess.
         ytdlp_proc = self._ytdlp_proc
         self._ytdlp_proc = None
         if ytdlp_proc and ytdlp_proc.poll() is None:
             try:
                 ytdlp_proc.terminate()
-                ytdlp_proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                ytdlp_proc.kill()
             except Exception:
                 pass
+            threading.Thread(target=_reap_process, args=(ytdlp_proc,), daemon=True).start()
         self._playback_done.set()
 
     async def play_radio(self, track) -> dict:
@@ -840,16 +1082,21 @@ class AudioPlayer:
         #   Without these, FFmpeg blocks for up to 5s before emitting the first PCM frame;
         #   discord.py's AudioPlayer thread sets its clock before that first read, so it rushes
         #   every subsequent frame with delay=0 — audible as choppy/robotic audio at stream start.
-        source = discord.FFmpegPCMAudio(
-            stream_url,
-            executable=self._ffmpeg_path,
-            before_options=(
-                "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
-                "-reconnect_at_eof 1 "
-                "-probesize 32k -analyzeduration 0"
+        # Build the FFmpeg source off the event loop — Popen spawn is blocking and
+        # would otherwise stall every guild's interactions during a radio start.
+        source = await loop.run_in_executor(
+            None,
+            lambda: discord.FFmpegPCMAudio(
+                stream_url,
+                executable=self._ffmpeg_path,
+                before_options=(
+                    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+                    "-reconnect_at_eof 1 "
+                    "-probesize 32k -analyzeduration 0"
+                ),
+                options="-vn",
+                stderr=subprocess.PIPE,
             ),
-            options="-vn",
-            stderr=subprocess.PIPE,
         )
 
         def _log_ffmpeg_stderr(proc):
