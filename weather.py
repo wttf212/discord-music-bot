@@ -45,6 +45,27 @@ def get_weather(lat: float, lon: float, label: str = "Weather") -> str | None:
         return None
 
 
+def get_hourly_sky(lat: float, lon: float):
+    """Return [(iso_utc, cloud_cover%, is_day 0/1), ...] for the next ~2 days,
+    or None. Used by the aurora viewing-window forecast (needs darkness + clouds)."""
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+        f"&hourly=cloud_cover,is_day&forecast_days=2&timezone=UTC"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "discord-music-bot"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        h = data.get("hourly", {}) or {}
+        times = h.get("time") or []
+        clouds = h.get("cloud_cover") or []
+        days = h.get("is_day") or []
+        out = [(t, c, d) for t, c, d in zip(times, clouds, days)]
+        return out or None
+    except Exception:
+        return None
+
+
 def geocode(name: str):
     """Resolve a place name to (display_name, lat, lon), or None if not found."""
     url = "https://geocoding-api.open-meteo.com/v1/search?" + urllib.parse.urlencode(

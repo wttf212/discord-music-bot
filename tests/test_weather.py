@@ -70,5 +70,21 @@ class TestGeocode(unittest.TestCase):
             self.assertIsNone(weather.geocode("x"))
 
 
+class TestHourlySky(unittest.TestCase):
+    def test_parses_hourly(self):
+        payload = json.dumps({"hourly": {
+            "time": ["2026-01-15T18:00", "2026-01-15T19:00"],
+            "cloud_cover": [10, 90],
+            "is_day": [0, 1],
+        }}).encode()
+        with patch("weather.urllib.request.urlopen", return_value=_FakeResp(payload)):
+            out = weather.get_hourly_sky(56.95, 24.11)
+        self.assertEqual(out, [("2026-01-15T18:00", 10, 0), ("2026-01-15T19:00", 90, 1)])
+
+    def test_error_returns_none(self):
+        with patch("weather.urllib.request.urlopen", side_effect=Exception("boom")):
+            self.assertIsNone(weather.get_hourly_sky(1, 2))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

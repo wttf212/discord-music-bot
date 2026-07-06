@@ -1185,7 +1185,11 @@ class PlayerView(discord.ui.LayoutView):
         w = _weather_text_for(loc)
         if w:
             sky.append(w)
-        a = aurora.format_aurora(aurora.aurora_at(_aurora_cache.get("grid"), loc["lat"], loc["lon"]))
+        a = aurora.forecast_line(
+            _kp_cache.get("list"),
+            _sky_cache.get(_loc_key(loc["lat"], loc["lon"]), {}).get("hourly"),
+            loc["lat"], loc["lon"], tz,
+        )
         if a:
             sky.append(a)
         if sky:
@@ -1287,8 +1291,10 @@ _f1_cache = {"race": None, "ts": 0.0, "busy": False}
 _F1_TTL = 3600.0           # 1 hour (the schedule changes rarely)
 _rocket_cache = {"launch": None, "ts": 0.0, "busy": False}
 _ROCKET_TTL = 7200.0       # 2 hours (Launch Library anon throttle is ~15/hr)
-_aurora_cache = {"grid": None, "ts": 0.0, "busy": False}
-_AURORA_TTL = 1800.0       # 30 minutes (OVATION updates ~every 5 min)
+_kp_cache = {"list": None, "ts": 0.0, "busy": False}   # NOAA Kp forecast (global)
+_KP_TTL = 3600.0           # 1 hour
+_sky_cache: dict = {}      # "lat,lon" -> {"hourly", "ts", "busy"} (cloud + day/night)
+_SKY_TTL = 1800.0          # 30 minutes
 
 
 def _loc_key(lat, lon) -> str:
@@ -1355,21 +1361,47 @@ async def _refresh_rocket_if_stale():
         _rocket_cache["busy"] = False
 
 
-async def _refresh_aurora_if_stale():
-    """Fetch the OVATION aurora grid in the background if the cache is stale."""
+async def _refresh_kp_if_stale():
+    """Fetch NOAA's Kp forecast in the background if the cache is stale (global)."""
     now = time.monotonic()
-    if _aurora_cache["busy"] or (_aurora_cache["ts"] and now - _aurora_cache["ts"] < _AURORA_TTL):
+    if _kp_cache["busy"] or (_kp_cache["ts"] and now - _kp_cache["ts"] < _KP_TTL):
         return
-    _aurora_cache["busy"] = True
-    _aurora_cache["ts"] = now
+    _kp_cache["busy"] = True
+    _kp_cache["ts"] = now
     try:
-        grid = await asyncio.get_event_loop().run_in_executor(None, aurora.get_aurora_grid)
-        if grid:
-            _aurora_cache["grid"] = grid
+        lst = await asyncio.get_event_loop().run_in_executor(None, aurora.get_kp_forecast)
+        if lst:
+            _kp_cache["list"] = lst
     except Exception:
         pass
     finally:
-        _aurora_cache["busy"] = False
+        _kp_cache["busy"] = False
+
+
+async def _refresh_sky_for(location: dict):
+    """Fetch hourly cloud + day/night for one location (for the aurora forecast)."""
+    key = _loc_key(location["lat"], location["lon"])
+    entry = _sky_cache.setdefault(key, {"hourly": None, "ts": 0.0, "busy": False})
+    now = time.monotonic()
+    if entry["busy"] or (entry["ts"] and now - entry["ts"] < _SKY_TTL):
+        return
+    entry["busy"] = True
+    entry["ts"] = now
+    try:
+        hourly = await asyncio.get_event_loop().run_in_executor(
+            None, weather.get_hourly_sky, location["lat"], location["lon"]
+        )
+        if hourly:
+            entry["hourly"] = hourly
+    except Exception:
+        pass
+    finally:
+        entry["busy"] = False
+
+
+async def _refresh_sky_if_stale(bot, guild_id):
+    """Refresh the hourly sky for a guild's configured location."""
+    await _refresh_sky_for(get_display_prefs(str(guild_id))["location"])
 
 
 def _build_grab_embed(gs, track) -> discord.Embed:
@@ -1659,9 +1691,10 @@ async def send_new_np(bot, channel_id: int, view: "PlayerView"):
 
     # Keep the card flourishes reasonably fresh (background, no-op if recent).
     asyncio.create_task(_refresh_weather_if_stale(bot, guild_id))
+    asyncio.create_task(_refresh_sky_if_stale(bot, guild_id))
     asyncio.create_task(_refresh_f1_if_stale())
     asyncio.create_task(_refresh_rocket_if_stale())
-    asyncio.create_task(_refresh_aurora_if_stale())
+    asyncio.create_task(_refresh_kp_if_stale())
 
     # Reset votes whenever a new NP message is sent / track changes
     gs.prev_votes.clear()
@@ -2437,7 +2470,9 @@ class MusicCog(commands.Cog):
             return
         name, lat, lon = geo
         set_weather_location(gid, name, lat, lon)
-        await _refresh_weather_for({"name": name, "lat": lat, "lon": lon})
+        new_loc = {"name": name, "lat": lat, "lon": lon}
+        await _refresh_weather_for(new_loc)
+        await _refresh_sky_for(new_loc)
         await ctx.send(f"Weather location set to **{name}**.")
         await self._refresh_np_card(ctx)
 
@@ -3037,6 +3072,7 @@ async def setup(bot):
     await bot.add_cog(MusicCog(bot))
     # Warm the flourish caches so the first card shows them.
     asyncio.create_task(_refresh_weather_for(dict(DEFAULT_WEATHER_LOCATION)))
+    asyncio.create_task(_refresh_sky_for(dict(DEFAULT_WEATHER_LOCATION)))
     asyncio.create_task(_refresh_f1_if_stale())
     asyncio.create_task(_refresh_rocket_if_stale())
-    asyncio.create_task(_refresh_aurora_if_stale())
+    asyncio.create_task(_refresh_kp_if_stale())
