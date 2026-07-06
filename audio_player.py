@@ -1,4 +1,5 @@
 import asyncio
+import queue
 import random
 import shutil
 import socket
@@ -675,6 +676,87 @@ class _PrimedAudioSource(discord.AudioSource):
         self._source.cleanup()
 
 
+# One 20 ms Discord voice frame = 48000 Hz * 0.02 s * 2 channels * 2 bytes (s16le).
+try:
+    from discord.opus import Encoder as _OpusEncoder
+    _PCM_FRAME_SIZE = _OpusEncoder.FRAME_SIZE
+except Exception:  # pragma: no cover - libopus/discord internals absent
+    _PCM_FRAME_SIZE = 3840
+
+
+class _BufferedAudioSource(discord.AudioSource):
+    """Jitter buffer that decouples discord.py's real-time audio thread from
+    yt-dlp/FFmpeg pipeline stalls.
+
+    A daemon thread pre-reads PCM frames from the wrapped source into a bounded
+    queue. read() pops a ready frame (near-instant), so the player thread never
+    blocks on the pipe — which is what makes it fall behind and then rush frames
+    to catch up (audible fast-forward). On a rare underrun (buffer momentarily
+    empty but stream not finished) it returns a silent frame instead of blocking:
+    a tiny gap rather than a speed-up. On EOF it returns b'' so playback ends.
+
+    The bounded queue also applies backpressure: when full, the reader blocks, so
+    FFmpeg/yt-dlp pause — memory stays bounded (~buffer_frames * 3840 bytes).
+    """
+
+    _SILENCE = b"\x00" * _PCM_FRAME_SIZE
+
+    def __init__(self, source, first_frame: bytes = b"", buffer_frames: int = 400):
+        self._source = source
+        self._queue: queue.Queue = queue.Queue(maxsize=buffer_frames)
+        self._eof = threading.Event()
+        self._closed = threading.Event()
+        self._first_frame = first_frame
+        self._first_pending = bool(first_frame)
+        self._thread = threading.Thread(target=self._fill, daemon=True, name="pcm-jitter-buffer")
+        self._thread.start()
+
+    def _fill(self):
+        try:
+            while not self._closed.is_set():
+                data = self._source.read()
+                if not data:
+                    break  # EOF
+                while not self._closed.is_set():
+                    try:
+                        self._queue.put(data, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue  # buffer full → backpressure; retry until space or closed
+        except Exception:
+            pass
+        finally:
+            self._eof.set()
+
+    def prefill(self, target: int = 15, timeout: float = 0.5):
+        """Block briefly until the buffer has a small cushion (or timeout/EOF)."""
+        end = time.monotonic() + timeout
+        while (self._queue.qsize() < target and not self._eof.is_set()
+               and not self._closed.is_set() and time.monotonic() < end):
+            time.sleep(0.02)
+
+    def read(self) -> bytes:
+        if self._first_pending:
+            self._first_pending = False
+            return self._first_frame
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            if self._eof.is_set():
+                return b""  # stream finished and drained → stop playback
+            return self._SILENCE  # transient underrun → gap, not a rushed catch-up
+
+    def is_opus(self) -> bool:
+        return False
+
+    def cleanup(self):
+        self._closed.set()
+        try:
+            self._source.cleanup()
+        except Exception:
+            pass
+
+
 class AudioPlayer:
     """Audio player using discord.py VoiceClient + FFmpegPCMAudio.
 
@@ -895,9 +977,12 @@ class AudioPlayer:
             self.current_track_title = None
             loop.call_soon_threadsafe(self._playback_done.set)
 
-        # Hand discord.py a pre-primed source whose first read() is instant.
-        if first_frame:
-            source = _PrimedAudioSource(source, first_frame)
+        # Wrap in a jitter buffer: a background thread pre-buffers PCM so the audio
+        # thread never blocks on a pipeline stall (which makes it rush/catch-up).
+        # The already-read first_frame is emitted first; a short prefill builds a
+        # small cushion before playback starts.
+        source = _BufferedAudioSource(source, first_frame=first_frame)
+        await loop.run_in_executor(None, source.prefill)
 
         # Configure Opus encoder before play() so first frames use music settings.
         # discord.py defaults: fec=True, expected_packet_loss=0.15, signal_type='auto'
