@@ -831,6 +831,9 @@ class _ControlsRow(discord.ui.ActionRow):
     @discord.ui.button(label="◄", style=discord.ButtonStyle.primary, custom_id="btn_prev")  # ◄
     async def prev_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.view.evaluate_vote(interaction, "prev"): return
+        if _on_cooldown(interaction.guild_id, interaction.user.id, "skip", 2.0):
+            await interaction.response.send_message("Easy on the skip — give it a moment.", ephemeral=True)
+            return
         await interaction.response.defer()
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
@@ -865,6 +868,9 @@ class _ControlsRow(discord.ui.ActionRow):
     @discord.ui.button(label="►", style=discord.ButtonStyle.primary, custom_id="btn_next")  # ►
     async def next_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.view.evaluate_vote(interaction, "next"): return
+        if _on_cooldown(interaction.guild_id, interaction.user.id, "skip", 2.0):
+            await interaction.response.send_message("Easy on the skip — give it a moment.", ephemeral=True)
+            return
         await interaction.response.defer()
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
@@ -987,6 +993,9 @@ class _SecondaryRow(discord.ui.ActionRow):
 
     @discord.ui.button(label="Loop: Off", style=discord.ButtonStyle.secondary, custom_id="btn_loop")
     async def loop_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if _on_cooldown(interaction.guild_id, interaction.user.id, "loop", 1.0):
+            await interaction.response.send_message("One moment…", ephemeral=True)
+            return
         gs = self.view.bot.get_guild_state(interaction.guild_id)
         gs.queue.cycle_loop()
         kwargs = {**self.view._kwargs, "queue_tracks": gs.queue.preview_fair_order()}
@@ -994,6 +1003,9 @@ class _SecondaryRow(discord.ui.ActionRow):
 
     @discord.ui.button(label="Shuffle", style=discord.ButtonStyle.secondary, custom_id="btn_shuffle")
     async def shuffle_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if _on_cooldown(interaction.guild_id, interaction.user.id, "shuffle", 1.5):
+            await interaction.response.send_message("One moment…", ephemeral=True)
+            return
         gs = self.view.bot.get_guild_state(interaction.guild_id)
         gs.queue.shuffle()
         kwargs = {**self.view._kwargs, "queue_tracks": gs.queue.preview_fair_order()}
@@ -1001,6 +1013,9 @@ class _SecondaryRow(discord.ui.ActionRow):
 
     @discord.ui.button(label="Grab", style=discord.ButtonStyle.secondary, custom_id="btn_grab")
     async def grab_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if _on_cooldown(interaction.guild_id, interaction.user.id, "grab", 3.0):
+            await interaction.response.send_message("You just grabbed this — give it a moment.", ephemeral=True)
+            return
         gs = self.view.bot.get_guild_state(interaction.guild_id)
         current = gs.queue.current
         if not current or not gs.player.is_playing:
@@ -1347,6 +1362,23 @@ def _discard_future(fut):
         fut.add_done_callback(_swallow)
     except Exception:
         pass
+
+
+# Per-(guild, user, action) button cooldowns. Stops machine-gunning the card
+# buttons — most importantly next/prev, which resolve a track via the YouTube API
+# on a cache-miss (a burst of skips = a burst of /player calls). Shuffle/loop are
+# in-memory + a Discord edit; grab sends a DM; the cooldown keeps all of them civil.
+_button_cooldowns: dict = {}
+
+
+def _on_cooldown(guild_id, user_id, action: str, seconds: float) -> bool:
+    """True (and blocks) if this user triggered this action within `seconds`."""
+    key = (guild_id, user_id, action)
+    now = time.monotonic()
+    if now - _button_cooldowns.get(key, 0.0) < seconds:
+        return True
+    _button_cooldowns[key] = now
+    return False
 
 
 async def check_channel(ctx: commands.Context) -> bool:
