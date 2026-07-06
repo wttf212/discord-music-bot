@@ -2,6 +2,7 @@ import asyncio
 import http.client
 import json
 import re
+import time
 import urllib.parse
 import urllib.request
 import discord
@@ -9,7 +10,10 @@ import yt_dlp
 from discord.ext import commands
 from discord import app_commands
 from track_queue import Track
-from audio_player import is_playlist_url, extract_playlist_info, get_audio_url_with_retry
+from audio_player import (
+    is_playlist_url, extract_playlist_info, get_audio_url_with_retry,
+    is_stream_info_fresh,
+)
 from guild_settings import (
     get_allowed_channel, set_allowed_channel,
     get_bitrate, set_bitrate,
@@ -807,7 +811,7 @@ class _ControlsRow(discord.ui.ActionRow):
         gs.player.stop_playback()
 
         try:
-            info = await gs.player.play(prev_track.query)
+            info = await gs.player.play(prev_track.query, prev_track.resolved_info, prev_track.resolved_at)
             title = info["title"]
             prev_track.title = title
             prev_track.thumbnail = info.get("thumbnail", "")
@@ -837,7 +841,7 @@ class _ControlsRow(discord.ui.ActionRow):
         next_track = gs.queue.next()
         if next_track:
             try:
-                info = await gs.player.play(next_track.query)
+                info = await gs.player.play(next_track.query, next_track.resolved_info, next_track.resolved_at)
                 title = info["title"]
                 next_track.title = title
                 next_track.thumbnail = info.get("thumbnail", "")
@@ -921,6 +925,7 @@ class _LoadPlaylistRow(discord.ui.ActionRow):
         for t in tracks:
             track = Track(query=t["url"], title=t["title"], requested_by=user_id, url=t["url"])
             gs.queue.add(track)
+        _schedule_prefetch(bot, guild_id)
 
         current = gs.queue.current
         if current:
@@ -1175,8 +1180,67 @@ async def update_np_stopped(bot, channel_id: int):
         print(f"[commands] Failed to update stopped NP card: {e}")
 
 
+# --- Next-track prefetch (fair-play aware, anti-ban throttled) -----------------
+#
+# While the current track plays, resolve the CDN URL of the track fair-play will
+# pick NEXT, so the transition skips the ~1.3s resolve. Anti-ban safeguards:
+#   * only ONE track ahead is ever prefetched;
+#   * only one prefetch runs at a time per guild (prefetch_task guard);
+#   * a global minimum interval floors how often prefetch resolves may fire, so a
+#     burst of skips/queue-adds can't hammer YouTube;
+#   * a track that already holds a fresh cached resolve is skipped;
+#   * the cached result REPLACES the play-time resolve (AudioPlayer.play reuses it),
+#     so this does NOT add API calls per track — it just moves the one resolve
+#     earlier in time.
+_PREFETCH_MIN_INTERVAL = 8.0  # seconds; global floor between prefetch resolves
+_last_prefetch_monotonic = 0.0
+
+
+async def _prefetch_next_track(bot, guild_id):
+    """Resolve the fair-play-predicted next track's CDN URL in the background."""
+    global _last_prefetch_monotonic
+    gs = bot.get_guild_state(guild_id)
+    try:
+        upcoming = gs.queue.preview_fair_order(1)
+        if not upcoming:
+            return
+        track = upcoming[0]
+        if track.is_radio:
+            return
+        # Already have a still-fresh resolve for this exact track — don't refetch.
+        if track.resolved_info and is_stream_info_fresh(track.resolved_info, track.resolved_at):
+            return
+        # Global rate-limit: never let prefetch resolves cluster (protects the IP).
+        now = time.monotonic()
+        if now - _last_prefetch_monotonic < _PREFETCH_MIN_INTERVAL:
+            return
+        _last_prefetch_monotonic = now
+
+        yt_client = bot.config.get("youtube", {}).get("client", "web")
+        cookies_file = bot.config.get("youtube", {}).get("cookies_file") or None
+        info = await asyncio.get_event_loop().run_in_executor(
+            None, get_audio_url_with_retry, track.query, yt_client, False, cookies_file
+        )
+        track.resolved_info = info
+        track.resolved_at = time.time()
+    except Exception as e:
+        print(f"[commands] Prefetch failed (will resolve at play time): {e}")
+
+
+def _schedule_prefetch(bot, guild_id):
+    """Kick off a single-in-flight background prefetch of the next track."""
+    gs = bot.get_guild_state(guild_id)
+    if gs.prefetch_task and not gs.prefetch_task.done():
+        return  # one already running
+    gs.prefetch_task = asyncio.create_task(_prefetch_next_track(bot, guild_id))
+
+
 async def _resolve_track_info(bot, channel_id: int, track: Track):
-    """Silently resolve missing track metadata via yt-dlp and update the NP embed."""
+    """Silently resolve missing track metadata via yt-dlp and update the NP embed.
+
+    Also caches the full resolve (CDN URL + metadata) on the Track so the eventual
+    play() reuses it instead of resolving again — one resolve, not two.
+    """
     if track.url:  # Already resolved
         return
     try:
@@ -1188,6 +1252,8 @@ async def _resolve_track_info(bot, channel_id: int, track: Track):
         track.title = info["title"]
         track.thumbnail = info.get("thumbnail", "")
         track.url = info.get("webpage_url", "")
+        track.resolved_info = info
+        track.resolved_at = time.time()
 
         _ch = bot.get_channel(channel_id)
         guild_id = _ch.guild.id if _ch and hasattr(_ch, 'guild') and _ch.guild else None
@@ -1423,6 +1489,7 @@ class MusicCog(commands.Cog):
                 # Add the first track to the queue silently
                 track = Track(query=first_track_info["url"], title=first_track_info["title"], requested_by=user_id, url=first_track_info["url"])
                 gs.queue.add(track)
+                _schedule_prefetch(self.bot, ctx.guild.id)
 
                 count = len(remaining_tracks)
                 if count > 0:
@@ -1771,7 +1838,7 @@ class MusicCog(commands.Cog):
         next_track = gs.queue.next()
         if next_track:
             try:
-                info = await gs.player.play(next_track.query)
+                info = await gs.player.play(next_track.query, next_track.resolved_info, next_track.resolved_at)
                 title = info["title"]
                 next_track.title = title
                 next_track.thumbnail = info.get("thumbnail", "")
@@ -1857,12 +1924,15 @@ class MusicCog(commands.Cog):
 
         await ctx.send(f"Added **{len(tracks)}** tracks to the queue.")
 
+        # Prefetch the next track's CDN URL (no-op if playback start below already did).
+        _schedule_prefetch(self.bot, ctx.guild.id)
+
         # Start playback if nothing is currently playing
         if not gs.player.is_playing:
             next_track = gs.queue.next()
             if next_track:
                 try:
-                    info = await gs.player.play(next_track.query)
+                    info = await gs.player.play(next_track.query, next_track.resolved_info, next_track.resolved_at)
                     title = info["title"]
                     next_track.title = title
                     next_track.thumbnail = info.get("thumbnail", "")
@@ -2143,6 +2213,8 @@ def _start_auto_next(bot, channel_id, guild_id):
     gen = gs.auto_next_gen + 1
     gs.auto_next_gen = gen
     gs.auto_next_task = asyncio.create_task(_auto_next(bot, channel_id, guild_id, gen))
+    # Current track just (re)started — prefetch the predicted next track's CDN URL.
+    _schedule_prefetch(bot, guild_id)
 
 
 async def _auto_next(bot, channel_id, guild_id, generation):
@@ -2167,7 +2239,9 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 await update_np_stopped(bot, channel_id)
                 break
             try:
-                info = await gs.player.play(next_track.query)
+                info = await gs.player.play(
+                    next_track.query, next_track.resolved_info, next_track.resolved_at
+                )
                 title = info["title"]
                 next_track.title = title
                 next_track.thumbnail = info.get("thumbnail", "")
@@ -2180,6 +2254,8 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                                         queue_tracks=gs.queue.preview_fair_order(),
                                         guild_id=guild_id)
                 await send_new_np(bot, channel_id, view)
+                # Prefetch the following track while this one plays.
+                _schedule_prefetch(bot, guild_id)
             except Exception as e:
                 consecutive_errors += 1
                 channel = bot.get_channel(channel_id)

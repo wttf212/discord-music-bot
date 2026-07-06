@@ -50,6 +50,7 @@ class GuildState:
     auto_next_task: asyncio.Task | None = None
     auto_next_gen: int = 0
     empty_channel_task: asyncio.Task | None = None
+    prefetch_task: asyncio.Task | None = None
     np_message_id: int | None = None
     current_text_channel_id: int | None = None
     fairness_pct: int = 50
