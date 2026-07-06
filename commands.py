@@ -981,21 +981,21 @@ class _SecondaryRow(discord.ui.ActionRow):
     queue; the button's colour/label reflect the mode (set in PlayerView._build).
     """
 
-    @discord.ui.button(label="↻", style=discord.ButtonStyle.secondary, custom_id="btn_loop")
+    @discord.ui.button(label="Loop: Off", style=discord.ButtonStyle.secondary, custom_id="btn_loop")
     async def loop_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         gs = self.view.bot.get_guild_state(interaction.guild_id)
         gs.queue.cycle_loop()
         kwargs = {**self.view._kwargs, "queue_tracks": gs.queue.preview_fair_order()}
         await interaction.response.edit_message(view=build_player_view(self.view.bot, **kwargs))
 
-    @discord.ui.button(label="⇄", style=discord.ButtonStyle.secondary, custom_id="btn_shuffle")
+    @discord.ui.button(label="Shuffle", style=discord.ButtonStyle.secondary, custom_id="btn_shuffle")
     async def shuffle_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         gs = self.view.bot.get_guild_state(interaction.guild_id)
         gs.queue.shuffle()
         kwargs = {**self.view._kwargs, "queue_tracks": gs.queue.preview_fair_order()}
         await interaction.response.edit_message(view=build_player_view(self.view.bot, **kwargs))
 
-    @discord.ui.button(label="⤓", style=discord.ButtonStyle.secondary, custom_id="btn_grab")
+    @discord.ui.button(label="Grab", style=discord.ButtonStyle.secondary, custom_id="btn_grab")
     async def grab_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         gs = self.view.bot.get_guild_state(interaction.guild_id)
         current = gs.queue.current
@@ -1124,11 +1124,11 @@ class PlayerView(discord.ui.LayoutView):
             for _item in secondary.children:
                 if getattr(_item, "custom_id", None) == "btn_loop":
                     if loop_mode == "track":
-                        _item.style, _item.label = discord.ButtonStyle.success, "↻ one"
+                        _item.style, _item.label = discord.ButtonStyle.success, "Loop: Song"
                     elif loop_mode == "queue":
-                        _item.style, _item.label = discord.ButtonStyle.success, "↻ all"
+                        _item.style, _item.label = discord.ButtonStyle.success, "Loop: Queue"
                     else:
-                        _item.style, _item.label = discord.ButtonStyle.secondary, "↻"
+                        _item.style, _item.label = discord.ButtonStyle.secondary, "Loop: Off"
             c.add_item(secondary)
 
             # Add the Load row when any pending playlist exists for this guild.
