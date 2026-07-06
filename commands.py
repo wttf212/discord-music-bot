@@ -1194,10 +1194,13 @@ async def check_channel(ctx: commands.Context) -> bool:
 
 
 async def _do_update_np_embed(bot, channel, msg_id, view):
-    """Helper to update the NP card (Components V2 view) in a separate task."""
+    """Helper to update the NP card (Components V2 view) in a separate task.
+
+    Uses a partial message (no fetch round-trip) — only the message ID is needed
+    to edit, and the view is re-registered for button dispatch on edit.
+    """
     try:
-        msg = await channel.fetch_message(msg_id)
-        await msg.edit(view=view)
+        await channel.get_partial_message(msg_id).edit(view=view)
     except Exception as e:
         print(f"[commands] Failed to update NP card: {e}")
 
@@ -1226,8 +1229,7 @@ async def update_np_stopped(bot, channel_id: int):
         return
     view = build_player_view(bot, title="", finished=True, guild_id=guild_id)
     try:
-        msg = await channel.fetch_message(msg_id)
-        await msg.edit(view=view)
+        await channel.get_partial_message(msg_id).edit(view=view)
     except Exception as e:
         print(f"[commands] Failed to update stopped NP card: {e}")
 
@@ -1341,13 +1343,10 @@ async def send_new_np(bot, channel_id: int, view: "PlayerView"):
     gs.stop_votes.clear()
     gs.next_votes.clear()
 
+    # Delete the old card concurrently with sending the new one (no fetch round-trip).
     old_msg_id = gs.np_message_id
     if old_msg_id:
-        try:
-            old_msg = await channel.fetch_message(old_msg_id)
-            await old_msg.delete()
-        except Exception:
-            pass
+        asyncio.create_task(_safe_delete(channel.get_partial_message(old_msg_id)))
 
     try:
         new_msg = await channel.send(view=view)
