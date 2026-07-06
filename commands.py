@@ -15,6 +15,7 @@ from audio_player import (
     is_stream_info_fresh, get_related_tracks,
 )
 from spotify import is_spotify_url, resolve_spotify, SpotifyError
+import weather
 from guild_settings import (
     get_allowed_channel, set_allowed_channel,
     get_bitrate, set_bitrate,
@@ -1150,7 +1151,9 @@ class PlayerView(discord.ui.LayoutView):
         requester = _plain_names(bot, guild, self._requester_name)
         loop_suffix = "" if loop_mode == "off" else f" · Loop {loop_mode}"
         autoplay_suffix = " · Autoplay" if (gs and gs.autoplay) else ""
-        foot = "-# " + (f"Track requested by {requester} · " if requester else "") + f"{kbps}kbps · EQ {eq_label}{loop_suffix}{autoplay_suffix}"
+        weather_suffix = f" · {_weather_cache['text']}" if _weather_cache["text"] else ""
+        foot = ("-# " + (f"Track requested by {requester} · " if requester else "")
+                + f"{kbps}kbps · EQ {eq_label}{loop_suffix}{autoplay_suffix}{weather_suffix}")
         c.add_item(discord.ui.TextDisplay(foot))
 
         self.add_item(c)
@@ -1229,6 +1232,34 @@ def _plain_names(bot, guild, text: str) -> str:
     if not text or "<@" not in text:
         return text
     return _MENTION_RE.sub(lambda m: _get_requester_name(bot, m.group(1), guild) or "someone", text)
+
+
+# --- Riga weather (footer flourish) -------------------------------------------
+# Cached with a TTL and refreshed off-loop; the card build only reads the cache,
+# so it never blocks the event loop or hits the network on every render.
+_weather_cache = {"text": "", "ts": 0.0}
+_weather_refreshing = False
+_WEATHER_TTL = 600.0  # 10 minutes
+
+
+async def _refresh_weather_if_stale():
+    """Fetch Riga weather in the background if the cache is stale (no-op otherwise)."""
+    global _weather_refreshing
+    now = time.monotonic()
+    if _weather_refreshing:
+        return
+    if _weather_cache["ts"] and (now - _weather_cache["ts"] < _WEATHER_TTL):
+        return
+    _weather_refreshing = True
+    _weather_cache["ts"] = now  # throttle attempts (success or failure) to the TTL
+    try:
+        text = await asyncio.get_event_loop().run_in_executor(None, weather.get_riga_weather)
+        if text:
+            _weather_cache["text"] = text
+    except Exception:
+        pass
+    finally:
+        _weather_refreshing = False
 
 
 def _build_grab_embed(gs, track) -> discord.Embed:
@@ -1498,6 +1529,9 @@ async def send_new_np(bot, channel_id: int, view: "PlayerView"):
         return
     guild_id = channel.guild.id
     gs = bot.get_guild_state(guild_id)
+
+    # Keep the footer's Riga weather reasonably fresh (background, no-op if recent).
+    asyncio.create_task(_refresh_weather_if_stale())
 
     # Reset votes whenever a new NP message is sent / track changes
     gs.prev_votes.clear()
@@ -2822,3 +2856,4 @@ async def _auto_next(bot, channel_id, guild_id, generation):
 
 async def setup(bot):
     await bot.add_cog(MusicCog(bot))
+    asyncio.create_task(_refresh_weather_if_stale())  # warm the Riga weather cache
