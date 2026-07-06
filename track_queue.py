@@ -11,6 +11,11 @@ class Track:
     thumbnail: str = ""
     url: str = ""
     is_radio: bool = False
+    # Cached full get_audio_url() result (CDN URL + metadata) from a background
+    # prefetch/enqueue resolve, so the eventual play() can skip the ~1.3s resolve.
+    # resolved_at is wall-clock (time.time()) for TTL fallback freshness checks.
+    resolved_info: dict | None = None
+    resolved_at: float = 0.0
 
 
 class TrackQueue:
