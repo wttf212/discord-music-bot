@@ -1,4 +1,4 @@
-"""Tests for the Riga weather footer helper (network mocked)."""
+"""Tests for the weather helpers (network mocked)."""
 import json
 import os
 import sys
@@ -24,33 +24,50 @@ class _FakeResp:
         return False
 
 
-def _payload(temp, code):
+def _wx(temp, code):
     cur = {"temperature_2m": temp}
     if code is not None:
         cur["weather_code"] = code
     return json.dumps({"current": cur}).encode()
 
 
-class TestGetRigaWeather(unittest.TestCase):
-    def test_known_code(self):
-        with patch("weather.urllib.request.urlopen", return_value=_FakeResp(_payload(3.4, 61))):
-            self.assertEqual(weather.get_riga_weather(), "Riga 3°C, light rain")
+class TestGetWeather(unittest.TestCase):
+    def test_known_code_with_label(self):
+        with patch("weather.urllib.request.urlopen", return_value=_FakeResp(_wx(3.4, 61))):
+            self.assertEqual(weather.get_weather(56.95, 24.11, "Riga"), "Riga 3°C, light rain")
 
-    def test_rounds_and_handles_negative(self):
-        with patch("weather.urllib.request.urlopen", return_value=_FakeResp(_payload(-2.6, 71))):
-            self.assertEqual(weather.get_riga_weather(), "Riga -3°C, light snow")
+    def test_negative_and_rounding(self):
+        with patch("weather.urllib.request.urlopen", return_value=_FakeResp(_wx(-2.6, 71))):
+            self.assertEqual(weather.get_weather(56.95, 24.11, "Riga"), "Riga -3°C, light snow")
 
     def test_unknown_code_omits_desc(self):
-        with patch("weather.urllib.request.urlopen", return_value=_FakeResp(_payload(5.0, 999))):
-            self.assertEqual(weather.get_riga_weather(), "Riga 5°C")
+        with patch("weather.urllib.request.urlopen", return_value=_FakeResp(_wx(5.0, 999))):
+            self.assertEqual(weather.get_weather(1, 2, "X"), "X 5°C")
 
     def test_missing_temp_returns_none(self):
-        with patch("weather.urllib.request.urlopen", return_value=_FakeResp(_payload(None, 1))):
-            self.assertIsNone(weather.get_riga_weather())
+        with patch("weather.urllib.request.urlopen", return_value=_FakeResp(_wx(None, 1))):
+            self.assertIsNone(weather.get_weather(1, 2, "X"))
 
     def test_network_error_returns_none(self):
         with patch("weather.urllib.request.urlopen", side_effect=Exception("boom")):
-            self.assertIsNone(weather.get_riga_weather())
+            self.assertIsNone(weather.get_weather(1, 2, "X"))
+
+
+class TestGeocode(unittest.TestCase):
+    def test_found(self):
+        payload = json.dumps({"results": [
+            {"name": "Riga", "country_code": "LV", "latitude": 56.95, "longitude": 24.1}
+        ]}).encode()
+        with patch("weather.urllib.request.urlopen", return_value=_FakeResp(payload)):
+            self.assertEqual(weather.geocode("riga"), ("Riga, LV", 56.95, 24.1))
+
+    def test_not_found(self):
+        with patch("weather.urllib.request.urlopen", return_value=_FakeResp(json.dumps({"results": []}).encode())):
+            self.assertIsNone(weather.geocode("zzznowhere"))
+
+    def test_error(self):
+        with patch("weather.urllib.request.urlopen", side_effect=Exception("boom")):
+            self.assertIsNone(weather.geocode("x"))
 
 
 if __name__ == "__main__":

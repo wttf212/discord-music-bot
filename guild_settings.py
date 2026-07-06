@@ -143,3 +143,47 @@ def get_eq_preset_name(bass: int, treble: int) -> str:
         if b == bass and t == treble:
             return name
     return "custom"
+
+
+# --- Card display prefs: weather location + timezone (Phase: fun trackers) -----
+
+DEFAULT_WEATHER_LOCATION = {"name": "Riga", "lat": 56.9496, "lon": 24.1052}
+DEFAULT_TIMEZONE = "Europe/Riga"
+
+
+def get_weather_location(guild_id: str) -> dict:
+    """Return {'name', 'lat', 'lon'} for this guild's weather, defaulting to Riga."""
+    guild = load_settings().get(guild_id, {})
+    loc = guild.get("weather_location")
+    return loc if loc else dict(DEFAULT_WEATHER_LOCATION)
+
+
+def set_weather_location(guild_id: str, name: str, lat: float, lon: float):
+    settings = load_settings()
+    if guild_id not in settings:
+        settings[guild_id] = {}
+    settings[guild_id]["weather_location"] = {"name": name, "lat": lat, "lon": lon}
+    save_settings(settings)
+
+
+def get_timezone(guild_id: str) -> str:
+    """Return this guild's IANA timezone for F1 race times (default Europe/Riga)."""
+    guild = load_settings().get(guild_id, {})
+    return guild.get("timezone") or DEFAULT_TIMEZONE
+
+
+def set_timezone(guild_id: str, tz: str):
+    settings = load_settings()
+    if guild_id not in settings:
+        settings[guild_id] = {}
+    settings[guild_id]["timezone"] = tz
+    save_settings(settings)
+
+
+def get_display_prefs(guild_id: str) -> dict:
+    """Weather location + timezone in one read (used by the card build)."""
+    guild = load_settings().get(guild_id, {})
+    return {
+        "location": guild.get("weather_location") or dict(DEFAULT_WEATHER_LOCATION),
+        "timezone": guild.get("timezone") or DEFAULT_TIMEZONE,
+    }

@@ -3,3 +3,4 @@ yt-dlp[default,curl-cffi]
 yt-dlp-ejs[all]
 pyyaml
 imageio-ffmpeg
+tzdata  # IANA timezone database for zoneinfo (F1 race times in the guild's timezone)
