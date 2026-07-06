@@ -820,7 +820,7 @@ class _ControlsRow(discord.ui.ActionRow):
         elif gs.player.is_paused:
             gs.player.resume()
         # Rebuild the card with the paused flag flipped to its new state.
-        new_view = build_player_view(**{**self.view._kwargs, "paused": gs.player.is_paused})
+        new_view = build_player_view(self.view.bot, **{**self.view._kwargs, "paused": gs.player.is_paused})
         await interaction.response.edit_message(view=new_view)
 
     @discord.ui.button(label="◄", style=discord.ButtonStyle.primary, custom_id="btn_prev")  # ◄
@@ -868,7 +868,7 @@ class _ControlsRow(discord.ui.ActionRow):
             gs.auto_next_task = None
         gs.auto_next_gen += 1
         gs.player.stop_playback()
-        next_track = gs.queue.next()
+        next_track = gs.queue.next(force=True)  # manual skip bypasses track-loop
         if next_track:
             try:
                 info = await gs.player.play(next_track.query, next_track.resolved_info, next_track.resolved_at)
@@ -973,6 +973,28 @@ class _LoadPlaylistRow(discord.ui.ActionRow):
                 await channel.send(f"Added **{len(tracks)}** tracks to the queue.")
 
 
+class _SecondaryRow(discord.ui.ActionRow):
+    """Second control row: loop-mode toggle + shuffle, folded into the Container.
+
+    Icon-only monochrome glyphs matching _ControlsRow. Loop cycles off → track →
+    queue; the button's colour/label reflect the mode (set in PlayerView._build).
+    """
+
+    @discord.ui.button(label="↻", style=discord.ButtonStyle.secondary, custom_id="btn_loop")
+    async def loop_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gs = self.view.bot.get_guild_state(interaction.guild_id)
+        gs.queue.cycle_loop()
+        kwargs = {**self.view._kwargs, "queue_tracks": gs.queue.preview_fair_order()}
+        await interaction.response.edit_message(view=build_player_view(self.view.bot, **kwargs))
+
+    @discord.ui.button(label="⇄", style=discord.ButtonStyle.secondary, custom_id="btn_shuffle")
+    async def shuffle_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gs = self.view.bot.get_guild_state(interaction.guild_id)
+        gs.queue.shuffle()
+        kwargs = {**self.view._kwargs, "queue_tracks": gs.queue.preview_fair_order()}
+        await interaction.response.edit_message(view=build_player_view(self.view.bot, **kwargs))
+
+
 class PlayerView(discord.ui.LayoutView):
     """Components V2 Now-Playing card: an accent-barred Container holding the song
     info (with thumbnail Section), the Up-Next preview, a Separator, the control
@@ -1012,6 +1034,7 @@ class PlayerView(discord.ui.LayoutView):
 
         gs = bot.get_guild_state(guild_id) if guild_id else None
         guild = bot.get_guild(guild_id) if guild_id else None
+        loop_mode = gs.queue.loop_mode if gs else "off"
         kbps = gs.player.get_bitrate_for_guild(guild_id) // 1000 if gs else bot.config.get("audio", {}).get("bitrate", 128)
 
         accent = NP_EMBED_COLOR if not finished else 0x95a5a6
@@ -1078,6 +1101,19 @@ class PlayerView(discord.ui.LayoutView):
                 if getattr(_item, "custom_id", None) == "btn_playpause":
                     _item.label = "▶" if paused else "‖"
             c.add_item(controls)
+
+            # Second row: loop toggle (colour/label reflect the mode) + shuffle.
+            secondary = _SecondaryRow()
+            for _item in secondary.children:
+                if getattr(_item, "custom_id", None) == "btn_loop":
+                    if loop_mode == "track":
+                        _item.style, _item.label = discord.ButtonStyle.success, "↻ one"
+                    elif loop_mode == "queue":
+                        _item.style, _item.label = discord.ButtonStyle.success, "↻ all"
+                    else:
+                        _item.style, _item.label = discord.ButtonStyle.secondary, "↻"
+            c.add_item(secondary)
+
             # Add the Load row when any pending playlist exists for this guild.
             # (The channel isn't known at build time, so match on guild_id.)
             has_pending = any(
@@ -1095,7 +1131,8 @@ class PlayerView(discord.ui.LayoutView):
             eq_bass, eq_treble = (0, 0)
         eq_label = get_eq_preset_name(eq_bass, eq_treble)
         requester = _plain_names(bot, guild, self._requester_name)
-        foot = "-# " + (f"Track requested by {requester} · " if requester else "") + f"{kbps}kbps · EQ {eq_label}"
+        loop_suffix = "" if loop_mode == "off" else f" · Loop {loop_mode}"
+        foot = "-# " + (f"Track requested by {requester} · " if requester else "") + f"{kbps}kbps · EQ {eq_label}{loop_suffix}"
         c.add_item(discord.ui.TextDisplay(foot))
 
         self.add_item(c)
@@ -1926,7 +1963,7 @@ class MusicCog(commands.Cog):
             gs.auto_next_task = None
         gs.auto_next_gen += 1
         gs.player.stop_playback()
-        next_track = gs.queue.next()
+        next_track = gs.queue.next(force=True)  # manual skip bypasses track-loop
         if next_track:
             try:
                 info = await gs.player.play(next_track.query, next_track.resolved_info, next_track.resolved_at)
@@ -1991,6 +2028,149 @@ class MusicCog(commands.Cog):
             await ctx.send("Only one track in the queue — nothing to shuffle.")
         else:
             await ctx.send(f"Shuffled {count} tracks in the queue.")
+        await self._refresh_np_card(ctx)
+
+    async def _refresh_np_card(self, ctx):
+        """Rebuild the Now-Playing card in place from current state (queue edits, loop)."""
+        gs = self.bot.get_guild_state(ctx.guild.id)
+        current = gs.queue.current
+        if not current:
+            return
+        view = build_player_view(
+            self.bot, current.title,
+            thumbnail=current.thumbnail, url=current.url,
+            requester_name=_get_requester_name(self.bot, current.requested_by, ctx.guild),
+            queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id,
+        )
+        await update_np_embed(self.bot, ctx.channel.id, view)
+
+    @commands.hybrid_command(name="loop", description="Set repeat mode: off, track, or queue")
+    @app_commands.describe(mode="off, track (repeat current), or queue (repeat all) — omit to cycle")
+    async def loop(self, ctx: commands.Context, mode: str = None):
+        if not await check_channel(ctx):
+            return
+        if not ctx.guild:
+            return
+        gs = self.bot.get_guild_state(ctx.guild.id)
+        if mode is None:
+            gs.queue.cycle_loop()
+        else:
+            aliases = {
+                "off": "off", "none": "off", "no": "off",
+                "track": "track", "one": "track", "song": "track", "current": "track", "1": "track",
+                "queue": "queue", "all": "queue", "q": "queue",
+            }
+            key = aliases.get(mode.strip().lower())
+            if key is None:
+                await ctx.send(f"Usage: `{self.bot.command_prefix}loop [off|track|queue]`")
+                return
+            gs.queue.loop_mode = key
+        labels = {
+            "off": "Repeat **off**.",
+            "track": "Repeating the **current track**.",
+            "queue": "Repeating the **whole queue**.",
+        }
+        await ctx.send(labels[gs.queue.loop_mode])
+        await self._refresh_np_card(ctx)
+
+    @commands.hybrid_command(name="remove", description="Remove a track from the queue by its position")
+    @app_commands.describe(position="Queue position to remove (see the queue list)")
+    async def remove(self, ctx: commands.Context, position: int = None):
+        if not await check_channel(ctx):
+            return
+        if not ctx.guild:
+            return
+        if position is None:
+            await ctx.send(f"Usage: `{self.bot.command_prefix}remove <position>`")
+            return
+        gs = self.bot.get_guild_state(ctx.guild.id)
+        removed = gs.queue.remove(position)
+        if not removed:
+            await ctx.send(f"No track at position {position}.")
+            return
+        await ctx.send(f"Removed **{removed.title}** from the queue.")
+        await self._refresh_np_card(ctx)
+
+    @commands.hybrid_command(name="move", description="Move a queued track to a new position")
+    @app_commands.describe(from_pos="Current position", to_pos="New position")
+    async def move(self, ctx: commands.Context, from_pos: int = None, to_pos: int = None):
+        if not await check_channel(ctx):
+            return
+        if not ctx.guild:
+            return
+        if from_pos is None or to_pos is None:
+            await ctx.send(f"Usage: `{self.bot.command_prefix}move <from> <to>`")
+            return
+        gs = self.bot.get_guild_state(ctx.guild.id)
+        moved = gs.queue.move(from_pos, to_pos)
+        if not moved:
+            await ctx.send("Invalid positions.")
+            return
+        await ctx.send(f"Moved **{moved.title}** to position {to_pos}.")
+        await self._refresh_np_card(ctx)
+
+    @commands.hybrid_command(name="skipto", description="Skip straight to a track in the queue")
+    @app_commands.describe(position="Queue position to jump to")
+    async def skipto(self, ctx: commands.Context, position: int = None):
+        if not await check_channel(ctx):
+            return
+        if not ctx.guild:
+            return
+        if position is None:
+            await ctx.send(f"Usage: `{self.bot.command_prefix}skipto <position>`")
+            return
+        gs = self.bot.get_guild_state(ctx.guild.id)
+        if not gs.queue.skip_to(position):
+            await ctx.send(f"No track at position {position}.")
+            return
+
+        channel_id = ctx.channel.id
+        if gs.auto_next_task and not gs.auto_next_task.done():
+            gs.auto_next_task.cancel()
+            gs.auto_next_task = None
+        gs.auto_next_gen += 1
+        gs.player.stop_playback()
+        next_track = gs.queue.next(force=True)
+        if not next_track:
+            await ctx.send("Nothing to play.")
+            await update_np_stopped(self.bot, channel_id)
+            return
+        try:
+            info = await gs.player.play(next_track.query, next_track.resolved_info, next_track.resolved_at)
+            next_track.title = info["title"]
+            next_track.thumbnail = info.get("thumbnail", "")
+            next_track.url = info.get("webpage_url", "")
+            view = build_player_view(self.bot, next_track.title,
+                                     thumbnail=next_track.thumbnail, url=next_track.url,
+                                     requester_name=_get_requester_name(self.bot, next_track.requested_by, ctx.guild),
+                                     queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
+            await ctx.send(f"Jumped to **{next_track.title}**.", delete_after=3)
+            await send_new_np(self.bot, channel_id, view)
+            _start_auto_next(self.bot, channel_id, ctx.guild.id)
+        except Exception as e:
+            await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+
+    @commands.hybrid_command(name="clear", description="Clear the upcoming queue (keeps the current track)")
+    async def clear(self, ctx: commands.Context):
+        if not await check_channel(ctx):
+            return
+        if not ctx.guild:
+            return
+        gs = self.bot.get_guild_state(ctx.guild.id)
+        n = gs.queue.clear_upcoming()
+        await ctx.send(f"Cleared **{n}** track(s) from the queue." if n else "The queue is already empty.")
+        await self._refresh_np_card(ctx)
+
+    @commands.hybrid_command(name="dedupe", description="Remove duplicate tracks from the queue")
+    async def dedupe(self, ctx: commands.Context):
+        if not await check_channel(ctx):
+            return
+        if not ctx.guild:
+            return
+        gs = self.bot.get_guild_state(ctx.guild.id)
+        n = gs.queue.dedupe()
+        await ctx.send(f"Removed **{n}** duplicate(s) from the queue." if n else "No duplicates in the queue.")
+        await self._refresh_np_card(ctx)
 
     @commands.command(name="loadall")
     async def loadall(self, ctx: commands.Context):
@@ -2284,6 +2464,12 @@ class MusicCog(commands.Cog):
             f"`{p}stop` — Stop playback, clear queue, and leave voice\n"
             f"`{p}queue` — Show the current queue\n"
             f"`{p}shuffle` — Shuffle the current queue\n"
+            f"`{p}loop [off|track|queue]` — Repeat the current track or the whole queue\n"
+            f"`{p}remove <pos>` — Remove a track from the queue\n"
+            f"`{p}move <from> <to>` — Reorder a queued track\n"
+            f"`{p}skipto <pos>` — Jump straight to a queued track\n"
+            f"`{p}clear` — Clear the upcoming queue (keeps the current track)\n"
+            f"`{p}dedupe` — Remove duplicate tracks from the queue\n"
             f"`{p}loadall` — Load all remaining tracks from the last pending playlist\n"
             f"`{p}radio` — Browse internet radio by region/country/genre\n"
             f"`{p}radio <name>` — Search 30k+ radio stations by name\n"
