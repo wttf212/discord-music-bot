@@ -1181,19 +1181,16 @@ class PlayerView(discord.ui.LayoutView):
                  else {"location": dict(DEFAULT_WEATHER_LOCATION), "timezone": None})
         loc, tz = prefs["location"], prefs.get("timezone")
 
-        sky = []
         w = _weather_text_for(loc)
         if w:
-            sky.append(w)
+            c.add_item(discord.ui.TextDisplay("-# " + w))
         a = aurora.forecast_line(
             _kp_cache.get("list"),
             _sky_cache.get(_loc_key(loc["lat"], loc["lon"]), {}).get("hourly"),
             loc["lat"], loc["lon"], tz,
         )
         if a:
-            sky.append(a)
-        if sky:
-            c.add_item(discord.ui.TextDisplay("-# " + " · ".join(sky)))
+            c.add_item(discord.ui.TextDisplay("-# " + a))
 
         f1_txt = f1.format_race(_f1_cache.get("race"), tz)
         if f1_txt:
