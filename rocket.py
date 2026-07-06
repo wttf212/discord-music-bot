@@ -57,11 +57,11 @@ def format_launch(launch: dict | None, tz_name: str | None = None, now: datetime
     name = launch["name"]
     dt_iso = launch.get("dt")
     if not dt_iso:
-        return f"Launch: {name}"
+        return f"Next space flight: {name}"
     try:
         dt = datetime.fromisoformat(dt_iso)
     except ValueError:
-        return f"Launch: {name}"
+        return f"Next space flight: {name}"
     now = now or datetime.now(timezone.utc)
     cd = _countdown((dt - now).total_seconds())
-    return f"Launch: {name}" + (f" ({cd})" if cd else "")
+    return f"Next space flight: {name}" + (f" ({cd})" if cd else "")

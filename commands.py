@@ -1191,15 +1191,12 @@ class PlayerView(discord.ui.LayoutView):
         if sky:
             c.add_item(discord.ui.TextDisplay("-# " + " · ".join(sky)))
 
-        events = []
         f1_txt = f1.format_race(_f1_cache.get("race"), tz)
         if f1_txt:
-            events.append(f1_txt)
+            c.add_item(discord.ui.TextDisplay("-# " + f1_txt))
         r_txt = rocket.format_launch(_rocket_cache.get("launch"), tz)
         if r_txt:
-            events.append(r_txt)
-        if events:
-            c.add_item(discord.ui.TextDisplay("-# " + " · ".join(events)))
+            c.add_item(discord.ui.TextDisplay("-# " + r_txt))
 
         self.add_item(c)
 

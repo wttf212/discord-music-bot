@@ -57,12 +57,12 @@ class TestFormatLaunch(unittest.TestCase):
     def test_countdown_days(self):
         launch = {"name": "Falcon 9 – Starlink", "dt": "2026-07-19T13:00:00+00:00"}
         now = datetime(2026, 7, 17, 13, 0, tzinfo=timezone.utc)
-        self.assertEqual(rocket.format_launch(launch, now=now), "Launch: Falcon 9 – Starlink (in 2d)")
+        self.assertEqual(rocket.format_launch(launch, now=now), "Next space flight: Falcon 9 – Starlink (in 2d)")
 
     def test_countdown_hours(self):
         launch = {"name": "Falcon 9", "dt": "2026-07-19T13:00:00+00:00"}
         now = datetime(2026, 7, 19, 9, 0, tzinfo=timezone.utc)
-        self.assertEqual(rocket.format_launch(launch, now=now), "Launch: Falcon 9 (in 4h)")
+        self.assertEqual(rocket.format_launch(launch, now=now), "Next space flight: Falcon 9 (in 4h)")
 
     def test_none(self):
         self.assertEqual(rocket.format_launch(None), "")
