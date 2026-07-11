@@ -691,6 +691,74 @@ class SearchPickerView(discord.ui.View):
             pass
 
 
+class QueuePaginatorView(discord.ui.View):
+    """Paginated plain-text listing of the pending queue for the !queue command.
+
+    Shows PAGE_SIZE tracks per page as message content (not an embed, matching the existing
+    !queue output). ◄ / ► navigate pages; only the command author may navigate (matches the
+    picker convention and avoids page-fighting on the shared message). Each rendered line is
+    hard-capped so a full page can never exceed Discord's 2000-char limit. On timeout the
+    buttons are disabled in place.
+    """
+
+    PAGE_SIZE = 20
+    LINE_MAX = 85   # per-line hard cap -> 20 lines + header + footer stays well under 2000
+
+    def __init__(self, bot, ctx: commands.Context, tracks, now_playing_title: str | None):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.ctx = ctx
+        self.tracks = tracks
+        self.now_playing_title = now_playing_title
+        self.page = 0
+        self.message: discord.Message | None = None
+        self.total_pages = max(1, (len(tracks) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self._update_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await _picker_author_check(interaction, self.ctx)
+
+    def render(self) -> str:
+        lines = []
+        if self.now_playing_title:
+            lines.append(f"Now playing: **{self.now_playing_title[:90]}**")
+        start = self.page * self.PAGE_SIZE
+        for offset, t in enumerate(self.tracks[start:start + self.PAGE_SIZE], start + 1):
+            req_tag = ""
+            if t.requested_by:
+                name = _get_requester_name(self.bot, t.requested_by, self.ctx.guild)
+                if name:
+                    req_tag = f" — *{name}*"
+            lines.append(f"{offset}. {t.title}{req_tag}"[:self.LINE_MAX])
+        lines.append(f"-# Page {self.page + 1} of {self.total_pages}")
+        return "\n".join(lines)
+
+    def _update_buttons(self):
+        self.prev_button.disabled = (self.page == 0)
+        self.next_button.disabled = (self.page >= self.total_pages - 1)
+
+    @discord.ui.button(label="◄", style=discord.ButtonStyle.secondary, custom_id="queue_btn_prev")
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = max(0, self.page - 1)
+        self._update_buttons()
+        await interaction.response.edit_message(content=self.render(), view=self)
+
+    @discord.ui.button(label="►", style=discord.ButtonStyle.secondary, custom_id="queue_btn_next")
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(self.total_pages - 1, self.page + 1)
+        self._update_buttons()
+        await interaction.response.edit_message(content=self.render(), view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
 async def _play_selected(bot, ctx: commands.Context, result: dict,
                          picker_msg: discord.Message):
     """Continue the play flow with a chosen search result dict {url, title, thumbnail, ...}.
@@ -922,20 +990,73 @@ class _ControlsRow(discord.ui.ActionRow):
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
         tracks = gs.queue.list()
-        lines = []
+        header = []
         if gs.player.current_track_title:
-            lines.append(f"**Now playing:** {gs.player.current_track_title}")
-        if tracks:
-            for i, t in enumerate(tracks, 1):
-                req_name = _get_requester_name(self.view.bot, t.requested_by, interaction.guild) if t.requested_by else ""
-                req_tag = f" — {req_name}" if req_name else ""
-                lines.append(f"`{i}.` {t.title}{req_tag}")
-        else:
-            lines.append("*Queue is empty.*")
-        text = "\n".join(lines)
-        if len(text) > 1900:
-            text = text[:1900].rsplit("\n", 1)[0] + "\n*…more*"
-        await interaction.response.send_message(text, ephemeral=True)
+            header.append(f"**Now playing:** {gs.player.current_track_title[:200]}")
+        if not tracks:
+            header.append("*Queue is empty.*")
+            await interaction.response.send_message("\n".join(header), ephemeral=True)
+            return
+        header_len = sum(len(h) + 1 for h in header)
+        body, shown = _queue_lines_within_budget(
+            self.view.bot, interaction.guild, tracks, budget=1900 - header_len - 60)
+        lines = header + body
+        remaining = len(tracks) - shown
+        if remaining > 0:
+            lines.append(f"*…and {remaining} more — use `!queue` to page through them*")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+def _loading_offer_text(title: str) -> str:
+    """Placeholder offer text shown the instant the Load button appears, before
+    the background full-enumeration has landed."""
+    return f"**{title}** — loading track list…\nClick 'Load playlist' to add the rest."
+
+
+def _resolve_offer_outcome(full_info: dict, title: str):
+    """Resolve a completed full-enumeration result into the offer outcome.
+
+    Returns (action, extra_text, remaining) where action is "empty" (no more
+    tracks beyond track 1) or "ready" (remaining tracks available to load).
+    remaining = full_info["tracks"][1:] (track 1 was already played/queued).
+    """
+    remaining = (full_info.get("tracks") or [])[1:]
+    if not remaining:
+        return "empty", "", []
+    n = len(remaining)
+    extra = (f"**{title}** has **{n}** more tracks.\n"
+             f"Click 'Load playlist' to add them to the queue.")
+    return "ready", extra, remaining
+
+
+def _error_offer_text(title: str) -> str:
+    return f"Couldn't load the track list for **{title}**."
+
+
+def _expiry_offer_text(title: str, remaining: list | None) -> str:
+    """Expiry card text. remaining is None if the entry was still ENUMERATING
+    when it expired (count unknown), else the known remaining-track list."""
+    if remaining is None:
+        return f"**{title}** — track list offer expired."
+    return (f"**{title}** had **{len(remaining)}** more tracks.\n"
+            f"~~Click Load playlist~~ *(expired)*")
+
+
+async def _await_pending_tracks(pending: dict) -> list:
+    """Return the remaining tracks for a pending-playlist entry.
+
+    If the entry is already READY (tracks is not None), returns it directly.
+    If still ENUMERATING, awaits the in-flight full-enumeration future — NEVER
+    re-fetches (no windowed/progressive re-querying, per R6).
+    """
+    tracks = pending.get("tracks")
+    if tracks is not None:
+        return tracks
+    future = pending.get("future")
+    if future is None:
+        return []
+    full_info = await future
+    return full_info["tracks"][1:] if full_info.get("tracks") else []
 
 
 class _LoadPlaylistRow(discord.ui.ActionRow):
@@ -963,7 +1084,23 @@ class _LoadPlaylistRow(discord.ui.ActionRow):
                 await interaction.message.edit(view=view)
             return
 
-        tracks = pending["tracks"]
+        if pending.get("tracks") is None:
+            await interaction.followup.send("Loading the full track list…", ephemeral=True)
+        try:
+            tracks = await _await_pending_tracks(pending)
+        except Exception:
+            await interaction.followup.send("Couldn't load the full track list — run `!play` with the playlist link to retry.", ephemeral=True)
+            current = gs.queue.current
+            if current:
+                view = build_player_view(bot, current.title,
+                                         thumbnail=current.thumbnail,
+                                         url=current.url,
+                                         requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
+                                         queue_tracks=gs.queue.preview_fair_order(),
+                                         guild_id=guild_id)
+                await interaction.message.edit(view=view)
+            return
+
         user_id = str(interaction.user.id)
 
         for t in tracks:
@@ -981,9 +1118,10 @@ class _LoadPlaylistRow(discord.ui.ActionRow):
                                      guild_id=guild_id)
             await interaction.message.edit(view=view)
 
-            channel = bot.get_channel(channel_id)
-            if channel:
-                await channel.send(f"Added **{len(tracks)}** tracks to the queue.")
+            if tracks:
+                channel = bot.get_channel(channel_id)
+                if channel:
+                    await channel.send(f"Added **{len(tracks)}** tracks to the queue.")
 
 
 class _SecondaryRow(discord.ui.ActionRow):
@@ -1120,7 +1258,7 @@ class PlayerView(discord.ui.LayoutView):
                     lines.append(f"`{i}.` [{t.title}]({t.url}){req_tag}")
                 else:
                     lines.append(f"`{i}.` {t.title}{req_tag}")
-            remaining = (len(gs.queue.list()) - 5) if gs else (len(self._queue_tracks) - 5)
+            remaining = (len(gs.queue) - 5) if gs else (len(self._queue_tracks) - 5)
             if remaining > 0:
                 lines.append(f"*...and {remaining} more*")
             c.add_item(discord.ui.TextDisplay("**Up Next**\n" + "\n".join(lines)))
@@ -1268,6 +1406,28 @@ def _get_requester_name(bot, user_id, guild=None) -> str:
     if user:
         return user.display_name
     return "someone"
+
+
+def _queue_lines_within_budget(bot, guild, tracks, budget: int) -> tuple[list[str], int]:
+    """Build numbered queue lines, stopping once the joined length would exceed `budget`.
+
+    Avoids building every line (and resolving every requester name) for huge queues.
+    Returns (lines, shown) where shown == len(lines).
+    """
+    lines: list[str] = []
+    used = 0
+    for i, t in enumerate(tracks, 1):
+        req_tag = ""
+        if t.requested_by:
+            name = _get_requester_name(bot, t.requested_by, guild)
+            if name:
+                req_tag = f" — {name}"
+        line = f"`{i}.` {t.title}{req_tag}"[:200]
+        if used + len(line) + 1 > budget:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return lines, len(lines)
 
 
 def _plain_names(bot, guild, text: str) -> str:
@@ -1741,7 +1901,7 @@ def _check_vote(bot, guild, user, action: str) -> tuple[bool, str]:
         all_reqs = set()
         if current:
             all_reqs.add(current.requested_by)
-        for t in gs.queue.list():
+        for t in gs.queue:
             all_reqs.add(t.requested_by)
         if len(all_reqs) == 1 and user_id in all_reqs:
             return True, ""
@@ -1887,83 +2047,127 @@ class MusicCog(commands.Cog):
                 gs.player.is_playing and voice_client and voice_client.is_playing()
             )
 
-            def _pending_and_expire(remaining, playlist_title, current_title):
-                """Store the pending-playlist offer and schedule its 120s expiry."""
-                count = len(remaining)
-                self.bot.pending_playlists[str(channel_id)] = {
+            def _make_offer(full_fut, playlist_title) -> dict:
+                """Store the ENUMERATING pending-playlist entry, arm its 120s expiry
+                (relative to when the offer was SHOWN, not enumeration completion),
+                and return the entry so the caller can pass it to _finalize_offer."""
+                old = self.bot.pending_playlists.get(str(channel_id))
+                if old is not None and old.get("future") is not None:
+                    # A second playlist offer for this channel superseded an
+                    # in-flight enumeration — drop its future so it isn't orphaned.
+                    _discard_future(old["future"])
+
+                entry = {
                     "query": query, "user_id": user_id, "guild_id": guild_id,
-                    "channel_id": channel_id, "tracks": remaining,
-                    "playlist_title": playlist_title,
+                    "channel_id": channel_id, "playlist_title": playlist_title,
+                    "tracks": None, "future": full_fut,
                 }
+                self.bot.pending_playlists[str(channel_id)] = entry
 
-                async def _expire_playlist(ch_id: int):
+                async def _expire(entry=entry):
                     await asyncio.sleep(120)
-                    if self.bot.pending_playlists.pop(str(ch_id), None):
-                        try:
-                            expired_extra = (
-                                f"**{playlist_title}** had **{count}** more tracks.\n"
-                                f"~~Click Load playlist~~ *(expired)*"
-                            )
-                            expired_view = build_player_view(self.bot, current_title, expired_extra, guild_id=ctx.guild.id)
-                            await update_np_embed(self.bot, ch_id, expired_view)
-                        except Exception:
-                            pass
+                    if self.bot.pending_playlists.get(str(channel_id)) is entry:
+                        self.bot.pending_playlists.pop(str(channel_id), None)
+                        if entry.get("future"):
+                            _discard_future(entry["future"])
+                        current = gs.queue.current
+                        if current:
+                            try:
+                                expired_view = build_player_view(
+                                    self.bot, current.title,
+                                    _expiry_offer_text(playlist_title, entry.get("tracks")),
+                                    thumbnail=current.thumbnail, url=current.url,
+                                    requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
+                                    queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
+                                await update_np_embed(self.bot, channel_id, expired_view)
+                            except Exception:
+                                pass
 
-                asyncio.create_task(_expire_playlist(channel_id))
+                asyncio.create_task(_expire())
+                return entry
+
+            async def _finalize_offer(entry, full_fut, playlist_title):
+                """Await the full enumeration and flip the entry to READY/gone,
+                editing the card with the real count. NEVER queues tracks —
+                that only happens via the pending_playlists.pop gate in
+                load_callback/loadall (exactly-once)."""
+                try:
+                    full_info = await full_fut
+                    action, extra, remaining = _resolve_offer_outcome(full_info, playlist_title)
+                except Exception as e:
+                    print(f"[commands] Playlist enumeration failed after start: {e}")
+                    action, extra, remaining = "error", _error_offer_text(playlist_title), []
+
+                if self.bot.pending_playlists.get(str(channel_id)) is not entry:
+                    return  # clicked / expired / replaced — leave the card to its owner
+
+                if action == "ready":
+                    entry["tracks"] = remaining
+                    entry["future"] = None
+                else:
+                    self.bot.pending_playlists.pop(str(channel_id), None)
+
+                current = gs.queue.current
+                if current:
+                    view = build_player_view(self.bot, current.title, extra,
+                                             thumbnail=current.thumbnail, url=current.url,
+                                             requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
+                                             queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
+                    await update_np_embed(self.bot, channel_id, view)
 
             if voice_actually_playing:
-                # Already playing — no rush to start track 1; enumerate fully then queue.
-                status_msg = await ctx.send("Fetching playlist info…")
+                # Already playing — limit=1-first so the offer appears instantly
+                # instead of blocking on a full "Fetching playlist info…" enumeration.
+                status_msg = await ctx.send("Loading playlist…")
                 try:
-                    playlist_info = await loop.run_in_executor(None, extract_playlist_info, query, yt_client)
+                    first_info = await loop.run_in_executor(None, extract_playlist_info, query, yt_client, 1)
                 except Exception as e:
                     await status_msg.edit(content=f"Error fetching playlist: {e}")
                     return
-                tracks = playlist_info["tracks"]
-                if not tracks:
+                first_tracks = first_info["tracks"]
+                if not first_tracks:
                     await status_msg.edit(content="No tracks found in this playlist.")
                     return
-                playlist_title = playlist_info["title"]
-                remaining_tracks = tracks[1:]
+                playlist_title = first_info["title"]
+                first_track_info = first_tracks[0]
 
-                track = Track(query=tracks[0]["url"], title=tracks[0]["title"], requested_by=user_id, url=tracks[0]["url"])
+                track = Track(query=first_track_info["url"], title=first_track_info["title"],
+                             requested_by=user_id, url=first_track_info["url"])
                 gs.queue.add(track)
                 _schedule_prefetch(self.bot, ctx.guild.id)
                 asyncio.create_task(_safe_delete(status_msg))
 
-                count = len(remaining_tracks)
-                if count > 0:
-                    extra = (f"**{playlist_title}** has **{count}** more tracks.\n"
-                             f"Click 'Load playlist' to add them to the queue.")
-                    _pending_and_expire(remaining_tracks, playlist_title, gs.queue.current.title if gs.queue.current else "")
-                else:
-                    extra = f"Added **{playlist_title}** (1 track) to the queue."
+                full_fut = loop.run_in_executor(None, extract_playlist_info, query, yt_client)
+                entry = _make_offer(full_fut, playlist_title)
 
                 current = gs.queue.current
-                view = build_player_view(self.bot, current.title, extra,
+                view = build_player_view(self.bot, current.title, _loading_offer_text(playlist_title),
                                          thumbnail=current.thumbnail, url=current.url,
                                          requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
                                          queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
                 await update_np_embed(self.bot, channel_id, view)
+
+                await _finalize_offer(entry, full_fut, playlist_title)
                 return
 
-            # Not playing: EARLY START — enumerate the full playlist in the background
-            # while a fast limit=1 fetch gets track 1, so audio starts ~1-2.5s sooner.
+            # Not playing: limit=1-first — track 1 starts at the same latency as
+            # today, then the offer appears instantly while ONE background pass
+            # enumerates the rest (Invariant 3: full_fut created after limit=1
+            # returns, non-blocking, before voice-join).
             status_msg = await ctx.send("Loading playlist…")
-            full_fut = loop.run_in_executor(None, extract_playlist_info, query, yt_client)
             try:
                 first_info = await loop.run_in_executor(None, extract_playlist_info, query, yt_client, 1)
             except Exception as e:
-                _discard_future(full_fut)
                 await status_msg.edit(content=f"Error fetching playlist: {e}")
                 return
             first_tracks = first_info["tracks"]
             if not first_tracks:
-                _discard_future(full_fut)
                 await status_msg.edit(content="No tracks found in this playlist.")
                 return
             playlist_title = first_info["title"]
             first_track_info = first_tracks[0]
+
+            full_fut = loop.run_in_executor(None, extract_playlist_info, query, yt_client)
 
             # Join voice if not already connected
             if not voice_client or not voice_client.is_connected():
@@ -2001,9 +2205,11 @@ class MusicCog(commands.Cog):
                 await status_msg.edit(content=f"Error playing first track: {e}")
                 return
 
-            # Audio is now playing — show the card and arm auto-next before the (possibly
-            # slower) full enumeration lands.
-            view = build_player_view(self.bot, title, f"From playlist: **{playlist_title}**",
+            # Audio is now playing — arm the offer BEFORE building the card so
+            # has_pending renders the Load button, then show the card and auto-next.
+            entry = _make_offer(full_fut, playlist_title)
+
+            view = build_player_view(self.bot, title, _loading_offer_text(playlist_title),
                                      thumbnail=track_thumbnail, url=track_url,
                                      requester_name=f"<@{user_id}>",
                                      queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
@@ -2011,26 +2217,7 @@ class MusicCog(commands.Cog):
             await send_new_np(self.bot, channel_id, view)
             _start_auto_next(self.bot, channel_id, ctx.guild.id)
 
-            # Finish enumerating; when done, offer the rest via the Load button.
-            try:
-                full_info = await full_fut
-            except Exception as e:
-                print(f"[commands] Playlist enumeration failed after start: {e}")
-                return
-            remaining_tracks = full_info["tracks"][1:] if full_info.get("tracks") else []
-            if not remaining_tracks:
-                return
-            _pending_and_expire(remaining_tracks, playlist_title, title)
-            count = len(remaining_tracks)
-            extra = (f"**{playlist_title}** has **{count}** more tracks.\n"
-                     f"Click 'Load playlist' to add them to the queue.")
-            current = gs.queue.current
-            if current:
-                view = build_player_view(self.bot, current.title, extra,
-                                         thumbnail=current.thumbnail, url=current.url,
-                                         requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
-                                         queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
-                await update_np_embed(self.bot, channel_id, view)
+            await _finalize_offer(entry, full_fut, playlist_title)
             return
 
         # ---------------------------------------------------------------
@@ -2310,23 +2497,19 @@ class MusicCog(commands.Cog):
 
         gs = self.bot.get_guild_state(ctx.guild.id)
         tracks = gs.queue.list()
+        now_playing = gs.player.current_track_title
         if not tracks:
             msg = "Queue is empty."
-            if gs.player.current_track_title:
-                msg = f"Now playing: **{gs.player.current_track_title}**\nQueue is empty."
+            if now_playing:
+                msg = f"Now playing: **{now_playing}**\nQueue is empty."
+            await ctx.send(msg)
+            return
+
+        view = QueuePaginatorView(self.bot, ctx, tracks, now_playing)
+        if view.total_pages <= 1:
+            await ctx.send(view.render())          # small queue: no buttons needed
         else:
-            lines = []
-            if gs.player.current_track_title:
-                lines.append(f"Now playing: **{gs.player.current_track_title}**")
-            for i, t in enumerate(tracks, 1):
-                req_tag = ""
-                if t.requested_by:
-                    req_name = _get_requester_name(self.bot, t.requested_by, ctx.guild)
-                    if req_name:
-                        req_tag = f" — *{req_name}*"
-                lines.append(f"{i}. {t.title}{req_tag}")
-            msg = "\n".join(lines)
-        await ctx.send(msg)
+            view.message = await ctx.send(view.render(), view=view)
 
     @commands.hybrid_command(name="shuffle", description="Shuffle the current queue")
     async def shuffle(self, ctx: commands.Context):
@@ -2667,7 +2850,11 @@ class MusicCog(commands.Cog):
             return
 
         gs = self.bot.get_guild_state(ctx.guild.id)
-        tracks = pending["tracks"]
+        try:
+            tracks = await _await_pending_tracks(pending)
+        except Exception:
+            await ctx.send("Couldn't load the full track list — run `!play` with the playlist link to retry.")
+            return
         user_id = str(ctx.author.id)
 
         for t in tracks:
