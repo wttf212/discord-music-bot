@@ -24,7 +24,7 @@ class TrackQueue:
 
     def __init__(self):
         self._queue: deque[Track] = deque()
-        self._history = []
+        self._history: deque[Track] = deque(maxlen=100)
         self.current: Track | None = None
         self.fair_play: bool = True
         self.last_played_user: str | None = None
@@ -152,6 +152,12 @@ class TrackQueue:
 
     def list(self):
         return list(self._queue)
+
+    def __len__(self) -> int:
+        return len(self._queue)
+
+    def __iter__(self):
+        return iter(self._queue)
 
     def shuffle(self) -> int:
         """Randomise pending tracks in-place. Returns count of shuffled tracks.

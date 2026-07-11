@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-MAX_TRACKS = 200  # mirror MAX_PLAYLIST_TRACKS
+from audio_player import MAX_PLAYLIST_TRACKS
 
 
 class SpotifyError(Exception):
@@ -101,7 +101,7 @@ def _oembed_title(url: str) -> str | None:
 
 
 def resolve_spotify(url: str, client_id: str | None = None,
-                    client_secret: str | None = None, limit: int = MAX_TRACKS) -> dict:
+                    client_secret: str | None = None, limit: int = MAX_PLAYLIST_TRACKS) -> dict:
     """Expand a Spotify link into search-query tracks.
 
     Returns {"kind": ..., "title": <collection or track title>,
