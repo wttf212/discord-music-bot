@@ -615,8 +615,12 @@ def extract_playlist_info(query: str, client: str, limit: int = MAX_PLAYLIST_TRA
         "no_warnings": True,
         "noplaylist": False,            # allow playlist extraction
         "playlistend": limit,           # stop enumerating after the cap (huge-playlist guard)
-        "sleep_interval_requests": 0.5,  # pace continuation-page requests (huge-playlist burst guard)
     }
+    if limit > 1:
+        # Pace continuation-page requests (huge-playlist burst guard). Never on the
+        # limit=1 fast fetch: it sits on the track-1 startup path, and yt-dlp sleeps
+        # before every request after the first, which would delay playback ~0.5s.
+        ydl_opts["sleep_interval_requests"] = 0.5
 
     if _is_youtube(query):
         yt_args = {"player_client": [c.strip() for c in client.split(",")]}
