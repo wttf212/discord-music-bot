@@ -990,20 +990,21 @@ class _ControlsRow(discord.ui.ActionRow):
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
         tracks = gs.queue.list()
-        lines = []
+        header = []
         if gs.player.current_track_title:
-            lines.append(f"**Now playing:** {gs.player.current_track_title}")
-        if tracks:
-            for i, t in enumerate(tracks, 1):
-                req_name = _get_requester_name(self.view.bot, t.requested_by, interaction.guild) if t.requested_by else ""
-                req_tag = f" — {req_name}" if req_name else ""
-                lines.append(f"`{i}.` {t.title}{req_tag}")
-        else:
-            lines.append("*Queue is empty.*")
-        text = "\n".join(lines)
-        if len(text) > 1900:
-            text = text[:1900].rsplit("\n", 1)[0] + "\n*…more*"
-        await interaction.response.send_message(text, ephemeral=True)
+            header.append(f"**Now playing:** {gs.player.current_track_title[:200]}")
+        if not tracks:
+            header.append("*Queue is empty.*")
+            await interaction.response.send_message("\n".join(header), ephemeral=True)
+            return
+        header_len = sum(len(h) + 1 for h in header)
+        body, shown = _queue_lines_within_budget(
+            self.view.bot, interaction.guild, tracks, budget=1900 - header_len - 60)
+        lines = header + body
+        remaining = len(tracks) - shown
+        if remaining > 0:
+            lines.append(f"*…and {remaining} more — use `!queue` to page through them*")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 class _LoadPlaylistRow(discord.ui.ActionRow):
@@ -1336,6 +1337,28 @@ def _get_requester_name(bot, user_id, guild=None) -> str:
     if user:
         return user.display_name
     return "someone"
+
+
+def _queue_lines_within_budget(bot, guild, tracks, budget: int) -> tuple[list[str], int]:
+    """Build numbered queue lines, stopping once the joined length would exceed `budget`.
+
+    Avoids building every line (and resolving every requester name) for huge queues.
+    Returns (lines, shown) where shown == len(lines).
+    """
+    lines: list[str] = []
+    used = 0
+    for i, t in enumerate(tracks, 1):
+        req_tag = ""
+        if t.requested_by:
+            name = _get_requester_name(bot, t.requested_by, guild)
+            if name:
+                req_tag = f" — {name}"
+        line = f"`{i}.` {t.title}{req_tag}"[:200]
+        if used + len(line) + 1 > budget:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return lines, len(lines)
 
 
 def _plain_names(bot, guild, text: str) -> str:

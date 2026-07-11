@@ -80,5 +80,19 @@ class TestQueuePaginatorView(unittest.TestCase):
         self.assertEqual(self._make_view(1).timeout, 120)
 
 
+class TestQueueLineBudget(unittest.TestCase):
+    def test_breaks_out_early_for_huge_queue(self):
+        tracks = _make_tracks(500)
+        lines, shown = commands._queue_lines_within_budget(MagicMock(), MagicMock(), tracks, 1000)
+        self.assertEqual(shown, len(lines))
+        self.assertLessEqual(sum(len(l) + 1 for l in lines), 1000)
+        self.assertLess(shown, 500)
+
+    def test_small_queue_generous_budget_shows_all(self):
+        tracks = _make_tracks(3)
+        lines, shown = commands._queue_lines_within_budget(MagicMock(), MagicMock(), tracks, 5000)
+        self.assertEqual(shown, 3)
+
+
 if __name__ == "__main__":
     unittest.main()
