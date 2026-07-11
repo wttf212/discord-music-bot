@@ -1189,7 +1189,7 @@ class PlayerView(discord.ui.LayoutView):
                     lines.append(f"`{i}.` [{t.title}]({t.url}){req_tag}")
                 else:
                     lines.append(f"`{i}.` {t.title}{req_tag}")
-            remaining = (len(gs.queue.list()) - 5) if gs else (len(self._queue_tracks) - 5)
+            remaining = (len(gs.queue) - 5) if gs else (len(self._queue_tracks) - 5)
             if remaining > 0:
                 lines.append(f"*...and {remaining} more*")
             c.add_item(discord.ui.TextDisplay("**Up Next**\n" + "\n".join(lines)))
@@ -1832,7 +1832,7 @@ def _check_vote(bot, guild, user, action: str) -> tuple[bool, str]:
         all_reqs = set()
         if current:
             all_reqs.add(current.requested_by)
-        for t in gs.queue.list():
+        for t in gs.queue:
             all_reqs.add(t.requested_by)
         if len(all_reqs) == 1 and user_id in all_reqs:
             return True, ""
