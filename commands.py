@@ -691,6 +691,74 @@ class SearchPickerView(discord.ui.View):
             pass
 
 
+class QueuePaginatorView(discord.ui.View):
+    """Paginated plain-text listing of the pending queue for the !queue command.
+
+    Shows PAGE_SIZE tracks per page as message content (not an embed, matching the existing
+    !queue output). ◄ / ► navigate pages; only the command author may navigate (matches the
+    picker convention and avoids page-fighting on the shared message). Each rendered line is
+    hard-capped so a full page can never exceed Discord's 2000-char limit. On timeout the
+    buttons are disabled in place.
+    """
+
+    PAGE_SIZE = 20
+    LINE_MAX = 85   # per-line hard cap -> 20 lines + header + footer stays well under 2000
+
+    def __init__(self, bot, ctx: commands.Context, tracks, now_playing_title: str | None):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.ctx = ctx
+        self.tracks = tracks
+        self.now_playing_title = now_playing_title
+        self.page = 0
+        self.message: discord.Message | None = None
+        self.total_pages = max(1, (len(tracks) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self._update_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await _picker_author_check(interaction, self.ctx)
+
+    def render(self) -> str:
+        lines = []
+        if self.now_playing_title:
+            lines.append(f"Now playing: **{self.now_playing_title[:90]}**")
+        start = self.page * self.PAGE_SIZE
+        for offset, t in enumerate(self.tracks[start:start + self.PAGE_SIZE], start + 1):
+            req_tag = ""
+            if t.requested_by:
+                name = _get_requester_name(self.bot, t.requested_by, self.ctx.guild)
+                if name:
+                    req_tag = f" — *{name}*"
+            lines.append(f"{offset}. {t.title}{req_tag}"[:self.LINE_MAX])
+        lines.append(f"-# Page {self.page + 1} of {self.total_pages}")
+        return "\n".join(lines)
+
+    def _update_buttons(self):
+        self.prev_button.disabled = (self.page == 0)
+        self.next_button.disabled = (self.page >= self.total_pages - 1)
+
+    @discord.ui.button(label="◄", style=discord.ButtonStyle.secondary, custom_id="queue_btn_prev")
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = max(0, self.page - 1)
+        self._update_buttons()
+        await interaction.response.edit_message(content=self.render(), view=self)
+
+    @discord.ui.button(label="►", style=discord.ButtonStyle.secondary, custom_id="queue_btn_next")
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(self.total_pages - 1, self.page + 1)
+        self._update_buttons()
+        await interaction.response.edit_message(content=self.render(), view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
 async def _play_selected(bot, ctx: commands.Context, result: dict,
                          picker_msg: discord.Message):
     """Continue the play flow with a chosen search result dict {url, title, thumbnail, ...}.
@@ -2310,23 +2378,19 @@ class MusicCog(commands.Cog):
 
         gs = self.bot.get_guild_state(ctx.guild.id)
         tracks = gs.queue.list()
+        now_playing = gs.player.current_track_title
         if not tracks:
             msg = "Queue is empty."
-            if gs.player.current_track_title:
-                msg = f"Now playing: **{gs.player.current_track_title}**\nQueue is empty."
+            if now_playing:
+                msg = f"Now playing: **{now_playing}**\nQueue is empty."
+            await ctx.send(msg)
+            return
+
+        view = QueuePaginatorView(self.bot, ctx, tracks, now_playing)
+        if view.total_pages <= 1:
+            await ctx.send(view.render())          # small queue: no buttons needed
         else:
-            lines = []
-            if gs.player.current_track_title:
-                lines.append(f"Now playing: **{gs.player.current_track_title}**")
-            for i, t in enumerate(tracks, 1):
-                req_tag = ""
-                if t.requested_by:
-                    req_name = _get_requester_name(self.bot, t.requested_by, ctx.guild)
-                    if req_name:
-                        req_tag = f" — *{req_name}*"
-                lines.append(f"{i}. {t.title}{req_tag}")
-            msg = "\n".join(lines)
-        await ctx.send(msg)
+            view.message = await ctx.send(view.render(), view=view)
 
     @commands.hybrid_command(name="shuffle", description="Shuffle the current queue")
     async def shuffle(self, ctx: commands.Context):
