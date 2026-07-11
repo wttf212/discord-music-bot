@@ -1089,7 +1089,7 @@ class _LoadPlaylistRow(discord.ui.ActionRow):
         try:
             tracks = await _await_pending_tracks(pending)
         except Exception:
-            await interaction.followup.send("Couldn't load the full track list — try again.", ephemeral=True)
+            await interaction.followup.send("Couldn't load the full track list — run `!play` with the playlist link to retry.", ephemeral=True)
             current = gs.queue.current
             if current:
                 view = build_player_view(bot, current.title,
@@ -2853,7 +2853,7 @@ class MusicCog(commands.Cog):
         try:
             tracks = await _await_pending_tracks(pending)
         except Exception:
-            await ctx.send("Couldn't load the full track list — try again.")
+            await ctx.send("Couldn't load the full track list — run `!play` with the playlist link to retry.")
             return
         user_id = str(ctx.author.id)
 
