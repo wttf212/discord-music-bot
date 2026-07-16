@@ -405,7 +405,7 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
                 if yt_cookies:
                     http_headers["Cookie"] = "; ".join(yt_cookies)
                     names = ", ".join(p.split("=", 1)[0] for p in yt_cookies)
-                    print(f"[yt-dlp] Cookies → FFmpeg: {len(yt_cookies)} ({names})")
+                    print(f"[yt-dlp] Cookies -> FFmpeg: {len(yt_cookies)} ({names})")
                 else:
                     print("[yt-dlp] Cookies: none found for youtube.com in cookiejar")
 

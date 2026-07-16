@@ -1,5 +1,5 @@
 discord.py[voice]>=2.7.0
-yt-dlp[default,curl-cffi]
+yt-dlp[default,curl-cffi]>=2026.7.4  # <2026.07 breaks YouTube extraction ("Sign in to confirm you're not a bot")
 yt-dlp-ejs[all]
 pyyaml
 imageio-ffmpeg
