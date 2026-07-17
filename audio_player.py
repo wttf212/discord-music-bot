@@ -959,7 +959,7 @@ class AudioPlayer:
 
         if self._debug:
             print(f"[debug][player] Resolved title: {title}")
-            print(f"[debug][player] yt-dlp pipe subprocess PID: {self._ytdlp_proc.pid}")
+            print(f"[debug][player] yt-dlp pipe subprocess PID: {proc.pid}")
 
         self.is_playing = True
         self.is_paused = False
