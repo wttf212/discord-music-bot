@@ -848,6 +848,12 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
         return
 
     resolved_at = time.time()
+    # Disarm the armed auto-next chain BEFORE play(): play()'s internal stop_playback() sets
+    # _playback_done, which would otherwise wake the live chain mid-setup and start a competing play().
+    if gs.auto_next_task and not gs.auto_next_task.done():
+        gs.auto_next_task.cancel()
+        gs.auto_next_task = None
+    gs.auto_next_gen += 1
     try:
         played = await gs.player.play(url, info, resolved_at)
         title = played["title"]
@@ -2193,6 +2199,11 @@ class MusicCog(commands.Cog):
                     return
 
             # Start track 1 immediately (do not wait for full enumeration).
+            # Disarm the armed auto-next chain before play() (see single-track play path for rationale).
+            if gs.auto_next_task and not gs.auto_next_task.done():
+                gs.auto_next_task.cancel()
+                gs.auto_next_task = None
+            gs.auto_next_gen += 1
             try:
                 played = await gs.player.play(first_track_info["url"])
                 title = played["title"]
@@ -2304,6 +2315,11 @@ class MusicCog(commands.Cog):
             return
 
         resolved_at = time.time()
+        # Disarm the armed auto-next chain before play() (see prev/next button pattern above).
+        if gs.auto_next_task and not gs.auto_next_task.done():
+            gs.auto_next_task.cancel()
+            gs.auto_next_task = None
+        gs.auto_next_gen += 1
         try:
             played = await gs.player.play(query, info, resolved_at)
             title = played["title"]
