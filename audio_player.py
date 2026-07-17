@@ -272,7 +272,13 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
     is_yt = _is_youtube(query) or not query.startswith(("http://", "https://"))
     if is_yt:
         # client can be comma-separated, e.g. "web,android_vr"
-        yt_args = {"player_client": [c.strip() for c in client.split(",")]}
+        # mweb needs a PLAYER PO token to pass YouTube's bot-check gate (LOGIN_REQUIRED)
+        # and a GVS PO token to unlock stream URLs; "always" makes yt-dlp fetch them
+        # proactively (harmless no-op for token-less clients like android_vr).
+        yt_args = {
+            "player_client": [c.strip() for c in client.split(",")],
+            "fetch_pot": ["always"],
+        }
         ydl_opts["extractor_args"] = {"youtube": yt_args}
 
         # Force bgutil CLI over the HTTP server for PO token generation.
@@ -478,7 +484,7 @@ def _start_ytdlp_stream(
     ]
 
     if is_yt:
-        cmd += ["--extractor-args", f"youtube:player_client={client}"]
+        cmd += ["--extractor-args", f"youtube:player_client={client};fetch_pot=always"]
         if bgutil_exe:
             # Force CLI provider (avoids broken HTTP server attestation)
             cmd += [
