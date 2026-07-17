@@ -5,13 +5,16 @@ owner_id: "YOUR_DISCORD_USER_ID"
 
 youtube:
   # PO tokens are generated automatically by bgutil-pot (no manual config needed).
-  # 'mweb' + bgutil PO tokens (the code sets fetch_pot=always) is the verified working
-  # combo as of July 2026: it mints a PLAYER PO token to pass YouTube's bot-check gate
-  # and a GVS PO token to unlock audio-only stream URLs.
-  # Do NOT use 'android_vr' — YouTube made it login-gated in July 2026 (it now returns
-  # "Sign in to confirm you're not a bot" / LOGIN_REQUIRED). 'web' is SABR-only and not
-  # usable for piped audio.
-  client: "mweb"
+  # 'web_embedded' + bgutil PO tokens (the code sets fetch_pot=always) is the verified
+  # working combo as of July 2026 (round 3): it resolves AND downloads clean (format 251
+  # opus, full speed in-session). 'mweb' + fetch_pot=always clears the sign-in gate but
+  # its stream URLs return HTTP 403 from googlevideo even in the same session — mweb is
+  # unusable for streaming in this cohort.
+  # Known limitation: web_embedded only plays embeddable videos (a rare miss for some
+  # music). Do NOT use 'android_vr' — YouTube made it login-gated in July 2026 (it now
+  # returns "Sign in to confirm you're not a bot" / LOGIN_REQUIRED). 'web' is SABR-only
+  # and not usable for piped audio.
+  client: "web_embedded"
 
   # Optional: path to a Netscape-format cookies file exported from your browser.
   # When set, VISITOR_INFO1_LIVE and SOCS cookies are sent with every yt-dlp request,

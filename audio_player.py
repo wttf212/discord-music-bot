@@ -481,6 +481,10 @@ def _start_ytdlp_stream(
         "--no-warnings",
         "--no-part",
         "-o", "-",  # pipe audio bytes to stdout
+        # googlevideo throttles rangeless full-file GETs to ~32 KiB/s after the first
+        # ~1 MiB; range-chunked requests (what the YouTube extractor normally configures
+        # per-format, lost in the direct-URL handoff) stream at full speed.
+        "--http-chunk-size", "10M",
     ]
 
     if is_yt:
