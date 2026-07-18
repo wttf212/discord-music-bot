@@ -200,6 +200,13 @@ _RADIO_GENRES = [
 
 _RADIO_SNI = "all.api.radio-browser.info"
 _RADIO_TIMEOUT = 10
+# all.api.radio-browser.info is a round-robin DNS pool of mirrors, not one stable
+# host. A fresh connection per attempt re-resolves the pool and often lands on a
+# different mirror (best-effort -- depends on the resolver), so a down / rate-limited
+# / redirecting mirror usually doesn't break radio: retry a few of them, and even
+# when the same mirror is picked, a transient blip on it typically clears on retry.
+_RADIO_ATTEMPTS = 3
+_RADIO_RETRY_DELAY = 0.5
 
 
 def _fetch_radio_stations(query: str | None, country: str = "", genre: str = "") -> list[dict]:
@@ -233,21 +240,42 @@ def _fetch_radio_stations(query: str | None, country: str = "", genre: str = "")
     else:
         path = "/json/stations/topvote?limit=50&hidebroken=true"
 
-    conn = None
-    try:
-        conn = http.client.HTTPSConnection(_RADIO_SNI, timeout=_RADIO_TIMEOUT)
-        conn.request("GET", path, headers={"User-Agent": "discord-music-bot/1.0"})
-        resp = conn.getresponse()
-        data = resp.read()
-    except OSError as e:
-        raise OSError(f"Cannot reach radio-browser.info ({e}) — check network/DNS connectivity") from e
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-    return json.loads(data)
+    # getresponse() does not raise on 4xx/5xx and http.client does not follow
+    # redirects, so a degraded mirror hands back a non-200 status, a truncated/
+    # unreadable body, or a non-JSON (often empty) body. Guard each of those and
+    # retry onto another mirror instead of surfacing a cryptic error to the user
+    # (the reported "Expecting value: line 1 column 1 (char 0)"). The handlers are
+    # deliberately broad: OSError/HTTPException = transport, ValueError = json.loads
+    # on a non-JSON *or* non-UTF-8 body (JSONDecodeError and UnicodeDecodeError both
+    # derive from ValueError).
+    last_err = None
+    for attempt in range(_RADIO_ATTEMPTS):
+        conn = None
+        try:
+            conn = http.client.HTTPSConnection(_RADIO_SNI, timeout=_RADIO_TIMEOUT)
+            conn.request("GET", path, headers={"User-Agent": "discord-music-bot/1.0"})
+            resp = conn.getresponse()
+            status = resp.status
+            data = resp.read()
+        except (OSError, http.client.HTTPException) as e:
+            last_err = OSError(f"Cannot reach radio-browser.info ({e}) — check network/DNS connectivity")
+        else:
+            if status != 200:
+                last_err = OSError(f"radio-browser.info returned HTTP {status} — service may be unavailable")
+            else:
+                try:
+                    return json.loads(data)
+                except ValueError as e:
+                    last_err = OSError(f"radio-browser.info sent an invalid response ({e}) — service may be unavailable")
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        if attempt + 1 < _RADIO_ATTEMPTS:
+            time.sleep(_RADIO_RETRY_DELAY)
+    raise last_err
 
 
 def _build_radio_embed(
