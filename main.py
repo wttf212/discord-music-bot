@@ -104,6 +104,20 @@ class MusicBot(commands.Bot):
         # synced = await self.tree.sync(guild=discord.Object(id=0))
         # print(f"[main] Synced {len(synced)} command(s) to guild")
 
+    async def close(self):
+        """Disarm every guild's auto-next chain before discord.py tears down voice.
+
+        The voice disconnect inside super().close() fires after_playback, which sets
+        _playback_done and would otherwise wake _auto_next -- it can't tell shutdown
+        from a track ending, so it pops the queue and calls play() until
+        MAX_CONSECUTIVE_ERRORS. Ctrl+C has no other teardown hook.
+        """
+        for gs in list(self._guild_states.values()):
+            gs.auto_next_gen += 1
+            if gs.auto_next_task and not gs.auto_next_task.done():
+                gs.auto_next_task.cancel()
+        await super().close()
+
 
 def main():
     # --- TLS-01c: curl_cffi startup check ---
