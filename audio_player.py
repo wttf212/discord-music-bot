@@ -550,12 +550,273 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
             "is_audio_only": is_audio_only,
             "duration": info.get("duration"),
             "artist": info.get("artist") or info.get("uploader") or info.get("channel") or "",
+            # Consumed by _can_stream_in_process(): only progressive, non-live sources
+            # may use the in-process CDN reader.
+            "protocol": info.get("protocol"),
+            "is_live": bool(info.get("is_live")),
         }
         if is_yt:
             # Keyed by the RESOLVED video id, so a text search also warms the cache for a
             # later direct-link play of the same track.
             _resolve_cache_put(info.get("id"), result)
         return result
+
+
+# --- In-process CDN reader -----------------------------------------------------
+#
+# Fetching an already-resolved googlevideo URL does not need a second Python
+# interpreter. `python -m yt_dlp` costs 1.51s to first byte (~0.42s of it just
+# importing yt-dlp, the rest the generic extractor probing the URL); the same bytes
+# arrive in 0.02s over curl_cffi, sustaining ~60 MB/s. That cost is paid on EVERY
+# track — prefetch removes the resolve on transitions, not this.
+#
+# Everything below was probed against googlevideo rather than assumed:
+#   * a rangeless GET is 403 — a range is mandatory;
+#   * `&range=a-b` in the URL returns 200 with an exact Content-Length (this is the
+#     form the web player uses); a `Range:` header returns 206 and also works;
+#   * sending the `Cookie` header is a 403 — the PO token in the URL is the auth;
+#   * UA / Referer / Origin make no difference, so impersonate supplies the headers;
+#   * `clen=` in the URL equals the real filesize, giving an exact EOF;
+#   * a FRESHLY resolved URL 403s for ~2-3s before the edge will serve it, which the
+#     1.5s subprocess boot used to mask by accident (and sometimes lost the race to,
+#     surfacing as "Error playing track" on a first play).
+_STREAM_CHUNK_BYTES = 10 * 1024 * 1024   # matches the old --http-chunk-size 10M
+
+# Settle-window schedule, measured rather than guessed. Polling 6 fresh URLs every
+# 250ms: 2 of 6 served instantly (0.02s), the other 4 went live at 2.43 / 2.52 / 2.70 /
+# 3.29s. Polling does NOT bring availability forward — a single unpolled request at
+# t+3.0s also returned 200 — so tight polling through the dead zone is pure waste
+# (13 requests). Instead: one attempt immediately to catch the instant case, then idle
+# out the dead zone and poll across the band where URLs actually go live. Costs 1
+# request in the fast case and ~2-4 in the slow one.
+# Cumulative wake times: 2.2 2.5 2.8 3.1 3.4 3.7 4.2 4.7 5.2 5.7s.
+_STREAM_SETTLE_BACKOFF = (2.2, 0.3, 0.3, 0.3, 0.3, 0.3, 0.5, 0.5, 0.5, 0.5)
+_STREAM_RESUME_BACKOFF = (0.25, 0.5)     # mid-stream truncation/blip retries
+_STREAM_TIMEOUT = 30
+
+
+def _stream_total_bytes(url: str) -> int | None:
+    """Total payload size from the CDN URL's `clen=` param, or None if absent."""
+    try:
+        clen = parse_qs(urlparse(url).query).get("clen", [None])[0]
+        return int(clen) if clen else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _range_url(url: str, start: int, end: int) -> str:
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}range={start}-{end}"
+
+
+def _can_stream_in_process(info: dict | None) -> bool:
+    """Whether this resolved track may use the in-process reader.
+
+    Deliberately narrow: googlevideo progressive audio is the only surface actually
+    probed. SoundCloud, HLS/DASH, live streams and radio keep the yt-dlp subprocess,
+    whose downloader already handles those protocols.
+    """
+    if not _IMPERSONATE_AVAILABLE or not info:
+        return False
+    url = info.get("url") or ""
+    if not url.startswith(("http://", "https://")):
+        return False
+    if info.get("is_live"):
+        return False
+    protocol = info.get("protocol")
+    if protocol and protocol not in ("https", "http"):
+        return False
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return host.endswith(".googlevideo.com") or host == "googlevideo.com"
+
+
+class _StreamStartError(RuntimeError):
+    """The in-process reader could not open the stream; caller falls back."""
+
+
+class _CurlStreamReader:
+    """Streams a progressive CDN URL into a pipe FFmpeg can read.
+
+    Duck-types the ``subprocess.Popen`` handle that ``AudioPlayer.play()`` and
+    ``stop_playback()`` already drive, so it drops in where ``_start_ytdlp_stream``
+    used to sit: ``.stdout``/``.stderr``/``.pid``/``.poll()``/``.terminate()``/
+    ``.kill()``/``.wait()``.
+
+    The first window is fetched synchronously in ``__init__`` (the caller already runs
+    this in an executor thread). A URL that will not serve therefore shows up as
+    ``poll() != None`` right after construction — exactly like a subprocess that exited
+    immediately — so play()'s existing stale-cache re-resolve path keeps working.
+    """
+
+    def __init__(self, url: str, debug: bool = False):
+        from curl_cffi import requests as curl_requests
+
+        self._url = url
+        self._debug = debug
+        self._total = _stream_total_bytes(url)
+        self._closed = threading.Event()
+        self._finished = threading.Event()
+        self._returncode: int | None = None
+        self.error_text = ""
+        self.stderr = None       # no child process, nothing to drain
+        self.pid = -1
+
+        # No Cookie header (403s a pot-authenticated URL) and no UA override —
+        # impersonate="chrome" supplies the full browser header set and TLS fingerprint.
+        self._session = curl_requests.Session(impersonate="chrome")
+
+        first = self._open_window(0, first=True)
+        if first is None:
+            self._returncode = 1
+            self._finished.set()
+            self._session.close()
+            raise _StreamStartError(self.error_text or "CDN refused the stream URL")
+
+        self._rfd, self._wfd = os.pipe()
+        self.stdout = os.fdopen(self._rfd, "rb")
+        self._thread = threading.Thread(target=self._pump, args=(first,), daemon=True,
+                                        name="curl-cdn-reader")
+        self._thread.start()
+
+    # -- request helpers ---------------------------------------------------------
+
+    def _open_window(self, offset: int, first: bool = False):
+        """GET one range window, retrying transient failures. Returns the streaming
+        response, or None once the retry budget is spent."""
+        end = offset + _STREAM_CHUNK_BYTES - 1
+        if self._total is not None:
+            end = min(end, self._total - 1)
+            if offset > end:
+                return None
+        # The settle-window ladder applies to the FIRST window only: a 403 there means
+        # the edge has not picked the URL up yet. Mid-stream we only retry blips.
+        backoff = _STREAM_SETTLE_BACKOFF if first else _STREAM_RESUME_BACKOFF
+        for attempt in range(len(backoff) + 1):
+            if self._closed.is_set():
+                return None
+            try:
+                resp = self._session.get(_range_url(self._url, offset, end),
+                                         stream=True, timeout=_STREAM_TIMEOUT)
+            except Exception as e:
+                self.error_text = f"{type(e).__name__}: {e}"
+            else:
+                if resp.status_code in (200, 206):
+                    return resp
+                # 403/401 on the first window = URL not live at the edge yet (propagation),
+                # NOT a rate-limit — this is the one place a 403 is worth retrying, and
+                # only here. Mid-stream it means the URL expired; give up and let the
+                # caller re-resolve.
+                self.error_text = f"HTTP {resp.status_code} at offset {offset}"
+                resp.close()
+                if not first and resp.status_code in (401, 403):
+                    return None
+            if attempt < len(backoff):
+                if self._debug:
+                    print(f"[debug][stream] window at {offset} failed "
+                          f"({self.error_text}) — retry in {backoff[attempt]}s")
+                if self._closed.wait(backoff[attempt]):
+                    return None
+        return None
+
+    def _pump(self, response):
+        """Write sequential range windows into the pipe until EOF or teardown."""
+        offset = 0
+        self._complete = False
+        try:
+            while response is not None and not self._closed.is_set():
+                expected = response.headers.get("content-length")
+                expected = int(expected) if expected and expected.isdigit() else None
+                got = 0
+                try:
+                    for buf in response.iter_content(chunk_size=65536):
+                        if self._closed.is_set():
+                            return
+                        os.write(self._wfd, buf)   # blocks when full = backpressure
+                        got += len(buf)
+                finally:
+                    response.close()
+                offset += got
+
+                if self._total is not None and offset >= self._total:
+                    self._complete = True
+                    return
+                if expected is not None and got < expected:
+                    # Truncated mid-window — resume from where we stopped.
+                    if self._debug:
+                        print(f"[debug][stream] short window ({got}/{expected}) — resuming at {offset}")
+                elif self._total is None and (expected is None or got < _STREAM_CHUNK_BYTES):
+                    self._complete = True                     # no clen: short window = EOF
+                    return
+                if got == 0:
+                    return                                    # no progress; stop rather than spin
+                response = self._open_window(offset)
+            if response is None and not self._closed.is_set():
+                print(f"[stream] giving up at byte {offset}: {self.error_text}")
+        except OSError:
+            pass  # read end closed (stop/skip) — normal teardown
+        except Exception as e:
+            print(f"[stream] reader error at byte {offset}: {type(e).__name__}: {e}")
+        finally:
+            self._returncode = 0 if self._complete else 1
+            try:
+                os.close(self._wfd)   # EOF for FFmpeg
+            except OSError:
+                pass
+            try:
+                self._session.close()
+            except Exception:
+                pass
+            self._finished.set()
+
+    # -- Popen-compatible surface ------------------------------------------------
+
+    def poll(self):
+        return self._returncode if self._finished.is_set() else None
+
+    def terminate(self):
+        self._closed.set()
+        try:
+            self.stdout.close()   # unblocks a pump thread parked in os.write
+        except Exception:
+            pass
+
+    kill = terminate
+
+    def wait(self, timeout=None):
+        if not self._finished.wait(timeout):
+            raise subprocess.TimeoutExpired("curl-cdn-reader", timeout or 0)
+        return self._returncode
+
+
+def _open_audio_stream(query: str, client: str, cookies_file: str | None,
+                       info: dict, debug: bool = False):
+    """Open an audio byte stream for a resolved track.
+
+    Prefers the in-process curl_cffi reader (no second interpreter, ~1.5s faster) and
+    falls back to the yt-dlp subprocess for anything it does not cover — or if it
+    cannot get the stream open at all, so reliability can only improve.
+    """
+    direct_url = info.get("url") if info else None
+    if _can_stream_in_process(info):
+        try:
+            return _CurlStreamReader(direct_url, debug=debug)
+        except Exception as e:
+            print(f"[stream] in-process reader unavailable ({e}) — "
+                  f"falling back to the yt-dlp subprocess")
+    return _start_ytdlp_stream(query, client, cookies_file, direct_url)
+
+
+def _stream_error_text(proc) -> str:
+    """Failure detail from either stream handle type."""
+    if getattr(proc, "stderr", None) is not None:
+        try:
+            return proc.stderr.read().decode(errors="replace")
+        except Exception:
+            return ""
+    return getattr(proc, "error_text", "")
 
 
 def _start_ytdlp_stream(
@@ -947,7 +1208,8 @@ class AudioPlayer:
         resolving again, collapsing the transition resolve to an instant handoff;
         a stale/revoked cached URL transparently falls back to a fresh resolve.
 
-        Architecture: yt-dlp subprocess pipes audio bytes to FFmpeg's stdin (pipe=True).
+        Architecture: an in-process curl_cffi reader (or, for sources it does not cover,
+        the yt-dlp subprocess) pipes audio bytes to FFmpeg's stdin (pipe=True).
         FFmpeg only decodes — it never makes HTTP requests to YouTube CDN.
         This bypasses the HTTP 403 that YouTube returns to FFmpeg's TLS fingerprint.
         """
@@ -1015,14 +1277,15 @@ class AudioPlayer:
                 )
 
             proc = await loop.run_in_executor(
-                None, _start_ytdlp_stream, url_or_query, yt["client"], cookies_file, info["url"]
+                None, _open_audio_stream, url_or_query, yt["client"], cookies_file,
+                info, self._debug
             )
             self._ytdlp_proc = proc  # track immediately so a concurrent stop reaps it
 
-            # Subprocess may exit immediately (invalid/expired URL). A cached URL that
+            # The stream may fail to open at all (invalid/expired URL). A cached URL that
             # fails is re-resolved fresh; a fresh resolve that fails is a hard error.
             if proc.poll() is not None:
-                stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+                stderr = _stream_error_text(proc)
                 if used_cache:
                     self._ytdlp_proc = None
                     candidate = None
@@ -1033,7 +1296,7 @@ class AudioPlayer:
                         print("[debug][player] Cached stream URL failed immediately — re-resolving fresh")
                     continue
                 raise RuntimeError(
-                    f"yt-dlp stream subprocess exited {proc.returncode} before playback started: {stderr[:500]}"
+                    f"audio stream failed to open ({proc.poll()}) before playback started: {stderr[:500]}"
                 )
 
             # Build the FFmpeg source off the event loop — Popen spawn is blocking
@@ -1051,9 +1314,11 @@ class AudioPlayer:
                 ),
             )
 
-            # Drain both stderr pipes before priming so a full pipe can't deadlock read().
+            # Drain stderr before priming so a full pipe can't deadlock read().
+            # The in-process reader has no stderr (no child process) — nothing to drain.
             threading.Thread(target=_drain_stderr, args=(src._process, "[ffmpeg]"), daemon=True).start()
-            threading.Thread(target=_drain_stderr, args=(proc, "[yt-dlp-pipe]"), daemon=True).start()
+            if proc.stderr is not None:
+                threading.Thread(target=_drain_stderr, args=(proc, "[yt-dlp-pipe]"), daemon=True).start()
 
             # Block in the executor until FFmpeg produces its first PCM frame. An empty
             # frame from a cached URL means the stream produced no audio (stale/revoked) —
@@ -1086,7 +1351,7 @@ class AudioPlayer:
 
         if self._debug:
             print(f"[debug][player] Resolved title: {title}")
-            print(f"[debug][player] yt-dlp pipe subprocess PID: {proc.pid}")
+            print(f"[debug][player] audio stream: {type(proc).__name__} (pid {proc.pid})")
 
         self.is_playing = True
         self.is_paused = False
@@ -1160,7 +1425,7 @@ class AudioPlayer:
         self.current_duration = None
         if self._voice_client and (self._voice_client.is_playing() or self._voice_client.is_paused()):
             self._voice_client.stop()
-        # Terminate the yt-dlp pipe subprocess (frees network connection and CPU).
+        # Tear down the audio stream (frees the network connection and CPU).
         # terminate() is instant; the wait()/kill() reap runs on a daemon thread so a
         # slow-dying subprocess never freezes the event loop mid-skip. The local handle
         # is already detached from self._ytdlp_proc, so the reaper cannot race the next
