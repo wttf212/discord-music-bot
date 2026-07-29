@@ -59,6 +59,52 @@ def _build_ffmpeg_af_options(bass_db: int, treble_db: int) -> str:
     return ",".join(parts)
 
 
+def _bgutil_executable() -> str | None:
+    """Path to the bgutil-pot binary at the project root, or None if absent."""
+    return next(
+        (p for p in (
+            os.path.join(_base_dir, "bgutil-pot.exe"),
+            os.path.join(_base_dir, "bgutil-pot"),
+        ) if os.path.isfile(p)),
+        None,
+    )
+
+
+def _youtube_extractor_args(client: str, bgutil_exe: str | None,
+                            force_cli: bool = False) -> dict:
+    """Build yt-dlp's YouTube extractor args, including PO token provider config.
+
+    The provider registry prefers the bgutil HTTP server (preference 130, started by
+    main.py on 127.0.0.1:4416) and falls back to the CLI (preference 1) on its own when
+    the server is unreachable. Both mint the same token; the server is just warm, so it
+    answers in ~0.4s where spawning the 45 MB binary per video costs seconds.
+
+    ``force_cli`` redirects the HTTP provider to a dead port so the registry has no
+    choice but the CLI. Used ONLY for the one-shot retry after a degraded (non
+    audio-only) resolve, which is the signature of broken HTTP-provider attestation
+    (YouTube changing ytAtR) — the CLI has its own Rust PPA implementation and needs no
+    webpage attestation. Do not set it on the normal path: the dead-port probe does not
+    fail fast, it costs ~2s per resolve.
+    """
+    args = {
+        # client can be comma-separated, e.g. "web,android_vr"
+        # mweb needs a PLAYER PO token to pass YouTube's bot-check gate (LOGIN_REQUIRED)
+        # and a GVS PO token to unlock stream URLs; "always" makes yt-dlp fetch them
+        # proactively (harmless no-op for token-less clients like android_vr).
+        "youtube": {
+            "player_client": [c.strip() for c in client.split(",")],
+            "fetch_pot": ["always"],
+        },
+    }
+    if bgutil_exe:
+        # bgutil-pot is at _base_dir, NOT in yt-dlp's default search paths — the CLI
+        # provider only registers when handed an explicit path.
+        args["youtubepot-bgutilcli"] = {"cli_path": [bgutil_exe]}
+        if force_cli:
+            args["youtubepot-bgutilhttp"] = {"base_url": ["http://127.0.0.1:1"]}
+    return args
+
+
 def _find_ffmpeg(config_path: str) -> str:
     """Resolve ffmpeg binary: config path > PATH > imageio_ffmpeg fallback."""
     if config_path and config_path != "ffmpeg":
@@ -256,8 +302,14 @@ def get_audio_url_with_retry(query: str, client: str, debug: bool = False, cooki
     )
 
 
-def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: str | None = None) -> dict:
-    """Extract audio URL and title via yt-dlp. Supports YouTube, SoundCloud, and others."""
+def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: str | None = None,
+                  *, force_cli: bool = False) -> dict:
+    """Extract audio URL and title via yt-dlp. Supports YouTube, SoundCloud, and others.
+
+    ``force_cli`` forces the bgutil CLI PO token provider. It is set only by the
+    internal one-shot retry after a degraded resolve.
+    """
+    original_query = query
     ffmpeg_exe = _find_ffmpeg("ffmpeg")
     ydl_opts = {
         "format": "bestaudio/best",
@@ -271,39 +323,9 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
     # Only apply YouTube-specific extractor args for YouTube URLs/searches
     is_yt = _is_youtube(query) or not query.startswith(("http://", "https://"))
     if is_yt:
-        # client can be comma-separated, e.g. "web,android_vr"
-        # mweb needs a PLAYER PO token to pass YouTube's bot-check gate (LOGIN_REQUIRED)
-        # and a GVS PO token to unlock stream URLs; "always" makes yt-dlp fetch them
-        # proactively (harmless no-op for token-less clients like android_vr).
-        yt_args = {
-            "player_client": [c.strip() for c in client.split(",")],
-            "fetch_pot": ["always"],
-        }
-        ydl_opts["extractor_args"] = {"youtube": yt_args}
-
-        # Force bgutil CLI over the HTTP server for PO token generation.
-        # The HTTP server parses ytAtR from YouTube's webpage for BotGuard challenge data;
-        # when YouTube changes that mechanism the HTTP server breaks ("Failed to extract
-        # initial attestation") and falls back to weak tokens that only unlock format 18.
-        # The CLI (bgutil-pot.exe) uses its own Rust implementation of the PPA algorithm
-        # and does NOT need webpage attestation — its tokens unlock audio-only streams.
-        bgutil_exe = next(
-            (p for p in (
-                os.path.join(_base_dir, "bgutil-pot.exe"),
-                os.path.join(_base_dir, "bgutil-pot"),
-            ) if os.path.isfile(p)),
-            None,
+        ydl_opts["extractor_args"] = _youtube_extractor_args(
+            client, _bgutil_executable(), force_cli=force_cli
         )
-        if bgutil_exe:
-            ydl_opts["extractor_args"]["youtubepot-bgutilcli"] = {
-                "cli_path": [bgutil_exe]
-            }
-            # Redirect HTTP provider to a dead port so it fails fast and the
-            # provider registry falls through to the CLI (preference 1 < HTTP 130,
-            # but CLI becomes the only available provider once HTTP is unreachable).
-            ydl_opts["extractor_args"]["youtubepot-bgutilhttp"] = {
-                "base_url": ["http://127.0.0.1:1"]
-            }
 
     if debug:
         print(f"[debug][yt-dlp] Query: {query}")
@@ -393,8 +415,26 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
                       f"(vcodec={vcodec}, format={info.get('format_id')}). "
                       f"Audio-only streams unavailable — bgutil attestation may be broken "
                       f"(YouTube changed ytAtR). Audio will still play (video stripped by FFmpeg) "
-                      f"but quality is limited to ~128kbps AAC instead of opus. "
-                      f"Consider updating bgutil-pot.exe or switching client in config.yaml.")
+                      f"but quality is limited to ~128kbps AAC instead of opus.")
+                # One-shot re-resolve with the CLI provider forced. The HTTP server needs
+                # ytAtR from the webpage for BotGuard challenge data; when YouTube changes
+                # that it degrades to weak tokens that only unlock format 18. The CLI has
+                # its own Rust PPA implementation and needs no webpage attestation, so it
+                # still unlocks opus. force_cli guards the recursion at depth 1.
+                if not force_cli:
+                    print("[yt-dlp] Retrying once with the bgutil CLI provider forced…")
+                    try:
+                        retry = get_audio_url(original_query, client, debug, cookies_file,
+                                              force_cli=True)
+                    except Exception as e:
+                        print(f"[yt-dlp] CLI-forced retry failed ({e}) — keeping the "
+                              f"combined format.")
+                    else:
+                        if retry.get("is_audio_only"):
+                            print("[yt-dlp] CLI-forced retry recovered an audio-only format.")
+                            return retry
+                        print("[yt-dlp] CLI-forced retry also returned a combined format — "
+                              "update bgutil-pot or switch client in config.yaml.")
 
             # Pass ALL YouTube session cookies to FFmpeg.
             # Audio-only formats (opus/m4a) authenticate via PO token in the URL and
@@ -465,13 +505,7 @@ def _start_ytdlp_stream(
         is_yt = _is_youtube(query) or not query.startswith(("http://", "https://"))
         actual_query = f"ytsearch:{query}" if not query.startswith(("http://", "https://")) else query
 
-    bgutil_exe = next(
-        (p for p in (
-            os.path.join(_base_dir, "bgutil-pot.exe"),
-            os.path.join(_base_dir, "bgutil-pot"),
-        ) if os.path.isfile(p)),
-        None,
-    )
+    bgutil_exe = _bgutil_executable()
 
     cmd = [
         sys.executable, "-m", "yt_dlp",
@@ -490,11 +524,10 @@ def _start_ytdlp_stream(
     if is_yt:
         cmd += ["--extractor-args", f"youtube:player_client={client};fetch_pot=always"]
         if bgutil_exe:
-            # Force CLI provider (avoids broken HTTP server attestation)
-            cmd += [
-                "--extractor-args", f"youtubepot-bgutilcli:cli_path={bgutil_exe}",
-                "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:1",
-            ]
+            # Register the CLI provider as a fallback; the registry prefers the warm
+            # bgutil HTTP server (see _youtube_extractor_args). Redirecting HTTP to a
+            # dead port here would cost ~2s per call — the probe does not fail fast.
+            cmd += ["--extractor-args", f"youtubepot-bgutilcli:cli_path={bgutil_exe}"]
 
     if _IMPERSONATE_AVAILABLE:
         cmd += ["--impersonate", "chrome"]
