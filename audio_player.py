@@ -550,11 +550,12 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
                         print("[yt-dlp] CLI-forced retry also returned a combined format — "
                               "update bgutil-pot or switch client in config.yaml.")
 
-            # Pass ALL YouTube session cookies to FFmpeg.
-            # Audio-only formats (opus/m4a) authenticate via PO token in the URL and
-            # don't need cookies. Format 18 (combined MP4) has no PO token — YouTube
-            # CDN validates via session cookies (YSC, VISITOR_INFO1_LIVE, etc.) instead,
-            # returning HTTP 403 if they're missing.
+            # Report which session cookies the resolve used. They are NOT sent to the
+            # CDN: the stream URL carries a PO token, and adding a Cookie header to a
+            # googlevideo request is an immediate 403 (measured). FFmpeg never makes
+            # HTTP requests at all — it only reads a pipe. This log exists purely as a
+            # diagnostic for cookie auth on the API side (e.g. spotting a missing SOCS,
+            # which EU IPs often lack).
             if hasattr(ydl, "cookiejar"):
                 yt_cookies = [
                     f"{c.name}={c.value}" for c in ydl.cookiejar
@@ -565,18 +566,20 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
                 if yt_cookies:
                     http_headers["Cookie"] = "; ".join(yt_cookies)
                     names = ", ".join(p.split("=", 1)[0] for p in yt_cookies)
-                    print(f"[yt-dlp] Cookies -> FFmpeg: {len(yt_cookies)} ({names})")
+                    print(f"[yt-dlp] Session cookies used for the resolve: "
+                          f"{len(yt_cookies)} ({names}) — not sent to the CDN")
                 else:
                     print("[yt-dlp] Cookies: none found for youtube.com in cookiejar")
 
-            # Referer is required by YouTube CDN for format 18 authentication
             if "Referer" not in http_headers:
                 http_headers["Referer"] = "https://www.youtube.com/"
 
-        # Filter headers to only what FFmpeg needs for HTTP video streaming.
-        # yt-dlp 2026.03.03+ includes browser-navigation headers (Sec-Fetch-Mode: navigate,
-        # Accept: text/html,...) that cause YouTube CDN to serve an HTML page instead of
-        # video data when FFmpeg requests the stream — leading to a decoder crash.
+        # Historical: back when FFmpeg fetched the stream itself, yt-dlp's browser
+        # navigation headers (Sec-Fetch-Mode: navigate, Accept: text/html,...) made the
+        # CDN serve an HTML page instead of media and crash the decoder, so the set was
+        # filtered down to these four. Nothing consumes http_headers today — FFmpeg only
+        # reads a pipe and the in-process reader sends none — so this is reported
+        # metadata, not request configuration.
         FFMPEG_ALLOWED_HEADERS = {"User-Agent", "Cookie", "Referer", "Origin"}
         http_headers = {k: v for k, v in http_headers.items() if k in FFMPEG_ALLOWED_HEADERS}
 
