@@ -8,6 +8,7 @@ import sys
 import os
 import threading
 import time
+from collections import OrderedDict
 from urllib.error import URLError
 from urllib.parse import urlparse, parse_qs
 
@@ -288,6 +289,69 @@ def is_stream_info_fresh(info: dict | None, resolved_at: float = 0.0,
     return False
 
 
+# Resolved CDN URLs stay valid until their `expire=` (~6h out), so replaying a video
+# within that window can skip the ~3s resolve entirely. This strictly REDUCES calls to
+# YouTube (one fewer /player request per repeat), and a cached URL is already past the
+# ~2-3s window during which googlevideo 403s a freshly minted URL, so playback starts
+# immediately. Bounded LRU — an always-on bot must not grow this without limit.
+_RESOLVE_CACHE_MAX = 256
+_resolve_cache: "OrderedDict[str, tuple[dict, float]]" = OrderedDict()
+_resolve_cache_lock = threading.Lock()
+
+
+def _copy_stream_info(info: dict) -> dict:
+    """Shallow copy incl. http_headers, so a caller mutating the result of a cache hit
+    cannot corrupt the cached entry (or another guild's copy of it)."""
+    copy = dict(info)
+    headers = copy.get("http_headers")
+    if isinstance(headers, dict):
+        copy["http_headers"] = dict(headers)
+    return copy
+
+
+def _resolve_cache_get(query: str) -> dict | None:
+    """Return a still-fresh cached resolve for this YouTube URL, or None.
+
+    Misses by construction for text queries and non-YouTube URLs — _youtube_video_id
+    only matches youtube.com/youtu.be links.
+    """
+    video_id = _youtube_video_id(query)
+    if not video_id:
+        return None
+    with _resolve_cache_lock:
+        entry = _resolve_cache.get(video_id)
+        if entry is None:
+            return None
+        info, resolved_at = entry
+        if not is_stream_info_fresh(info, resolved_at):
+            _resolve_cache.pop(video_id, None)  # expired — drop it
+            return None
+        _resolve_cache.move_to_end(video_id)
+        return _copy_stream_info(info)
+
+
+def _resolve_cache_put(video_id: str | None, info: dict) -> None:
+    """Cache a successful resolve. Degraded (combined video+audio) results are NOT
+    cached — pinning a format-18 fallback for hours would outlast the breakage."""
+    if not video_id or not info.get("is_audio_only") or not info.get("url"):
+        return
+    with _resolve_cache_lock:
+        _resolve_cache[video_id] = (_copy_stream_info(info), time.time())
+        _resolve_cache.move_to_end(video_id)
+        while len(_resolve_cache) > _RESOLVE_CACHE_MAX:
+            _resolve_cache.popitem(last=False)
+
+
+def invalidate_resolve_cache(query: str) -> None:
+    """Drop the cached resolve for this URL — call when its CDN URL turned out dead so
+    the retry actually re-resolves instead of getting the same dead URL back."""
+    video_id = _youtube_video_id(query)
+    if not video_id:
+        return
+    with _resolve_cache_lock:
+        _resolve_cache.pop(video_id, None)
+
+
 def get_audio_url_with_retry(query: str, client: str, debug: bool = False, cookies_file: str | None = None) -> dict:
     """Retrying wrapper around get_audio_url (RETRY-01).
 
@@ -306,10 +370,21 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
                   *, force_cli: bool = False) -> dict:
     """Extract audio URL and title via yt-dlp. Supports YouTube, SoundCloud, and others.
 
-    ``force_cli`` forces the bgutil CLI PO token provider. It is set only by the
-    internal one-shot retry after a degraded resolve.
+    ``force_cli`` forces the bgutil CLI PO token provider and bypasses the resolve
+    cache. It is set only by the internal one-shot retry after a degraded resolve.
     """
     original_query = query
+
+    # A previously resolved CDN URL is good until its `expire=`, so replaying the same
+    # video skips the whole ~3s resolve (and one /player call). Direct YouTube URLs only
+    # — a text query has no video id to key on until it has been resolved once.
+    if not force_cli:
+        cached = _resolve_cache_get(query)
+        if cached is not None:
+            if debug:
+                print(f"[debug][yt-dlp] Resolve cache hit: {cached['title']!r}")
+            return cached
+
     ffmpeg_exe = _find_ffmpeg("ffmpeg")
     ydl_opts = {
         "format": "bestaudio/best",
@@ -466,7 +541,7 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
         FFMPEG_ALLOWED_HEADERS = {"User-Agent", "Cookie", "Referer", "Origin"}
         http_headers = {k: v for k, v in http_headers.items() if k in FFMPEG_ALLOWED_HEADERS}
 
-        return {
+        result = {
             "url": info["url"],
             "title": info.get("title", "Unknown"),
             "http_headers": http_headers,
@@ -476,6 +551,11 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
             "duration": info.get("duration"),
             "artist": info.get("artist") or info.get("uploader") or info.get("channel") or "",
         }
+        if is_yt:
+            # Keyed by the RESOLVED video id, so a text search also warms the cache for a
+            # later direct-link play of the same track.
+            _resolve_cache_put(info.get("id"), result)
+        return result
 
 
 def _start_ytdlp_stream(
@@ -946,6 +1026,9 @@ class AudioPlayer:
                 if used_cache:
                     self._ytdlp_proc = None
                     candidate = None
+                    # Also drop the module-level resolve cache entry, or the fresh
+                    # re-resolve below would just hand back the same dead URL.
+                    invalidate_resolve_cache(url_or_query)
                     if self._debug:
                         print("[debug][player] Cached stream URL failed immediately — re-resolving fresh")
                     continue
@@ -990,6 +1073,7 @@ class AudioPlayer:
                     pass
                 self._ytdlp_proc = None
                 candidate = None
+                invalidate_resolve_cache(url_or_query)
                 continue
 
             source = src
