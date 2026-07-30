@@ -56,6 +56,12 @@ class _Bot:
 class TestPrefetch(unittest.TestCase):
     def setUp(self):
         commands._last_prefetch_monotonic = 0.0
+        # The fake resolves below carry *.googlevideo.com URLs, so the post-resolve
+        # CDN warm-up would treat them as real and probe the network. Stub it out —
+        # warming has its own tests in test_stream_warmup.py.
+        self._warm = patch.object(commands, "warm_stream_url", return_value=True)
+        self._warm.start()
+        self.addCleanup(self._warm.stop)
 
     def _run(self, coro):
         return asyncio.run(coro)

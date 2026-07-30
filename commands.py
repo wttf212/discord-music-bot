@@ -13,6 +13,7 @@ from track_queue import Track
 from audio_player import (
     is_playlist_url, extract_playlist_info, get_audio_url_with_retry,
     is_stream_info_fresh, get_related_tracks, _youtube_video_id,
+    warm_stream_url, _can_stream_in_process,
 )
 from spotify import is_spotify_url, resolve_spotify, SpotifyError
 import weather
@@ -1659,6 +1660,19 @@ async def _prefetch_next_track(bot, guild_id):
         track.resolved_at = time.time()
         if debug:
             print(f"[debug][prefetch] ready: {info.get('title', '?')[:40]!r}")
+
+        # Spend the CDN settle window HERE, while the current track still plays, rather
+        # than at playback. A freshly resolved googlevideo URL 403s for ~2.5s; skipping
+        # to an unwarmed track costs three retries (~2.8s) before the first byte, which
+        # is now the single largest delay on a skip. Warming uses 1-byte probes and does
+        # not consume the URL. Failure is harmless — playback falls back to waiting the
+        # window out itself, exactly as before.
+        if _can_stream_in_process(info):
+            warmed = await asyncio.get_event_loop().run_in_executor(
+                None, warm_stream_url, info["url"], debug
+            )
+            if debug and not warmed:
+                print("[debug][prefetch] CDN URL still cold — playback will wait it out")
     except asyncio.CancelledError:
         raise
     except Exception as e:

@@ -726,6 +726,51 @@ def _can_stream_in_process(info: dict | None) -> bool:
     return host.endswith(".googlevideo.com") or host == "googlevideo.com"
 
 
+def warm_stream_url(url: str, debug: bool = False) -> bool:
+    """Poll a freshly resolved CDN URL until the edge will actually serve it.
+
+    Run this OFF the critical path — during the previous track — so the ~2.5s settle
+    window is already spent by the time playback starts. Measured: a warmed URL then
+    delivers its first byte in 0.02s instead of costing three retries (~2.8s).
+
+    Uses a 1-byte range, so a probe transfers nothing. Two things were verified before
+    building this: a 1-byte probe reaches "live" at the same moment a full window would
+    (2.55 / 2.58 / 0.02s across three videos, matching the known distribution), and
+    probing then abandoning does NOT consume the URL — the real stream afterwards still
+    downloaded every byte (3433755/3433755 etc.).
+
+    Returns True once the URL serves. False just means playback will do its own settle
+    wait exactly as before, so a failure here is never worse than not calling it.
+    """
+    if not _IMPERSONATE_AVAILABLE or not url:
+        return False
+    from curl_cffi import requests as curl_requests
+
+    session = curl_requests.Session(impersonate="chrome")
+    try:
+        for attempt, delay in enumerate((0.0,) + _STREAM_SETTLE_BACKOFF):
+            if delay:
+                time.sleep(delay)   # executor thread — blocking sleep is correct here
+            try:
+                resp = session.get(_range_url(url, 0, 0), stream=True,
+                                   timeout=_STREAM_TIMEOUT)
+                next(resp.iter_content(chunk_size=1), b"")
+                code = resp.status_code
+                resp.close()
+            except Exception:
+                continue            # transient — the ladder retries
+            if code in (200, 206):
+                if debug:
+                    print(f"[debug][stream] CDN URL warm after {attempt + 1} probe(s)")
+                return True
+        return False
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
 class _StreamStartError(RuntimeError):
     """The in-process reader could not open the stream; caller falls back."""
 
