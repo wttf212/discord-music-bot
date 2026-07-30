@@ -128,8 +128,10 @@ class TestPrefetch(unittest.TestCase):
         with patch.object(commands, "get_audio_url_with_retry", return_value=_stale_info()), \
              patch("asyncio.sleep", fake_sleep):
             self._run(commands._prefetch_next_track(bot, 1))
-        self.assertTrue(waited and waited[0] > 7.0,
-                        f"expected a ~8s deferral, waited {waited}")
+        floor = commands._PREFETCH_MIN_INTERVAL
+        self.assertTrue(waited, "a prefetch inside the floor must wait, not drop")
+        self.assertAlmostEqual(waited[0], floor, delta=0.5,
+                               msg=f"expected a ~{floor}s deferral, waited {waited}")
 
     def test_requeries_next_track_after_deferring(self):
         """A skip during the wait changes what plays next — re-read, don't prefetch

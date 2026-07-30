@@ -844,6 +844,54 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
         )
 
 
+# --- Interaction acknowledgement -----------------------------------------------
+#
+# Discord invalidates an interaction token 3 seconds after the click. Under load that
+# can elapse before we answer — a real session produced
+#   discord.errors.NotFound: 404 (error code: 10062): Unknown interaction
+# from next_callback while the bot was mid-resolve. The skip still worked, but the
+# clicker saw "This interaction failed" and the log got a traceback.
+#
+# Two rules follow: acknowledge FIRST (before votes, cooldowns or any other work, so
+# none of the 3s budget is spent on things that can wait), and never let a dead token
+# raise — the action it triggered is still valid and must go ahead.
+async def _ack(interaction: discord.Interaction) -> bool:
+    """Acknowledge an interaction. False means the token is already dead."""
+    try:
+        await interaction.response.defer()
+        return True
+    except discord.InteractionResponded:
+        return True
+    except discord.HTTPException:
+        return False
+
+
+async def _respond(interaction: discord.Interaction, content: str,
+                   ephemeral: bool = True) -> None:
+    """Reply whether or not the interaction was already deferred; never raise."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+    except discord.HTTPException:
+        pass
+
+
+async def _edit_card(interaction: discord.Interaction, view: "PlayerView") -> None:
+    """Update the card the click came from — via the interaction while its token
+    lives, else directly by message id, which uses the bot token and never expires."""
+    try:
+        await interaction.edit_original_response(view=view)
+        return
+    except discord.HTTPException:
+        pass
+    try:
+        await interaction.message.edit(view=view)
+    except Exception:
+        pass
+
+
 class _ControlsRow(discord.ui.ActionRow):
     """The five Now-Playing control buttons, rendered INSIDE the player Container.
 
@@ -854,6 +902,7 @@ class _ControlsRow(discord.ui.ActionRow):
 
     @discord.ui.button(label="‖", style=discord.ButtonStyle.success, custom_id="btn_playpause")  # ‖
     async def playpause_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ack(interaction)          # first — the 3s token clock is already running
         if not await self.view.evaluate_vote(interaction, "playpause"): return
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
@@ -863,15 +912,15 @@ class _ControlsRow(discord.ui.ActionRow):
             gs.player.resume()
         # Rebuild the card with the paused flag flipped to its new state.
         new_view = build_player_view(self.view.bot, **{**self.view._kwargs, "paused": gs.player.is_paused})
-        await interaction.response.edit_message(view=new_view)
+        await _edit_card(interaction, new_view)
 
     @discord.ui.button(label="◄", style=discord.ButtonStyle.primary, custom_id="btn_prev")  # ◄
     async def prev_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ack(interaction)          # first — the 3s token clock is already running
         if not await self.view.evaluate_vote(interaction, "prev"): return
         if _on_cooldown(interaction.guild_id, interaction.user.id, "skip", 2.0):
-            await interaction.response.send_message("Easy on the skip — give it a moment.", ephemeral=True)
+            await _respond(interaction, "Easy on the skip — give it a moment.")
             return
-        await interaction.response.defer()
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
         prev_track = gs.queue.previous()
@@ -904,11 +953,11 @@ class _ControlsRow(discord.ui.ActionRow):
 
     @discord.ui.button(label="►", style=discord.ButtonStyle.primary, custom_id="btn_next")  # ►
     async def next_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ack(interaction)          # first — the 3s token clock is already running
         if not await self.view.evaluate_vote(interaction, "next"): return
         if _on_cooldown(interaction.guild_id, interaction.user.id, "skip", 2.0):
-            await interaction.response.send_message("Easy on the skip — give it a moment.", ephemeral=True)
+            await _respond(interaction, "Easy on the skip — give it a moment.")
             return
-        await interaction.response.defer()
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
         if gs.auto_next_task and not gs.auto_next_task.done():
@@ -939,8 +988,8 @@ class _ControlsRow(discord.ui.ActionRow):
 
     @discord.ui.button(label="■", style=discord.ButtonStyle.danger, custom_id="btn_stop")  # ■
     async def stop_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ack(interaction)          # first — the 3s token clock is already running
         if not await self.view.evaluate_vote(interaction, "stop"): return
-        await interaction.response.defer()
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
         if gs.auto_next_task and not gs.auto_next_task.done():
@@ -979,7 +1028,7 @@ class _LoadPlaylistRow(discord.ui.ActionRow):
 
     @discord.ui.button(label="Load playlist", style=discord.ButtonStyle.success, custom_id="btn_load_playlist")
     async def load_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
+        await _ack(interaction)
         bot = self.view.bot
         guild_id = interaction.guild_id
         channel_id = interaction.channel.id
@@ -1271,7 +1320,8 @@ class PlayerView(discord.ui.LayoutView):
     async def evaluate_vote(self, interaction: discord.Interaction, action: str) -> bool:
         passes, msg = _check_vote(self.bot, interaction.guild, interaction.user, action)
         if not passes:
-            await interaction.response.send_message(msg, ephemeral=False)
+            # Callers acknowledge before voting, so this goes out as a followup.
+            await _respond(interaction, msg, ephemeral=False)
         return passes
 
 
@@ -1611,7 +1661,20 @@ async def update_np_stopped(bot, channel_id: int):
 #     so this does NOT add API calls per track — it just moves the one resolve
 #     earlier in time.
 # The floor DEFERS a prefetch, it does not cancel it — see _prefetch_next_track.
-_PREFETCH_MIN_INTERVAL = 8.0  # seconds; global floor between prefetch resolves
+#
+# 8s was too conservative to be useful and cost real latency: the skip buttons already
+# enforce a 2s per-user cooldown, so a floor 4x slower than the fastest possible skip
+# guaranteed the prefetch would fall behind and the track would resolve at play time
+# (~2s) and then wait out the CDN settle window (~2.8s).
+#
+# Crucially this does NOT trade anti-ban safety for speed. Prefetch only ever resolves
+# the track that is about to play, so under sustained skipping the number of /player
+# calls is IDENTICAL either way — one per track played. The floor never removed a call,
+# it only decided whether that call happened before playback or during it. What it
+# genuinely guards is a burst resolving several DIFFERENT tracks in quick succession
+# (queue churn), and 3s still bounds that to ~20/min, below what the 2s skip cooldown
+# already permits.
+_PREFETCH_MIN_INTERVAL = 3.0  # seconds; global floor between prefetch resolves
 _last_prefetch_monotonic = 0.0
 
 
