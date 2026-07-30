@@ -354,7 +354,7 @@ class TestGetAudioUrlWithRetry(unittest.TestCase):
 
     def test_success_returns_dict_unchanged(self):
         fake_result = {"title": "Song", "url": "https://example.com/audio.m4a",
-                       "http_headers": {}, "thumbnail": "", "webpage_url": "", "is_audio_only": True}
+                       "thumbnail": "", "webpage_url": "", "is_audio_only": True}
         with patch("audio_player.get_audio_url", return_value=fake_result) as mock_fn:
             with patch.object(audio_player.time, "sleep", lambda s: None):
                 result = get_audio_url_with_retry("test query", "web")
@@ -400,7 +400,7 @@ class TestGetAudioUrlWithRetry(unittest.TestCase):
             call_kwargs["max_attempts"] = max_attempts
             call_kwargs["base_delay"] = base_delay
             call_kwargs["jitter"] = jitter
-            return {"title": "t", "url": "u", "http_headers": {}, "thumbnail": "",
+            return {"title": "t", "url": "u", "thumbnail": "",
                     "webpage_url": "", "is_audio_only": True}
 
         with patch("audio_player._retry_with_backoff", side_effect=fake_retry):

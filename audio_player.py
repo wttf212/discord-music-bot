@@ -301,13 +301,9 @@ _resolve_cache_lock = threading.Lock()
 
 
 def _copy_stream_info(info: dict) -> dict:
-    """Shallow copy incl. http_headers, so a caller mutating the result of a cache hit
-    cannot corrupt the cached entry (or another guild's copy of it)."""
-    copy = dict(info)
-    headers = copy.get("http_headers")
-    if isinstance(headers, dict):
-        copy["http_headers"] = dict(headers)
-    return copy
+    """Copy a resolve result so a caller mutating a cache hit cannot corrupt the cached
+    entry (or another guild's copy). Every value is a scalar, so shallow is enough."""
+    return dict(info)
 
 
 def _resolve_cache_get(query: str) -> dict | None:
@@ -481,9 +477,6 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
         if "entries" in info:
             info = info["entries"][0]
 
-        # Extract HTTP headers that yt-dlp wants us to use (critical for YouTube)
-        http_headers = info.get("http_headers", {})
-
         if debug:
             print(f"[debug][yt-dlp] Title: {info.get('title', 'Unknown')}")
             print(f"[debug][yt-dlp] Extractor: {info.get('extractor', 'N/A')}")
@@ -500,7 +493,6 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
             print(f"[debug][yt-dlp] URL prefix: {url[:120]}...")
             print(f"[debug][yt-dlp] URL contains 'googlevideo': {'googlevideo' in url}")
             print(f"[debug][yt-dlp] URL contains 'soundcloud': {'soundcloud' in url}")
-            print(f"[debug][yt-dlp] HTTP headers from yt-dlp: {http_headers}")
             # Log all available formats for comparison
             formats = info.get("formats", [])
             print(f"[debug][yt-dlp] Total formats available: {len(formats)}")
@@ -564,29 +556,15 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
                                      ".googlevideo.com", "googlevideo.com"))
                 ]
                 if yt_cookies:
-                    http_headers["Cookie"] = "; ".join(yt_cookies)
                     names = ", ".join(p.split("=", 1)[0] for p in yt_cookies)
                     print(f"[yt-dlp] Session cookies used for the resolve: "
                           f"{len(yt_cookies)} ({names}) — not sent to the CDN")
                 else:
                     print("[yt-dlp] Cookies: none found for youtube.com in cookiejar")
 
-            if "Referer" not in http_headers:
-                http_headers["Referer"] = "https://www.youtube.com/"
-
-        # Historical: back when FFmpeg fetched the stream itself, yt-dlp's browser
-        # navigation headers (Sec-Fetch-Mode: navigate, Accept: text/html,...) made the
-        # CDN serve an HTML page instead of media and crash the decoder, so the set was
-        # filtered down to these four. Nothing consumes http_headers today — FFmpeg only
-        # reads a pipe and the in-process reader sends none — so this is reported
-        # metadata, not request configuration.
-        FFMPEG_ALLOWED_HEADERS = {"User-Agent", "Cookie", "Referer", "Origin"}
-        http_headers = {k: v for k, v in http_headers.items() if k in FFMPEG_ALLOWED_HEADERS}
-
         result = {
             "url": info["url"],
             "title": info.get("title", "Unknown"),
-            "http_headers": http_headers,
             "thumbnail": info.get("thumbnail", ""),
             "webpage_url": info.get("webpage_url", ""),
             "is_audio_only": is_audio_only,

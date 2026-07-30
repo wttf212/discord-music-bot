@@ -28,7 +28,6 @@ def _info(video_id="abc12345678", expire_in=6 * 3600, audio_only=True):
     return {
         "url": f"https://r5---sn-x.googlevideo.com/videoplayback?expire={int(time.time()) + expire_in}&id={video_id}",
         "title": f"Track {video_id}",
-        "http_headers": {"User-Agent": "UA"},
         "thumbnail": "",
         "webpage_url": WATCH.format(video_id),
         "is_audio_only": audio_only,
@@ -128,10 +127,19 @@ class TestResolveCache(unittest.TestCase):
         _resolve_cache_put("abc12345678", _info("abc12345678"))
         first = _resolve_cache_get(WATCH.format("abc12345678"))
         first["title"] = "MUTATED"
-        first["http_headers"]["Cookie"] = "leaked"
+        first["url"] = "https://evil/"
         second = _resolve_cache_get(WATCH.format("abc12345678"))
+        self.assertIsNot(first, second)
         self.assertEqual(second["title"], "Track abc12345678")
-        self.assertNotIn("Cookie", second["http_headers"])
+        self.assertNotEqual(second["url"], "https://evil/")
+
+    def test_put_snapshots_the_caller_dict(self):
+        """Mutating the dict after caching must not rewrite the cached entry."""
+        info = _info("abc12345678")
+        _resolve_cache_put("abc12345678", info)
+        info["title"] = "MUTATED AFTER PUT"
+        self.assertEqual(_resolve_cache_get(WATCH.format("abc12345678"))["title"],
+                         "Track abc12345678")
 
     def test_lru_bound_evicts_oldest(self):
         for i in range(_RESOLVE_CACHE_MAX + 20):
