@@ -12,7 +12,7 @@ from discord import app_commands
 from track_queue import Track
 from audio_player import (
     is_playlist_url, extract_playlist_info, get_audio_url_with_retry,
-    is_stream_info_fresh, get_related_tracks,
+    is_stream_info_fresh, get_related_tracks, _youtube_video_id,
 )
 from spotify import is_spotify_url, resolve_spotify, SpotifyError
 import weather
@@ -1078,7 +1078,8 @@ class PlayerView(discord.ui.LayoutView):
                  queue_tracks: list | None = None,
                  guild_id: int | None = None,
                  paused: bool = False,
-                 finished: bool = False):
+                 finished: bool = False,
+                 loading: bool = False):
         super().__init__(timeout=None)
         self.bot = bot
         # Store every kwarg so a button can rebuild the card (e.g. play/pause flip).
@@ -1096,6 +1097,7 @@ class PlayerView(discord.ui.LayoutView):
         self._guild_id = guild_id
         self._paused = paused
         self._finished = finished
+        self._loading = loading
         self._build()
 
     def _build(self):
@@ -1113,7 +1115,14 @@ class PlayerView(discord.ui.LayoutView):
         c = discord.ui.Container(accent_colour=discord.Colour(accent))
 
         # Header line
-        header = "**Paused**" if paused else ("**Queue finished**" if finished else "**Now Playing**")
+        if self._loading:
+            header = "**Loading…**"
+        elif paused:
+            header = "**Paused**"
+        elif finished:
+            header = "**Queue finished**"
+        else:
+            header = "**Now Playing**"
         c.add_item(discord.ui.TextDisplay(header))
 
         if not finished:
@@ -1166,7 +1175,9 @@ class PlayerView(discord.ui.LayoutView):
         c.add_item(discord.ui.Separator())
 
         # Controls live ABOVE the requester/footer line (matching the reference).
-        if not finished:
+        # The loading card omits them: nothing is playing yet, so skip/pause/stop
+        # would act on the previous track (or on nothing at all).
+        if not finished and not self._loading:
             controls = _ControlsRow()
             # Reflect paused state on the play/pause glyph (▶ = resume, ‖ = pause).
             for _item in controls.children:
@@ -1269,13 +1280,24 @@ def build_player_view(bot, title: str, extra_desc: str = "",
                       queue_tracks: list | None = None,
                       guild_id: int | None = None,
                       paused: bool = False,
-                      finished: bool = False) -> PlayerView:
+                      finished: bool = False,
+                      loading: bool = False) -> PlayerView:
     """Build the Components V2 Now-Playing card (replaces create_np_embed)."""
     return PlayerView(
         bot, title=title, extra_desc=extra_desc, thumbnail=thumbnail, url=url,
         requester_name=requester_name, queue_tracks=queue_tracks,
-        guild_id=guild_id, paused=paused, finished=finished,
+        guild_id=guild_id, paused=paused, finished=finished, loading=loading,
     )
+
+
+# YouTube serves video thumbnails off i.ytimg.com from the video id alone, with no
+# API call — and Discord's CDN is what fetches the image, not us, so showing artwork
+# before the resolve costs ZERO requests from our IP. hqdefault exists for every
+# video (maxresdefault does not).
+def _youtube_thumbnail(query: str) -> str:
+    """Thumbnail URL derivable from a direct YouTube link, or "" for anything else."""
+    video_id = _youtube_video_id(query or "")
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else ""
 
 
 _MENTION_RE = re.compile(r"<@!?(\d+)>")
@@ -1540,6 +1562,22 @@ async def update_np_embed(bot, channel_id: int, view: "PlayerView"):
     if not msg_id:
         return
     asyncio.create_task(_do_update_np_embed(bot, channel, msg_id, view))
+
+
+async def _clear_np(bot, channel_id: int):
+    """Delete the current NP card and forget it.
+
+    Used when a play attempt that already showed a loading card fails — leaving a
+    permanent "Loading…" card behind would be worse than no card at all.
+    """
+    channel = bot.get_channel(channel_id)
+    if not channel or not hasattr(channel, 'guild') or not channel.guild:
+        return
+    gs = bot.get_guild_state(channel.guild.id)
+    msg_id = gs.np_message_id
+    gs.np_message_id = None
+    if msg_id:
+        await _safe_delete(channel.get_partial_message(msg_id))
 
 
 async def update_np_stopped(bot, channel_id: int):
@@ -2148,11 +2186,33 @@ class MusicCog(commands.Cog):
                 await ctx.send(f"Failed to join voice channel: {e}")
                 return
 
-        status_msg = await ctx.send("Resolving…")
+        # Show the card straight away. For a direct YouTube link the artwork is
+        # derivable from the video id with no API call, so the user sees the track
+        # within ~200ms instead of staring at "Resolving…" through the resolve AND
+        # the CDN settle window. It becomes the live card via an in-place edit once
+        # playback starts — same message, no delete-and-resend flicker.
+        loading_view = build_player_view(
+            self.bot, "Loading…",
+            thumbnail=_youtube_thumbnail(query),
+            url=query if query.startswith(("http://", "https://")) else "",
+            requester_name=f"<@{user_id}>",
+            queue_tracks=gs.queue.preview_fair_order(),
+            guild_id=ctx.guild.id, loading=True,
+        )
+        await send_new_np(self.bot, channel_id, loading_view)
+
+        async def _fail(message: str):
+            """Replace the loading card with a plain error line."""
+            await _clear_np(self.bot, channel_id)
+            try:
+                await ctx.send(message)
+            except Exception:
+                pass
+
         try:
             info = await resolve_fut
         except Exception as e:
-            await status_msg.edit(content=f"Error playing track: {_friendly_ytdlp_error(e)}")
+            await _fail(f"Error playing track: {_friendly_ytdlp_error(e)}")
             return
 
         resolved_at = time.time()
@@ -2179,11 +2239,11 @@ class MusicCog(commands.Cog):
                                     requester_name=f"<@{user_id}>",
                                     queue_tracks=gs.queue.preview_fair_order(),
                                     guild_id=ctx.guild.id)
-            asyncio.create_task(_safe_delete(status_msg))
-            await send_new_np(self.bot, channel_id, view)
+            # Edit the loading card in place rather than sending a second message.
+            await update_np_embed(self.bot, channel_id, view)
             _start_auto_next(self.bot, channel_id, ctx.guild.id)
         except Exception as e:
-            await status_msg.edit(content=f"Error playing track: {e}")
+            await _fail(f"Error playing track: {e}")
 
     @commands.hybrid_command(name="radio", description="Browse or search internet radio stations")
     @app_commands.describe(query="Station name to search, or leave blank to browse by country/genre")
