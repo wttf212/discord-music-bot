@@ -3,7 +3,7 @@
 Verify that _prefetch_next_track:
   * resolves the fair-play-predicted next track and caches it on the Track,
   * skips a track that already holds a fresh cached resolve,
-  * is floored by the global minimum interval (no clustering),
+  * DEFERS (never drops) when the global minimum interval has not elapsed,
   * never prefetches a live radio track,
 and that _schedule_prefetch keeps at most one prefetch in flight per guild.
 """
@@ -83,15 +83,63 @@ class TestPrefetch(unittest.TestCase):
             self._run(commands._prefetch_next_track(bot, 1))
         self.assertEqual(m.call_count, 0)  # already fresh — no refetch
 
-    def test_global_throttle_blocks_back_to_back(self):
+    def test_global_throttle_defers_instead_of_dropping(self):
+        """The floor must DELAY the second resolve, not discard it.
+
+        Dropping it was the skip-lag bug: nothing rescheduled, so the next track
+        resolved at play time (~2s) and could hit the CDN settle window on top.
+        Skipping every ~10s against an 8s floor lost roughly every other prefetch.
+        """
         bot = _Bot()
         bot._gs.queue.add(Track(query="q1", title="q1", requested_by="u1"))
         bot._gs.queue.add(Track(query="q2", title="q2", requested_by="u1"))
+        slept = []
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+
         # Stale results so skip-if-fresh never triggers — isolates the throttle.
-        with patch.object(commands, "get_audio_url_with_retry", return_value=_stale_info()) as m:
+        with patch.object(commands, "get_audio_url_with_retry", return_value=_stale_info()) as m, \
+             patch("asyncio.sleep", fake_sleep):
             self._run(commands._prefetch_next_track(bot, 1))
             self._run(commands._prefetch_next_track(bot, 1))
-        self.assertEqual(m.call_count, 1)  # second call floored by _PREFETCH_MIN_INTERVAL
+        self.assertEqual(m.call_count, 2, "the deferred prefetch must still happen")
+        self.assertEqual(len(slept), 1, "only the throttled call should wait")
+        self.assertGreater(slept[0], 0)
+        self.assertLessEqual(slept[0], commands._PREFETCH_MIN_INTERVAL,
+                             "never wait longer than the floor itself")
+
+    def test_spacing_floor_still_respected(self):
+        """Anti-ban invariant: resolves stay >= _PREFETCH_MIN_INTERVAL apart."""
+        bot = _Bot()
+        bot._gs.queue.add(Track(query="q1", title="q1", requested_by="u1"))
+        commands._last_prefetch_monotonic = time.monotonic()
+        waited = []
+
+        async def fake_sleep(seconds):
+            waited.append(seconds)
+
+        with patch.object(commands, "get_audio_url_with_retry", return_value=_stale_info()), \
+             patch("asyncio.sleep", fake_sleep):
+            self._run(commands._prefetch_next_track(bot, 1))
+        self.assertTrue(waited and waited[0] > 7.0,
+                        f"expected a ~8s deferral, waited {waited}")
+
+    def test_requeries_next_track_after_deferring(self):
+        """A skip during the wait changes what plays next — re-read, don't prefetch
+        the track that was next when the prefetch was scheduled."""
+        bot = _Bot()
+        bot._gs.queue.add(Track(query="stale-pick", title="s", requested_by="u1"))
+        commands._last_prefetch_monotonic = time.monotonic()  # force a deferral
+
+        async def fake_sleep(seconds):
+            bot._gs.queue.clear()
+            bot._gs.queue.add(Track(query="actual-next", title="a", requested_by="u1"))
+
+        with patch.object(commands, "get_audio_url_with_retry", return_value=_stale_info()) as m, \
+             patch("asyncio.sleep", fake_sleep):
+            self._run(commands._prefetch_next_track(bot, 1))
+        self.assertEqual(m.call_args[0][0], "actual-next")
 
     def test_radio_track_not_prefetched(self):
         bot = _Bot()

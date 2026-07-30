@@ -1609,6 +1609,7 @@ async def update_np_stopped(bot, channel_id: int):
 #   * the cached result REPLACES the play-time resolve (AudioPlayer.play reuses it),
 #     so this does NOT add API calls per track — it just moves the one resolve
 #     earlier in time.
+# The floor DEFERS a prefetch, it does not cancel it — see _prefetch_next_track.
 _PREFETCH_MIN_INTERVAL = 8.0  # seconds; global floor between prefetch resolves
 _last_prefetch_monotonic = 0.0
 
@@ -1617,21 +1618,37 @@ async def _prefetch_next_track(bot, guild_id):
     """Resolve the fair-play-predicted next track's CDN URL in the background."""
     global _last_prefetch_monotonic
     gs = bot.get_guild_state(guild_id)
+    debug = bot.config.get("debug", False)
     try:
+        # WAIT OUT the global floor instead of dropping the prefetch. Returning here
+        # silently lost it: nothing reschedules, so the next track resolved at play
+        # time (~2s) and could then hit the CDN settle window on top. Skipping every
+        # ~10s against an 8s floor meant losing roughly every other prefetch.
+        # Sleeping preserves the invariant that actually protects the IP — at most one
+        # prefetch resolve per _PREFETCH_MIN_INTERVAL — while still arriving before the
+        # track is needed. gs.prefetch_task stays alive across the sleep, so the
+        # single-in-flight guard still collapses a burst of skips into one prefetch.
+        wait = _PREFETCH_MIN_INTERVAL - (time.monotonic() - _last_prefetch_monotonic)
+        if wait > 0:
+            if debug:
+                print(f"[debug][prefetch] throttled — deferring {wait:.1f}s")
+            await asyncio.sleep(wait)
+
+        # Re-read AFTER the wait: skips during the sleep change what plays next.
         upcoming = gs.queue.preview_fair_order(1)
         if not upcoming:
+            if debug:
+                print("[debug][prefetch] nothing queued — skipped")
             return
         track = upcoming[0]
         if track.is_radio:
             return
         # Already have a still-fresh resolve for this exact track — don't refetch.
         if track.resolved_info and is_stream_info_fresh(track.resolved_info, track.resolved_at):
+            if debug:
+                print(f"[debug][prefetch] already fresh: {track.title[:40]!r}")
             return
-        # Global rate-limit: never let prefetch resolves cluster (protects the IP).
-        now = time.monotonic()
-        if now - _last_prefetch_monotonic < _PREFETCH_MIN_INTERVAL:
-            return
-        _last_prefetch_monotonic = now
+        _last_prefetch_monotonic = time.monotonic()
 
         yt_client = bot.config.get("youtube", {}).get("client", "web")
         cookies_file = bot.config.get("youtube", {}).get("cookies_file") or None
@@ -1640,6 +1657,10 @@ async def _prefetch_next_track(bot, guild_id):
         )
         track.resolved_info = info
         track.resolved_at = time.time()
+        if debug:
+            print(f"[debug][prefetch] ready: {info.get('title', '?')[:40]!r}")
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         print(f"[commands] Prefetch failed (will resolve at play time): {e}")
 
