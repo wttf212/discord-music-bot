@@ -397,25 +397,98 @@ def get_audio_url_with_retry(query: str, client: str, debug: bool = False, cooki
     )
 
 
+# Two callers can want the same video at once: a skip fires play()'s resolve while the
+# background prefetch for that very track is still in flight. Both would issue their own
+# /player call — double the API traffic in exactly the skip-heavy pattern where rate
+# limiting matters most — and the loser would also get a cold throwaway resolver. So the
+# second caller waits for the first and reads its result out of the resolve cache.
+_INFLIGHT_WAIT = 20.0   # seconds; longer than a resolve+retries, then give up and self-serve
+_inflight_resolves: dict[str, "_InflightResolve"] = {}
+_inflight_lock = threading.Lock()
+
+
+class _InflightResolve:
+    """A resolve in progress. The leader publishes its result here directly rather than
+    via the resolve cache — results that are deliberately not cached (a degraded
+    format-18 fallback) would otherwise still cost every waiter a duplicate call."""
+
+    __slots__ = ("event", "result")
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.result: dict | None = None
+
+
+def _claim_resolve(video_id: str) -> "_InflightResolve | None":
+    """Claim this video's resolve, or return the in-flight entry to wait on."""
+    with _inflight_lock:
+        existing = _inflight_resolves.get(video_id)
+        if existing is not None:
+            return existing
+        _inflight_resolves[video_id] = _InflightResolve()
+        return None
+
+
+def _release_resolve(video_id: str, result: dict | None = None) -> None:
+    """Publish the outcome (result, or None on failure) and wake anyone waiting."""
+    with _inflight_lock:
+        entry = _inflight_resolves.pop(video_id, None)
+    if entry is not None:
+        entry.result = result
+        entry.event.set()
+
+
 def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: str | None = None,
                   *, force_cli: bool = False) -> dict:
-    """Extract audio URL and title via yt-dlp. Supports YouTube, SoundCloud, and others.
+    """Resolve a track to a streamable CDN URL + metadata.
 
-    ``force_cli`` forces the bgutil CLI PO token provider and bypasses the resolve
-    cache. It is set only by the internal one-shot retry after a degraded resolve.
+    Wraps the actual extraction with the two things that keep repeat and concurrent
+    plays cheap: the video-id resolve cache, and in-flight de-duplication so two
+    callers racing for the same video make one API call between them.
+
+    ``force_cli`` forces the bgutil CLI PO token provider and bypasses both. It is set
+    only by the internal one-shot retry after a degraded resolve.
     """
-    original_query = query
+    if force_cli:
+        return _resolve_audio_url(query, client, debug, cookies_file, force_cli=True)
 
     # A previously resolved CDN URL is good until its `expire=`, so replaying the same
     # video skips the whole ~3s resolve (and one /player call). Direct YouTube URLs only
     # — a text query has no video id to key on until it has been resolved once.
-    if not force_cli:
-        cached = _resolve_cache_get(query)
-        if cached is not None:
-            if debug:
-                print(f"[debug][yt-dlp] Resolve cache hit: {cached['title']!r}")
-            return cached
+    cached = _resolve_cache_get(query)
+    if cached is not None:
+        if debug:
+            print(f"[debug][yt-dlp] Resolve cache hit: {cached['title']!r}")
+        return cached
 
+    video_id = _youtube_video_id(query)
+    if not video_id:
+        return _resolve_audio_url(query, client, debug, cookies_file)
+
+    inflight = _claim_resolve(video_id)
+    if inflight is not None:
+        # Someone else is already resolving this exact video — wait for them rather
+        # than issuing a second /player call for it.
+        if debug:
+            print(f"[debug][yt-dlp] Resolve already in flight for {video_id} — waiting")
+        inflight.event.wait(timeout=_INFLIGHT_WAIT)
+        if inflight.result is not None:
+            return _copy_stream_info(inflight.result)
+        # Leader failed or timed out — do it ourselves rather than inherit its failure.
+        return _resolve_audio_url(query, client, debug, cookies_file)
+
+    result = None
+    try:
+        result = _resolve_audio_url(query, client, debug, cookies_file)
+        return result
+    finally:
+        _release_resolve(video_id, result)
+
+
+def _resolve_audio_url(query: str, client: str, debug: bool = False,
+                       cookies_file: str | None = None, *, force_cli: bool = False) -> dict:
+    """Extract audio URL and title via yt-dlp. Supports YouTube, SoundCloud, and others."""
+    original_query = query
     ffmpeg_exe = _find_ffmpeg("ffmpeg")
     ydl_opts = {
         "format": "bestaudio/best",

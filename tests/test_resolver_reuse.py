@@ -156,17 +156,17 @@ class TestConcurrencySafety(ResolverTestCase):
 
 class TestGetAudioUrlUsesResolver(unittest.TestCase):
 
-    def test_get_audio_url_goes_through_resolver(self):
+    def test_extraction_goes_through_resolver(self):
         import inspect
-        src = inspect.getsource(audio_player.get_audio_url)
+        src = inspect.getsource(audio_player._resolve_audio_url)
         self.assertIn("_resolver(resolver_key, ydl_opts)", src)
         self.assertNotIn("with YoutubeDL(ydl_opts) as ydl", src,
-                         "get_audio_url must not build its own instance any more")
+                         "extraction must not build its own instance any more")
 
     def test_resolver_key_covers_every_option_that_shapes_opts(self):
         """A key collision would hand back an instance configured for other options."""
         import inspect
-        src = inspect.getsource(audio_player.get_audio_url)
+        src = inspect.getsource(audio_player._resolve_audio_url)
         self.assertIn("resolver_key = (client, cookies_file, debug, force_cli, is_yt)", src)
 
 
