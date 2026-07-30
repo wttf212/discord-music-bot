@@ -108,6 +108,18 @@ class TrackQueue:
             return track
         return None
 
+    def discard(self, track: Track) -> bool:
+        """Remove this exact pending track by identity. True if it was queued.
+
+        Index-based remove() is unusable here: the prefetch picks its target via
+        preview_fair_order(), whose ordering is not the raw queue order.
+        """
+        for i, queued in enumerate(self._queue):
+            if queued is track:
+                del self._queue[i]
+                return True
+        return False
+
     def move(self, src: int, dst: int) -> Track | None:
         """Move the 1-based src-th pending track to the 1-based dst position."""
         n = len(self._queue)

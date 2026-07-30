@@ -13,7 +13,7 @@ from track_queue import Track
 from audio_player import (
     is_playlist_url, extract_playlist_info, get_audio_url_with_retry,
     is_stream_info_fresh, get_related_tracks, _youtube_video_id,
-    warm_stream_url, _can_stream_in_process,
+    warm_stream_url, _can_stream_in_process, is_permanent_resolve_error,
 )
 from spotify import is_spotify_url, resolve_spotify, SpotifyError
 import weather
@@ -1744,6 +1744,9 @@ async def update_np_stopped(bot, channel_id: int):
 # (queue churn), and 3s still bounds that to ~20/min, below what the 2s skip cooldown
 # already permits.
 _PREFETCH_MIN_INTERVAL = 3.0  # seconds; global floor between prefetch resolves
+# How many consecutive permanently-dead tracks one prefetch pass will drop before
+# giving up. Bounded so a playlist full of removed videos can't spin.
+_PREFETCH_MAX_DEAD_SKIPS = 3
 _last_prefetch_monotonic = 0.0
 
 
@@ -1768,26 +1771,43 @@ async def _prefetch_next_track(bot, guild_id):
             await asyncio.sleep(wait)
 
         # Re-read AFTER the wait: skips during the sleep change what plays next.
-        upcoming = gs.queue.preview_fair_order(1)
-        if not upcoming:
-            if debug:
-                print("[debug][prefetch] nothing queued — skipped")
-            return
-        track = upcoming[0]
-        if track.is_radio:
-            return
-        # Already have a still-fresh resolve for this exact track — don't refetch.
-        if track.resolved_info and is_stream_info_fresh(track.resolved_info, track.resolved_at):
-            if debug:
-                print(f"[debug][prefetch] already fresh: {track.title[:40]!r}")
-            return
-        _last_prefetch_monotonic = time.monotonic()
-
+        # Loops so a track that turns out to be permanently gone is dropped and the one
+        # behind it gets prefetched instead — otherwise every dead track in a playlist
+        # costs a failed play AND a cold start for whatever follows it.
         yt_client = bot.config.get("youtube", {}).get("client", "web")
         cookies_file = bot.config.get("youtube", {}).get("cookies_file") or None
-        info = await asyncio.get_event_loop().run_in_executor(
-            None, get_audio_url_with_retry, track.query, yt_client, False, cookies_file
-        )
+        info = None
+        for _ in range(_PREFETCH_MAX_DEAD_SKIPS + 1):
+            upcoming = gs.queue.preview_fair_order(1)
+            if not upcoming:
+                if debug:
+                    print("[debug][prefetch] nothing queued — skipped")
+                return
+            track = upcoming[0]
+            if track.is_radio:
+                return
+            # Already have a still-fresh resolve for this exact track — don't refetch.
+            if track.resolved_info and is_stream_info_fresh(track.resolved_info, track.resolved_at):
+                if debug:
+                    print(f"[debug][prefetch] already fresh: {track.title[:40]!r}")
+                return
+            _last_prefetch_monotonic = time.monotonic()
+            try:
+                info = await asyncio.get_event_loop().run_in_executor(
+                    None, get_audio_url_with_retry, track.query, yt_client, False, cookies_file
+                )
+                break
+            except Exception as e:
+                # Removed / private / geo-blocked: it can never play, so take it out now
+                # instead of letting playback discover it. Anything else (network, 429)
+                # is left alone — play() will retry it for real.
+                if not is_permanent_resolve_error(e) or not gs.queue.discard(track):
+                    raise
+                print(f"[commands] Dropped unplayable track {track.title[:40]!r}: "
+                      f"{_friendly_ytdlp_error(e)}")
+        if info is None:
+            return
+
         track.resolved_info = info
         track.resolved_at = time.time()
         if debug:

@@ -212,6 +212,16 @@ def _is_retryable_ytdlp_error(exc: BaseException) -> bool:
     return True
 
 
+def is_permanent_resolve_error(exc: BaseException) -> bool:
+    """True when re-resolving this track can never succeed — removed by the uploader,
+    private, age-gated, geo-blocked, members-only.
+
+    Lets the prefetch drop such a track from the queue instead of leaving it to fail at
+    playback, where it costs a failed play plus a cold start for whatever follows.
+    """
+    return not _is_retryable_ytdlp_error(exc)
+
+
 def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.0,
                         fast_delay: float = 1.5, jitter: float = 0.25, **kwargs):
     """Retry a synchronous callable with exponential backoff + jitter.
