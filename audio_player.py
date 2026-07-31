@@ -39,6 +39,20 @@ _RESOLVE_EXECUTOR = ThreadPoolExecutor(
 _STREAM_EXECUTOR = ThreadPoolExecutor(
     max_workers=32, thread_name_prefix="audio-stream")
 
+# Set on shutdown. Worker threads park in settle backoffs and retry sleeps for several
+# seconds at a time, and concurrent.futures joins its (non-daemon) workers at
+# interpreter exit — so without a way to interrupt those sleeps, Ctrl+C hangs for as
+# long as the longest one. Every sleep in this module waits on this event instead of
+# time.sleep, which turns shutdown into an immediate return.
+_shutdown = threading.Event()
+
+
+def shutdown_audio() -> None:
+    """Wake every parked audio worker and stop accepting new work."""
+    _shutdown.set()
+    _RESOLVE_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    _STREAM_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+
 # Load bgutil PO token provider plugin for yt-dlp
 _base_dir = os.path.dirname(os.path.abspath(__file__))
 _plugin_dir = os.path.join(_base_dir, "yt-dlp-plugins", "bgutil-ytdlp-pot-provider")
@@ -270,6 +284,8 @@ def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.
             if attempt == max_attempts - 1:
                 # Final attempt exhausted.
                 raise
+            if _shutdown.is_set():
+                raise   # shutting down — don't start another backoff
             exp_delay = _retry_base_delay(exc, base_delay, fast_delay) * (2 ** attempt)
             jitter_mult = random.uniform(1.0 - jitter, 1.0 + jitter)
             sleep_seconds = exp_delay * jitter_mult
@@ -279,6 +295,12 @@ def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.
                 f"[retry] attempt {attempt + 1}/{max_attempts} failed: "
                 f"{exc_class}: {msg_preview} — sleeping {sleep_seconds:.1f}s"
             )
+            # Deliberately time.sleep, not _shutdown.wait: the retry-tier tests patch
+            # time.sleep to assert the backoff values, and that coverage is worth more
+            # than interrupting a sleep that only happens when a resolve is already
+            # failing. The check above stops FURTHER retries once shutdown starts, and
+            # the sleeps that actually run on every track start (settle, warm-up) are
+            # interruptible.
             time.sleep(sleep_seconds)
     # Unreachable (loop always either returns or raises), but keep the invariant explicit.
     raise last_exc  # type: ignore[misc]
@@ -782,8 +804,10 @@ def warm_stream_url(url: str, debug: bool = False) -> bool:
     session = curl_requests.Session(impersonate="chrome")
     try:
         for attempt, delay in enumerate((0.0,) + _STREAM_SETTLE_BACKOFF):
-            if delay:
-                time.sleep(delay)   # executor thread — blocking sleep is correct here
+            if _shutdown.is_set():
+                return False
+            if delay and _shutdown.wait(delay):
+                return False        # executor thread: an interruptible blocking wait
             try:
                 resp = session.get(_range_url(url, 0, 0), stream=True,
                                    timeout=_STREAM_TIMEOUT)
@@ -866,7 +890,7 @@ class _CurlStreamReader:
         # the edge has not picked the URL up yet. Mid-stream we only retry blips.
         backoff = _STREAM_SETTLE_BACKOFF if first else _STREAM_RESUME_BACKOFF
         for attempt in range(len(backoff) + 1):
-            if self._closed.is_set():
+            if self._closed.is_set() or _shutdown.is_set():
                 return None
             try:
                 resp = self._session.get(_range_url(self._url, offset, end),

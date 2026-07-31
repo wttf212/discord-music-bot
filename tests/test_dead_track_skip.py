@@ -99,6 +99,16 @@ class TestPrefetchDropsDeadTracks(unittest.TestCase):
         self._warm = patch.object(commands, "warm_stream_url", return_value=True)
         self._warm.start()
         self.addCleanup(self._warm.stop)
+        # The floor is now enforced on every loop iteration, so a run of dead tracks
+        # really would wait _PREFETCH_MIN_INTERVAL each time. Record the waits instead.
+        self.waits = []
+
+        async def _no_sleep(seconds):
+            self.waits.append(seconds)
+
+        self._sleep = patch("asyncio.sleep", _no_sleep)
+        self._sleep.start()
+        self.addCleanup(self._sleep.stop)
 
     def test_dead_track_dropped_and_next_one_prefetched(self):
         bot = _Bot()
@@ -147,6 +157,9 @@ class TestPrefetchDropsDeadTracks(unittest.TestCase):
         self.assertEqual(len(calls), commands._PREFETCH_MAX_DEAD_SKIPS + 1)
         self.assertEqual(len(bot._gs.queue.list()),
                          10 - (commands._PREFETCH_MAX_DEAD_SKIPS + 1))
+        self.assertGreaterEqual(
+            len([w for w in self.waits if w > 0]), len(calls) - 1,
+            "each dead-track retry must still wait out the anti-ban floor")
 
     def test_all_dead_then_empty_queue_is_handled(self):
         bot = _Bot()

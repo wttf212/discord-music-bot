@@ -38,7 +38,7 @@ else:
 
 import discord
 from discord.ext import commands
-from audio_player import AudioPlayer
+from audio_player import AudioPlayer, shutdown_audio
 from track_queue import TrackQueue
 
 
@@ -116,6 +116,9 @@ class MusicBot(commands.Bot):
             gs.auto_next_gen += 1
             if gs.auto_next_task and not gs.auto_next_task.done():
                 gs.auto_next_task.cancel()
+        # Wake audio workers parked in settle backoffs / retry sleeps, or the
+        # interpreter's join-on-exit holds shutdown for as long as the longest sleep.
+        shutdown_audio()
         await super().close()
 
 

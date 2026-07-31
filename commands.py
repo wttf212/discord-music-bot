@@ -1771,13 +1771,6 @@ async def _prefetch_next_track(bot, guild_id):
         # prefetch resolve per _PREFETCH_MIN_INTERVAL — while still arriving before the
         # track is needed. gs.prefetch_task stays alive across the sleep, so the
         # single-in-flight guard still collapses a burst of skips into one prefetch.
-        wait = _PREFETCH_MIN_INTERVAL - (time.monotonic() - _last_prefetch_monotonic)
-        if wait > 0:
-            if debug:
-                print(f"[debug][prefetch] throttled — deferring {wait:.1f}s")
-            await asyncio.sleep(wait)
-
-        # Re-read AFTER the wait: skips during the sleep change what plays next.
         # Loops so a track that turns out to be permanently gone is dropped and the one
         # behind it gets prefetched instead — otherwise every dead track in a playlist
         # costs a failed play AND a cold start for whatever follows it.
@@ -1785,6 +1778,16 @@ async def _prefetch_next_track(bot, guild_id):
         cookies_file = bot.config.get("youtube", {}).get("cookies_file") or None
         info = None
         for _ in range(_PREFETCH_MAX_DEAD_SKIPS + 1):
+            # The floor is enforced on EVERY iteration, not just before the loop: a run
+            # of dead tracks would otherwise fire back-to-back resolves and punch
+            # straight through the rate limit that exists to protect the IP.
+            wait = _PREFETCH_MIN_INTERVAL - (time.monotonic() - _last_prefetch_monotonic)
+            if wait > 0:
+                if debug:
+                    print(f"[debug][prefetch] throttled — deferring {wait:.1f}s")
+                await asyncio.sleep(wait)
+
+            # Re-read AFTER the wait: skips during the sleep change what plays next.
             upcoming = gs.queue.preview_fair_order(1)
             if not upcoming:
                 if debug:
