@@ -49,6 +49,25 @@ class TestExtractPlaylistLimit(unittest.TestCase):
         opts = ydl_class.call_args[0][0]
         self.assertEqual(opts["playlistend"], MAX_PLAYLIST_TRACKS)
 
+    def test_max_playlist_tracks_is_2000(self):
+        self.assertEqual(MAX_PLAYLIST_TRACKS, 2000)
+
+    def test_sleep_interval_requests_paces_enumeration(self):
+        ydl_class = _mock_ydl(self._entries(3))
+        with patch("audio_player.YoutubeDL", ydl_class):
+            extract_playlist_info("https://www.youtube.com/playlist?list=X", "web")
+        opts = ydl_class.call_args[0][0]
+        self.assertEqual(opts["sleep_interval_requests"], 0.5)
+
+    def test_limit_1_fast_fetch_is_unpaced(self):
+        # limit=1 sits on the track-1 startup path — pacing there would delay
+        # playback by ~0.5s (yt-dlp sleeps before every request after the first).
+        ydl_class = _mock_ydl(self._entries(3))
+        with patch("audio_player.YoutubeDL", ydl_class):
+            extract_playlist_info("https://www.youtube.com/playlist?list=X", "web", limit=1)
+        opts = ydl_class.call_args[0][0]
+        self.assertNotIn("sleep_interval_requests", opts)
+
     def test_limit_clamped_low(self):
         ydl_class = _mock_ydl(self._entries(3))
         with patch("audio_player.YoutubeDL", ydl_class):

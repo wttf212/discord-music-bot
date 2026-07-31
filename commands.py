@@ -12,7 +12,9 @@ from discord import app_commands
 from track_queue import Track
 from audio_player import (
     is_playlist_url, extract_playlist_info, get_audio_url_with_retry,
-    is_stream_info_fresh, get_related_tracks,
+    is_stream_info_fresh, get_related_tracks, _youtube_video_id,
+    warm_stream_url, _can_stream_in_process, is_permanent_resolve_error,
+    _RESOLVE_EXECUTOR, _STREAM_EXECUTOR,
 )
 from spotify import is_spotify_url, resolve_spotify, SpotifyError
 import weather
@@ -200,6 +202,13 @@ _RADIO_GENRES = [
 
 _RADIO_SNI = "all.api.radio-browser.info"
 _RADIO_TIMEOUT = 10
+# all.api.radio-browser.info is a round-robin DNS pool of mirrors, not one stable
+# host. A fresh connection per attempt re-resolves the pool and often lands on a
+# different mirror (best-effort -- depends on the resolver), so a down / rate-limited
+# / redirecting mirror usually doesn't break radio: retry a few of them, and even
+# when the same mirror is picked, a transient blip on it typically clears on retry.
+_RADIO_ATTEMPTS = 3
+_RADIO_RETRY_DELAY = 0.5
 
 
 def _fetch_radio_stations(query: str | None, country: str = "", genre: str = "") -> list[dict]:
@@ -233,21 +242,42 @@ def _fetch_radio_stations(query: str | None, country: str = "", genre: str = "")
     else:
         path = "/json/stations/topvote?limit=50&hidebroken=true"
 
-    conn = None
-    try:
-        conn = http.client.HTTPSConnection(_RADIO_SNI, timeout=_RADIO_TIMEOUT)
-        conn.request("GET", path, headers={"User-Agent": "discord-music-bot/1.0"})
-        resp = conn.getresponse()
-        data = resp.read()
-    except OSError as e:
-        raise OSError(f"Cannot reach radio-browser.info ({e}) — check network/DNS connectivity") from e
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-    return json.loads(data)
+    # getresponse() does not raise on 4xx/5xx and http.client does not follow
+    # redirects, so a degraded mirror hands back a non-200 status, a truncated/
+    # unreadable body, or a non-JSON (often empty) body. Guard each of those and
+    # retry onto another mirror instead of surfacing a cryptic error to the user
+    # (the reported "Expecting value: line 1 column 1 (char 0)"). The handlers are
+    # deliberately broad: OSError/HTTPException = transport, ValueError = json.loads
+    # on a non-JSON *or* non-UTF-8 body (JSONDecodeError and UnicodeDecodeError both
+    # derive from ValueError).
+    last_err = None
+    for attempt in range(_RADIO_ATTEMPTS):
+        conn = None
+        try:
+            conn = http.client.HTTPSConnection(_RADIO_SNI, timeout=_RADIO_TIMEOUT)
+            conn.request("GET", path, headers={"User-Agent": "discord-music-bot/1.0"})
+            resp = conn.getresponse()
+            status = resp.status
+            data = resp.read()
+        except (OSError, http.client.HTTPException) as e:
+            last_err = OSError(f"Cannot reach radio-browser.info ({e}) — check network/DNS connectivity")
+        else:
+            if status != 200:
+                last_err = OSError(f"radio-browser.info returned HTTP {status} — service may be unavailable")
+            else:
+                try:
+                    return json.loads(data)
+                except ValueError as e:
+                    last_err = OSError(f"radio-browser.info sent an invalid response ({e}) — service may be unavailable")
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        if attempt + 1 < _RADIO_ATTEMPTS:
+            time.sleep(_RADIO_RETRY_DELAY)
+    raise last_err
 
 
 def _build_radio_embed(
@@ -740,7 +770,7 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
     # Start-playback path: overlap the URL resolve with the voice connect.
     yt_cfg = bot.config.get("youtube", {})
     resolve_fut = loop.run_in_executor(
-        None, get_audio_url_with_retry, url,
+        _RESOLVE_EXECUTOR, get_audio_url_with_retry, url,
         yt_cfg.get("client", "web"), bot.config.get("debug", False),
         yt_cfg.get("cookies_file") or None,
     )
@@ -780,6 +810,12 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
         return
 
     resolved_at = time.time()
+    # Disarm the armed auto-next chain BEFORE play(): play()'s internal stop_playback() sets
+    # _playback_done, which would otherwise wake the live chain mid-setup and start a competing play().
+    if gs.auto_next_task and not gs.auto_next_task.done():
+        gs.auto_next_task.cancel()
+        gs.auto_next_task = None
+    gs.auto_next_gen += 1
     try:
         played = await gs.player.play(url, info, resolved_at)
         title = played["title"]
@@ -809,6 +845,54 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
         )
 
 
+# --- Interaction acknowledgement -----------------------------------------------
+#
+# Discord invalidates an interaction token 3 seconds after the click. Under load that
+# can elapse before we answer — a real session produced
+#   discord.errors.NotFound: 404 (error code: 10062): Unknown interaction
+# from next_callback while the bot was mid-resolve. The skip still worked, but the
+# clicker saw "This interaction failed" and the log got a traceback.
+#
+# Two rules follow: acknowledge FIRST (before votes, cooldowns or any other work, so
+# none of the 3s budget is spent on things that can wait), and never let a dead token
+# raise — the action it triggered is still valid and must go ahead.
+async def _ack(interaction: discord.Interaction) -> bool:
+    """Acknowledge an interaction. False means the token is already dead."""
+    try:
+        await interaction.response.defer()
+        return True
+    except discord.InteractionResponded:
+        return True
+    except discord.HTTPException:
+        return False
+
+
+async def _respond(interaction: discord.Interaction, content: str,
+                   ephemeral: bool = True) -> None:
+    """Reply whether or not the interaction was already deferred; never raise."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+    except discord.HTTPException:
+        pass
+
+
+async def _edit_card(interaction: discord.Interaction, view: "PlayerView") -> None:
+    """Update the card the click came from — via the interaction while its token
+    lives, else directly by message id, which uses the bot token and never expires."""
+    try:
+        await interaction.edit_original_response(view=view)
+        return
+    except discord.HTTPException:
+        pass
+    try:
+        await interaction.message.edit(view=view)
+    except Exception:
+        pass
+
+
 class _ControlsRow(discord.ui.ActionRow):
     """The five Now-Playing control buttons, rendered INSIDE the player Container.
 
@@ -819,6 +903,7 @@ class _ControlsRow(discord.ui.ActionRow):
 
     @discord.ui.button(label="‖", style=discord.ButtonStyle.success, custom_id="btn_playpause")  # ‖
     async def playpause_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ack(interaction)          # first — the 3s token clock is already running
         if not await self.view.evaluate_vote(interaction, "playpause"): return
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
@@ -828,15 +913,15 @@ class _ControlsRow(discord.ui.ActionRow):
             gs.player.resume()
         # Rebuild the card with the paused flag flipped to its new state.
         new_view = build_player_view(self.view.bot, **{**self.view._kwargs, "paused": gs.player.is_paused})
-        await interaction.response.edit_message(view=new_view)
+        await _edit_card(interaction, new_view)
 
     @discord.ui.button(label="◄", style=discord.ButtonStyle.primary, custom_id="btn_prev")  # ◄
     async def prev_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ack(interaction)          # first — the 3s token clock is already running
         if not await self.view.evaluate_vote(interaction, "prev"): return
         if _on_cooldown(interaction.guild_id, interaction.user.id, "skip", 2.0):
-            await interaction.response.send_message("Easy on the skip — give it a moment.", ephemeral=True)
+            await _respond(interaction, "Easy on the skip — give it a moment.")
             return
-        await interaction.response.defer()
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
         prev_track = gs.queue.previous()
@@ -869,11 +954,11 @@ class _ControlsRow(discord.ui.ActionRow):
 
     @discord.ui.button(label="►", style=discord.ButtonStyle.primary, custom_id="btn_next")  # ►
     async def next_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ack(interaction)          # first — the 3s token clock is already running
         if not await self.view.evaluate_vote(interaction, "next"): return
         if _on_cooldown(interaction.guild_id, interaction.user.id, "skip", 2.0):
-            await interaction.response.send_message("Easy on the skip — give it a moment.", ephemeral=True)
+            await _respond(interaction, "Easy on the skip — give it a moment.")
             return
-        await interaction.response.defer()
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
         if gs.auto_next_task and not gs.auto_next_task.done():
@@ -904,8 +989,8 @@ class _ControlsRow(discord.ui.ActionRow):
 
     @discord.ui.button(label="■", style=discord.ButtonStyle.danger, custom_id="btn_stop")  # ■
     async def stop_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ack(interaction)          # first — the 3s token clock is already running
         if not await self.view.evaluate_vote(interaction, "stop"): return
-        await interaction.response.defer()
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
         if gs.auto_next_task and not gs.auto_next_task.done():
@@ -919,6 +1004,7 @@ class _ControlsRow(discord.ui.ActionRow):
     @discord.ui.button(label="☰", style=discord.ButtonStyle.secondary, custom_id="btn_queue")  # ☰
     async def queue_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Read-only: show the queue privately (ephemeral), no fairness vote required.
+        await _ack(interaction)          # first — the 3s token clock is already running
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
         tracks = gs.queue.list()
@@ -935,7 +1021,59 @@ class _ControlsRow(discord.ui.ActionRow):
         text = "\n".join(lines)
         if len(text) > 1900:
             text = text[:1900].rsplit("\n", 1)[0] + "\n*…more*"
-        await interaction.response.send_message(text, ephemeral=True)
+        await _respond(interaction, text)
+
+
+def _loading_offer_text(title: str) -> str:
+    """Placeholder offer text shown the instant the Load button appears, before
+    the background full-enumeration has landed."""
+    return f"**{title}** — loading track list…\nClick 'Load playlist' to add the rest."
+
+
+def _resolve_offer_outcome(full_info: dict, title: str):
+    """Resolve a completed full-enumeration result into the offer outcome.
+
+    Returns (action, extra_text, remaining) where action is "empty" (no more
+    tracks beyond track 1) or "ready" (remaining tracks available to load).
+    remaining = full_info["tracks"][1:] (track 1 was already played/queued).
+    """
+    remaining = (full_info.get("tracks") or [])[1:]
+    if not remaining:
+        return "empty", "", []
+    n = len(remaining)
+    extra = (f"**{title}** has **{n}** more tracks.\n"
+             f"Click 'Load playlist' to add them to the queue.")
+    return "ready", extra, remaining
+
+
+def _error_offer_text(title: str) -> str:
+    return f"Couldn't load the track list for **{title}**."
+
+
+def _expiry_offer_text(title: str, remaining: list | None) -> str:
+    """Expiry card text. remaining is None if the entry was still ENUMERATING
+    when it expired (count unknown), else the known remaining-track list."""
+    if remaining is None:
+        return f"**{title}** — track list offer expired."
+    return (f"**{title}** had **{len(remaining)}** more tracks.\n"
+            f"~~Click Load playlist~~ *(expired)*")
+
+
+async def _await_pending_tracks(pending: dict) -> list:
+    """Return the remaining tracks for a pending-playlist entry.
+
+    If the entry is already READY (tracks is not None), returns it directly.
+    If still ENUMERATING, awaits the in-flight full-enumeration future — NEVER
+    re-fetches (no windowed/progressive re-querying, per R6).
+    """
+    tracks = pending.get("tracks")
+    if tracks is not None:
+        return tracks
+    future = pending.get("future")
+    if future is None:
+        return []
+    full_info = await future
+    return full_info["tracks"][1:] if full_info.get("tracks") else []
 
 
 class _LoadPlaylistRow(discord.ui.ActionRow):
@@ -944,7 +1082,7 @@ class _LoadPlaylistRow(discord.ui.ActionRow):
 
     @discord.ui.button(label="Load playlist", style=discord.ButtonStyle.success, custom_id="btn_load_playlist")
     async def load_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
+        await _ack(interaction)
         bot = self.view.bot
         guild_id = interaction.guild_id
         channel_id = interaction.channel.id
@@ -963,7 +1101,23 @@ class _LoadPlaylistRow(discord.ui.ActionRow):
                 await interaction.message.edit(view=view)
             return
 
-        tracks = pending["tracks"]
+        if pending.get("tracks") is None:
+            await interaction.followup.send("Loading the full track list…", ephemeral=True)
+        try:
+            tracks = await _await_pending_tracks(pending)
+        except Exception:
+            await interaction.followup.send("Couldn't load the full track list — run `!play` with the playlist link to retry.", ephemeral=True)
+            current = gs.queue.current
+            if current:
+                view = build_player_view(bot, current.title,
+                                         thumbnail=current.thumbnail,
+                                         url=current.url,
+                                         requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
+                                         queue_tracks=gs.queue.preview_fair_order(),
+                                         guild_id=guild_id)
+                await interaction.message.edit(view=view)
+            return
+
         user_id = str(interaction.user.id)
 
         for t in tracks:
@@ -981,9 +1135,10 @@ class _LoadPlaylistRow(discord.ui.ActionRow):
                                      guild_id=guild_id)
             await interaction.message.edit(view=view)
 
-            channel = bot.get_channel(channel_id)
-            if channel:
-                await channel.send(f"Added **{len(tracks)}** tracks to the queue.")
+            if tracks:
+                channel = bot.get_channel(channel_id)
+                if channel:
+                    await channel.send(f"Added **{len(tracks)}** tracks to the queue.")
 
 
 class _SecondaryRow(discord.ui.ActionRow):
@@ -995,41 +1150,46 @@ class _SecondaryRow(discord.ui.ActionRow):
 
     @discord.ui.button(label="Loop: Off", style=discord.ButtonStyle.secondary, custom_id="btn_loop")
     async def loop_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ack(interaction)          # first — the 3s token clock is already running
         if _on_cooldown(interaction.guild_id, interaction.user.id, "loop", 1.0):
-            await interaction.response.send_message("One moment…", ephemeral=True)
+            await _respond(interaction, "One moment…")
             return
         gs = self.view.bot.get_guild_state(interaction.guild_id)
         gs.queue.cycle_loop()
         kwargs = {**self.view._kwargs, "queue_tracks": gs.queue.preview_fair_order()}
-        await interaction.response.edit_message(view=build_player_view(self.view.bot, **kwargs))
+        await _edit_card(interaction, build_player_view(self.view.bot, **kwargs))
 
     @discord.ui.button(label="Shuffle", style=discord.ButtonStyle.secondary, custom_id="btn_shuffle")
     async def shuffle_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ack(interaction)          # first — the 3s token clock is already running
         if _on_cooldown(interaction.guild_id, interaction.user.id, "shuffle", 1.5):
-            await interaction.response.send_message("One moment…", ephemeral=True)
+            await _respond(interaction, "One moment…")
             return
         gs = self.view.bot.get_guild_state(interaction.guild_id)
         gs.queue.shuffle()
         kwargs = {**self.view._kwargs, "queue_tracks": gs.queue.preview_fair_order()}
-        await interaction.response.edit_message(view=build_player_view(self.view.bot, **kwargs))
+        await _edit_card(interaction, build_player_view(self.view.bot, **kwargs))
 
     @discord.ui.button(label="Grab", style=discord.ButtonStyle.secondary, custom_id="btn_grab")
     async def grab_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Acknowledge before the DM: sending it is a network round-trip that can
+        # easily outlast the 3s interaction token on a loaded bot.
+        await _ack(interaction)
         if _on_cooldown(interaction.guild_id, interaction.user.id, "grab", 3.0):
-            await interaction.response.send_message("You just grabbed this — give it a moment.", ephemeral=True)
+            await _respond(interaction, "You just grabbed this — give it a moment.")
             return
         gs = self.view.bot.get_guild_state(interaction.guild_id)
         current = gs.queue.current
         if not current or not gs.player.is_playing:
-            await interaction.response.send_message("Nothing is playing to grab.", ephemeral=True)
+            await _respond(interaction, "Nothing is playing to grab.")
             return
         try:
             await interaction.user.send(embed=_build_grab_embed(gs, current))
-            await interaction.response.send_message("Sent it to your DMs.", ephemeral=True)
+            await _respond(interaction, "Sent it to your DMs.")
         except discord.Forbidden:
-            await interaction.response.send_message(
+            await _respond(
+                interaction,
                 "I couldn't DM you — enable **Allow direct messages from server members**.",
-                ephemeral=True,
             )
 
 
@@ -1044,7 +1204,8 @@ class PlayerView(discord.ui.LayoutView):
                  queue_tracks: list | None = None,
                  guild_id: int | None = None,
                  paused: bool = False,
-                 finished: bool = False):
+                 finished: bool = False,
+                 loading: bool = False):
         super().__init__(timeout=None)
         self.bot = bot
         # Store every kwarg so a button can rebuild the card (e.g. play/pause flip).
@@ -1062,6 +1223,7 @@ class PlayerView(discord.ui.LayoutView):
         self._guild_id = guild_id
         self._paused = paused
         self._finished = finished
+        self._loading = loading
         self._build()
 
     def _build(self):
@@ -1079,7 +1241,14 @@ class PlayerView(discord.ui.LayoutView):
         c = discord.ui.Container(accent_colour=discord.Colour(accent))
 
         # Header line
-        header = "**Paused**" if paused else ("**Queue finished**" if finished else "**Now Playing**")
+        if self._loading:
+            header = "**Loading…**"
+        elif paused:
+            header = "**Paused**"
+        elif finished:
+            header = "**Queue finished**"
+        else:
+            header = "**Now Playing**"
         c.add_item(discord.ui.TextDisplay(header))
 
         if not finished:
@@ -1120,7 +1289,7 @@ class PlayerView(discord.ui.LayoutView):
                     lines.append(f"`{i}.` [{t.title}]({t.url}){req_tag}")
                 else:
                     lines.append(f"`{i}.` {t.title}{req_tag}")
-            remaining = (len(gs.queue.list()) - 5) if gs else (len(self._queue_tracks) - 5)
+            remaining = (len(gs.queue) - 5) if gs else (len(self._queue_tracks) - 5)
             if remaining > 0:
                 lines.append(f"*...and {remaining} more*")
             c.add_item(discord.ui.TextDisplay("**Up Next**\n" + "\n".join(lines)))
@@ -1132,7 +1301,9 @@ class PlayerView(discord.ui.LayoutView):
         c.add_item(discord.ui.Separator())
 
         # Controls live ABOVE the requester/footer line (matching the reference).
-        if not finished:
+        # The loading card omits them: nothing is playing yet, so skip/pause/stop
+        # would act on the previous track (or on nothing at all).
+        if not finished and not self._loading:
             controls = _ControlsRow()
             # Reflect paused state on the play/pause glyph (▶ = resume, ‖ = pause).
             for _item in controls.children:
@@ -1225,7 +1396,8 @@ class PlayerView(discord.ui.LayoutView):
     async def evaluate_vote(self, interaction: discord.Interaction, action: str) -> bool:
         passes, msg = _check_vote(self.bot, interaction.guild, interaction.user, action)
         if not passes:
-            await interaction.response.send_message(msg, ephemeral=False)
+            # Callers acknowledge before voting, so this goes out as a followup.
+            await _respond(interaction, msg, ephemeral=False)
         return passes
 
 
@@ -1235,13 +1407,24 @@ def build_player_view(bot, title: str, extra_desc: str = "",
                       queue_tracks: list | None = None,
                       guild_id: int | None = None,
                       paused: bool = False,
-                      finished: bool = False) -> PlayerView:
+                      finished: bool = False,
+                      loading: bool = False) -> PlayerView:
     """Build the Components V2 Now-Playing card (replaces create_np_embed)."""
     return PlayerView(
         bot, title=title, extra_desc=extra_desc, thumbnail=thumbnail, url=url,
         requester_name=requester_name, queue_tracks=queue_tracks,
-        guild_id=guild_id, paused=paused, finished=finished,
+        guild_id=guild_id, paused=paused, finished=finished, loading=loading,
     )
+
+
+# YouTube serves video thumbnails off i.ytimg.com from the video id alone, with no
+# API call — and Discord's CDN is what fetches the image, not us, so showing artwork
+# before the resolve costs ZERO requests from our IP. hqdefault exists for every
+# video (maxresdefault does not).
+def _youtube_thumbnail(query: str) -> str:
+    """Thumbnail URL derivable from a direct YouTube link, or "" for anything else."""
+    video_id = _youtube_video_id(query or "")
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else ""
 
 
 _MENTION_RE = re.compile(r"<@!?(\d+)>")
@@ -1508,6 +1691,22 @@ async def update_np_embed(bot, channel_id: int, view: "PlayerView"):
     asyncio.create_task(_do_update_np_embed(bot, channel, msg_id, view))
 
 
+async def _clear_np(bot, channel_id: int):
+    """Delete the current NP card and forget it.
+
+    Used when a play attempt that already showed a loading card fails — leaving a
+    permanent "Loading…" card behind would be worse than no card at all.
+    """
+    channel = bot.get_channel(channel_id)
+    if not channel or not hasattr(channel, 'guild') or not channel.guild:
+        return
+    gs = bot.get_guild_state(channel.guild.id)
+    msg_id = gs.np_message_id
+    gs.np_message_id = None
+    if msg_id:
+        await _safe_delete(channel.get_partial_message(msg_id))
+
+
 async def update_np_stopped(bot, channel_id: int):
     """Update the NP card to a stopped/queue-finished state and remove all buttons."""
     channel = bot.get_channel(channel_id)
@@ -1537,7 +1736,24 @@ async def update_np_stopped(bot, channel_id: int):
 #   * the cached result REPLACES the play-time resolve (AudioPlayer.play reuses it),
 #     so this does NOT add API calls per track — it just moves the one resolve
 #     earlier in time.
-_PREFETCH_MIN_INTERVAL = 8.0  # seconds; global floor between prefetch resolves
+# The floor DEFERS a prefetch, it does not cancel it — see _prefetch_next_track.
+#
+# 8s was too conservative to be useful and cost real latency: the skip buttons already
+# enforce a 2s per-user cooldown, so a floor 4x slower than the fastest possible skip
+# guaranteed the prefetch would fall behind and the track would resolve at play time
+# (~2s) and then wait out the CDN settle window (~2.8s).
+#
+# Crucially this does NOT trade anti-ban safety for speed. Prefetch only ever resolves
+# the track that is about to play, so under sustained skipping the number of /player
+# calls is IDENTICAL either way — one per track played. The floor never removed a call,
+# it only decided whether that call happened before playback or during it. What it
+# genuinely guards is a burst resolving several DIFFERENT tracks in quick succession
+# (queue churn), and 3s still bounds that to ~20/min, below what the 2s skip cooldown
+# already permits.
+_PREFETCH_MIN_INTERVAL = 3.0  # seconds; global floor between prefetch resolves
+# How many consecutive permanently-dead tracks one prefetch pass will drop before
+# giving up. Bounded so a playlist full of removed videos can't spin.
+_PREFETCH_MAX_DEAD_SKIPS = 3
 _last_prefetch_monotonic = 0.0
 
 
@@ -1545,29 +1761,80 @@ async def _prefetch_next_track(bot, guild_id):
     """Resolve the fair-play-predicted next track's CDN URL in the background."""
     global _last_prefetch_monotonic
     gs = bot.get_guild_state(guild_id)
+    debug = bot.config.get("debug", False)
     try:
-        upcoming = gs.queue.preview_fair_order(1)
-        if not upcoming:
-            return
-        track = upcoming[0]
-        if track.is_radio:
-            return
-        # Already have a still-fresh resolve for this exact track — don't refetch.
-        if track.resolved_info and is_stream_info_fresh(track.resolved_info, track.resolved_at):
-            return
-        # Global rate-limit: never let prefetch resolves cluster (protects the IP).
-        now = time.monotonic()
-        if now - _last_prefetch_monotonic < _PREFETCH_MIN_INTERVAL:
-            return
-        _last_prefetch_monotonic = now
+        # WAIT OUT the global floor instead of dropping the prefetch. Returning here
+        # silently lost it: nothing reschedules, so the next track resolved at play
+        # time (~2s) and could then hit the CDN settle window on top. Skipping every
+        # ~10s against an 8s floor meant losing roughly every other prefetch.
+        # Sleeping preserves the invariant that actually protects the IP — at most one
+        # prefetch resolve per _PREFETCH_MIN_INTERVAL — while still arriving before the
+        # track is needed. gs.prefetch_task stays alive across the sleep, so the
+        # single-in-flight guard still collapses a burst of skips into one prefetch.
+        wait = _PREFETCH_MIN_INTERVAL - (time.monotonic() - _last_prefetch_monotonic)
+        if wait > 0:
+            if debug:
+                print(f"[debug][prefetch] throttled — deferring {wait:.1f}s")
+            await asyncio.sleep(wait)
 
+        # Re-read AFTER the wait: skips during the sleep change what plays next.
+        # Loops so a track that turns out to be permanently gone is dropped and the one
+        # behind it gets prefetched instead — otherwise every dead track in a playlist
+        # costs a failed play AND a cold start for whatever follows it.
         yt_client = bot.config.get("youtube", {}).get("client", "web")
         cookies_file = bot.config.get("youtube", {}).get("cookies_file") or None
-        info = await asyncio.get_event_loop().run_in_executor(
-            None, get_audio_url_with_retry, track.query, yt_client, False, cookies_file
-        )
+        info = None
+        for _ in range(_PREFETCH_MAX_DEAD_SKIPS + 1):
+            upcoming = gs.queue.preview_fair_order(1)
+            if not upcoming:
+                if debug:
+                    print("[debug][prefetch] nothing queued — skipped")
+                return
+            track = upcoming[0]
+            if track.is_radio:
+                return
+            # Already have a still-fresh resolve for this exact track — don't refetch.
+            if track.resolved_info and is_stream_info_fresh(track.resolved_info, track.resolved_at):
+                if debug:
+                    print(f"[debug][prefetch] already fresh: {track.title[:40]!r}")
+                return
+            _last_prefetch_monotonic = time.monotonic()
+            try:
+                info = await asyncio.get_event_loop().run_in_executor(
+                    _RESOLVE_EXECUTOR, get_audio_url_with_retry,
+                    track.query, yt_client, False, cookies_file
+                )
+                break
+            except Exception as e:
+                # Removed / private / geo-blocked: it can never play, so take it out now
+                # instead of letting playback discover it. Anything else (network, 429)
+                # is left alone — play() will retry it for real.
+                if not is_permanent_resolve_error(e) or not gs.queue.discard(track):
+                    raise
+                print(f"[commands] Dropped unplayable track {track.title[:40]!r}: "
+                      f"{_friendly_ytdlp_error(e)}")
+        if info is None:
+            return
+
         track.resolved_info = info
         track.resolved_at = time.time()
+        if debug:
+            print(f"[debug][prefetch] ready: {info.get('title', '?')[:40]!r}")
+
+        # Spend the CDN settle window HERE, while the current track still plays, rather
+        # than at playback. A freshly resolved googlevideo URL 403s for ~2.5s; skipping
+        # to an unwarmed track costs three retries (~2.8s) before the first byte, which
+        # is now the single largest delay on a skip. Warming uses 1-byte probes and does
+        # not consume the URL. Failure is harmless — playback falls back to waiting the
+        # window out itself, exactly as before.
+        if _can_stream_in_process(info):
+            warmed = await asyncio.get_event_loop().run_in_executor(
+                _STREAM_EXECUTOR, warm_stream_url, info["url"], debug
+            )
+            if debug and not warmed:
+                print("[debug][prefetch] CDN URL still cold — playback will wait it out")
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         print(f"[commands] Prefetch failed (will resolve at play time): {e}")
 
@@ -1596,7 +1863,7 @@ async def _autoplay_pick(bot, guild_id, seed):
             yt_client = bot.config.get("youtube", {}).get("client", "web")
             seed_url = seed.url or seed.query
             related = await asyncio.get_event_loop().run_in_executor(
-                None, get_related_tracks, seed_url, yt_client, 25
+                _RESOLVE_EXECUTOR, get_related_tracks, seed_url, yt_client, 25
             )
             gs.autoplay_pool = [t for t in related if t.get("url") and t["url"] not in gs.autoplay_history]
         while gs.autoplay_pool:
@@ -1650,7 +1917,8 @@ async def _resolve_track_info(bot, channel_id: int, track: Track):
         yt_client = bot.config.get("youtube", {}).get("client", "web")
         cookies_file = bot.config.get("youtube", {}).get("cookies_file") or None
         info = await asyncio.get_event_loop().run_in_executor(
-            None, get_audio_url_with_retry, track.query, yt_client, False, cookies_file
+            _RESOLVE_EXECUTOR, get_audio_url_with_retry,
+            track.query, yt_client, False, cookies_file
         )
         track.title = info["title"]
         track.thumbnail = info.get("thumbnail", "")
@@ -1741,7 +2009,7 @@ def _check_vote(bot, guild, user, action: str) -> tuple[bool, str]:
         all_reqs = set()
         if current:
             all_reqs.add(current.requested_by)
-        for t in gs.queue.list():
+        for t in gs.queue:
             all_reqs.add(t.requested_by)
         if len(all_reqs) == 1 and user_id in all_reqs:
             return True, ""
@@ -1887,83 +2155,127 @@ class MusicCog(commands.Cog):
                 gs.player.is_playing and voice_client and voice_client.is_playing()
             )
 
-            def _pending_and_expire(remaining, playlist_title, current_title):
-                """Store the pending-playlist offer and schedule its 120s expiry."""
-                count = len(remaining)
-                self.bot.pending_playlists[str(channel_id)] = {
+            def _make_offer(full_fut, playlist_title) -> dict:
+                """Store the ENUMERATING pending-playlist entry, arm its 120s expiry
+                (relative to when the offer was SHOWN, not enumeration completion),
+                and return the entry so the caller can pass it to _finalize_offer."""
+                old = self.bot.pending_playlists.get(str(channel_id))
+                if old is not None and old.get("future") is not None:
+                    # A second playlist offer for this channel superseded an
+                    # in-flight enumeration — drop its future so it isn't orphaned.
+                    _discard_future(old["future"])
+
+                entry = {
                     "query": query, "user_id": user_id, "guild_id": guild_id,
-                    "channel_id": channel_id, "tracks": remaining,
-                    "playlist_title": playlist_title,
+                    "channel_id": channel_id, "playlist_title": playlist_title,
+                    "tracks": None, "future": full_fut,
                 }
+                self.bot.pending_playlists[str(channel_id)] = entry
 
-                async def _expire_playlist(ch_id: int):
+                async def _expire(entry=entry):
                     await asyncio.sleep(120)
-                    if self.bot.pending_playlists.pop(str(ch_id), None):
-                        try:
-                            expired_extra = (
-                                f"**{playlist_title}** had **{count}** more tracks.\n"
-                                f"~~Click Load playlist~~ *(expired)*"
-                            )
-                            expired_view = build_player_view(self.bot, current_title, expired_extra, guild_id=ctx.guild.id)
-                            await update_np_embed(self.bot, ch_id, expired_view)
-                        except Exception:
-                            pass
+                    if self.bot.pending_playlists.get(str(channel_id)) is entry:
+                        self.bot.pending_playlists.pop(str(channel_id), None)
+                        if entry.get("future"):
+                            _discard_future(entry["future"])
+                        current = gs.queue.current
+                        if current:
+                            try:
+                                expired_view = build_player_view(
+                                    self.bot, current.title,
+                                    _expiry_offer_text(playlist_title, entry.get("tracks")),
+                                    thumbnail=current.thumbnail, url=current.url,
+                                    requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
+                                    queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
+                                await update_np_embed(self.bot, channel_id, expired_view)
+                            except Exception:
+                                pass
 
-                asyncio.create_task(_expire_playlist(channel_id))
+                asyncio.create_task(_expire())
+                return entry
+
+            async def _finalize_offer(entry, full_fut, playlist_title):
+                """Await the full enumeration and flip the entry to READY/gone,
+                editing the card with the real count. NEVER queues tracks —
+                that only happens via the pending_playlists.pop gate in
+                load_callback/loadall (exactly-once)."""
+                try:
+                    full_info = await full_fut
+                    action, extra, remaining = _resolve_offer_outcome(full_info, playlist_title)
+                except Exception as e:
+                    print(f"[commands] Playlist enumeration failed after start: {e}")
+                    action, extra, remaining = "error", _error_offer_text(playlist_title), []
+
+                if self.bot.pending_playlists.get(str(channel_id)) is not entry:
+                    return  # clicked / expired / replaced — leave the card to its owner
+
+                if action == "ready":
+                    entry["tracks"] = remaining
+                    entry["future"] = None
+                else:
+                    self.bot.pending_playlists.pop(str(channel_id), None)
+
+                current = gs.queue.current
+                if current:
+                    view = build_player_view(self.bot, current.title, extra,
+                                             thumbnail=current.thumbnail, url=current.url,
+                                             requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
+                                             queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
+                    await update_np_embed(self.bot, channel_id, view)
 
             if voice_actually_playing:
-                # Already playing — no rush to start track 1; enumerate fully then queue.
-                status_msg = await ctx.send("Fetching playlist info…")
+                # Already playing — limit=1-first so the offer appears instantly
+                # instead of blocking on a full "Fetching playlist info…" enumeration.
+                status_msg = await ctx.send("Loading playlist…")
                 try:
-                    playlist_info = await loop.run_in_executor(None, extract_playlist_info, query, yt_client)
+                    first_info = await loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client, 1)
                 except Exception as e:
                     await status_msg.edit(content=f"Error fetching playlist: {e}")
                     return
-                tracks = playlist_info["tracks"]
-                if not tracks:
+                first_tracks = first_info["tracks"]
+                if not first_tracks:
                     await status_msg.edit(content="No tracks found in this playlist.")
                     return
-                playlist_title = playlist_info["title"]
-                remaining_tracks = tracks[1:]
+                playlist_title = first_info["title"]
+                first_track_info = first_tracks[0]
 
-                track = Track(query=tracks[0]["url"], title=tracks[0]["title"], requested_by=user_id, url=tracks[0]["url"])
+                track = Track(query=first_track_info["url"], title=first_track_info["title"],
+                             requested_by=user_id, url=first_track_info["url"])
                 gs.queue.add(track)
                 _schedule_prefetch(self.bot, ctx.guild.id)
                 asyncio.create_task(_safe_delete(status_msg))
 
-                count = len(remaining_tracks)
-                if count > 0:
-                    extra = (f"**{playlist_title}** has **{count}** more tracks.\n"
-                             f"Click 'Load playlist' to add them to the queue.")
-                    _pending_and_expire(remaining_tracks, playlist_title, gs.queue.current.title if gs.queue.current else "")
-                else:
-                    extra = f"Added **{playlist_title}** (1 track) to the queue."
+                full_fut = loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client)
+                entry = _make_offer(full_fut, playlist_title)
 
                 current = gs.queue.current
-                view = build_player_view(self.bot, current.title, extra,
+                view = build_player_view(self.bot, current.title, _loading_offer_text(playlist_title),
                                          thumbnail=current.thumbnail, url=current.url,
                                          requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
                                          queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
                 await update_np_embed(self.bot, channel_id, view)
+
+                await _finalize_offer(entry, full_fut, playlist_title)
                 return
 
-            # Not playing: EARLY START — enumerate the full playlist in the background
-            # while a fast limit=1 fetch gets track 1, so audio starts ~1-2.5s sooner.
+            # Not playing: limit=1-first — track 1 starts at the same latency as
+            # today, then the offer appears instantly while ONE background pass
+            # enumerates the rest (Invariant 3: full_fut created after limit=1
+            # returns, non-blocking, before voice-join).
             status_msg = await ctx.send("Loading playlist…")
-            full_fut = loop.run_in_executor(None, extract_playlist_info, query, yt_client)
             try:
-                first_info = await loop.run_in_executor(None, extract_playlist_info, query, yt_client, 1)
+                first_info = await loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client, 1)
             except Exception as e:
-                _discard_future(full_fut)
                 await status_msg.edit(content=f"Error fetching playlist: {e}")
                 return
             first_tracks = first_info["tracks"]
             if not first_tracks:
-                _discard_future(full_fut)
                 await status_msg.edit(content="No tracks found in this playlist.")
                 return
             playlist_title = first_info["title"]
             first_track_info = first_tracks[0]
+
+            full_fut = loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client)
 
             # Join voice if not already connected
             if not voice_client or not voice_client.is_connected():
@@ -1989,6 +2301,11 @@ class MusicCog(commands.Cog):
                     return
 
             # Start track 1 immediately (do not wait for full enumeration).
+            # Disarm the armed auto-next chain before play() (see single-track play path for rationale).
+            if gs.auto_next_task and not gs.auto_next_task.done():
+                gs.auto_next_task.cancel()
+                gs.auto_next_task = None
+            gs.auto_next_gen += 1
             try:
                 played = await gs.player.play(first_track_info["url"])
                 title = played["title"]
@@ -2001,9 +2318,11 @@ class MusicCog(commands.Cog):
                 await status_msg.edit(content=f"Error playing first track: {e}")
                 return
 
-            # Audio is now playing — show the card and arm auto-next before the (possibly
-            # slower) full enumeration lands.
-            view = build_player_view(self.bot, title, f"From playlist: **{playlist_title}**",
+            # Audio is now playing — arm the offer BEFORE building the card so
+            # has_pending renders the Load button, then show the card and auto-next.
+            entry = _make_offer(full_fut, playlist_title)
+
+            view = build_player_view(self.bot, title, _loading_offer_text(playlist_title),
                                      thumbnail=track_thumbnail, url=track_url,
                                      requester_name=f"<@{user_id}>",
                                      queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
@@ -2011,26 +2330,7 @@ class MusicCog(commands.Cog):
             await send_new_np(self.bot, channel_id, view)
             _start_auto_next(self.bot, channel_id, ctx.guild.id)
 
-            # Finish enumerating; when done, offer the rest via the Load button.
-            try:
-                full_info = await full_fut
-            except Exception as e:
-                print(f"[commands] Playlist enumeration failed after start: {e}")
-                return
-            remaining_tracks = full_info["tracks"][1:] if full_info.get("tracks") else []
-            if not remaining_tracks:
-                return
-            _pending_and_expire(remaining_tracks, playlist_title, title)
-            count = len(remaining_tracks)
-            extra = (f"**{playlist_title}** has **{count}** more tracks.\n"
-                     f"Click 'Load playlist' to add them to the queue.")
-            current = gs.queue.current
-            if current:
-                view = build_player_view(self.bot, current.title, extra,
-                                         thumbnail=current.thumbnail, url=current.url,
-                                         requester_name=f"<@{current.requested_by}>" if getattr(current, 'requested_by', None) else "",
-                                         queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
-                await update_np_embed(self.bot, channel_id, view)
+            await _finalize_offer(entry, full_fut, playlist_title)
             return
 
         # ---------------------------------------------------------------
@@ -2080,7 +2380,7 @@ class MusicCog(commands.Cog):
         # (they are independent — connect needs no resolved URL, resolve needs no voice).
         yt_cfg = self.bot.config.get("youtube", {})
         resolve_fut = loop.run_in_executor(
-            None, get_audio_url_with_retry, query,
+            _RESOLVE_EXECUTOR, get_audio_url_with_retry, query,
             yt_cfg.get("client", "web"), self.bot.config.get("debug", False),
             yt_cfg.get("cookies_file") or None,
         )
@@ -2109,14 +2409,41 @@ class MusicCog(commands.Cog):
                 await ctx.send(f"Failed to join voice channel: {e}")
                 return
 
-        status_msg = await ctx.send("Resolving…")
+        # Show the card straight away. For a direct YouTube link the artwork is
+        # derivable from the video id with no API call, so the user sees the track
+        # within ~200ms instead of staring at "Resolving…" through the resolve AND
+        # the CDN settle window. It becomes the live card via an in-place edit once
+        # playback starts — same message, no delete-and-resend flicker.
+        loading_view = build_player_view(
+            self.bot, "Loading…",
+            thumbnail=_youtube_thumbnail(query),
+            url=query if query.startswith(("http://", "https://")) else "",
+            requester_name=f"<@{user_id}>",
+            queue_tracks=gs.queue.preview_fair_order(),
+            guild_id=ctx.guild.id, loading=True,
+        )
+        await send_new_np(self.bot, channel_id, loading_view)
+
+        async def _fail(message: str):
+            """Replace the loading card with a plain error line."""
+            await _clear_np(self.bot, channel_id)
+            try:
+                await ctx.send(message)
+            except Exception:
+                pass
+
         try:
             info = await resolve_fut
         except Exception as e:
-            await status_msg.edit(content=f"Error playing track: {_friendly_ytdlp_error(e)}")
+            await _fail(f"Error playing track: {_friendly_ytdlp_error(e)}")
             return
 
         resolved_at = time.time()
+        # Disarm the armed auto-next chain before play() (see prev/next button pattern above).
+        if gs.auto_next_task and not gs.auto_next_task.done():
+            gs.auto_next_task.cancel()
+            gs.auto_next_task = None
+        gs.auto_next_gen += 1
         try:
             played = await gs.player.play(query, info, resolved_at)
             title = played["title"]
@@ -2135,11 +2462,11 @@ class MusicCog(commands.Cog):
                                     requester_name=f"<@{user_id}>",
                                     queue_tracks=gs.queue.preview_fair_order(),
                                     guild_id=ctx.guild.id)
-            asyncio.create_task(_safe_delete(status_msg))
-            await send_new_np(self.bot, channel_id, view)
+            # Edit the loading card in place rather than sending a second message.
+            await update_np_embed(self.bot, channel_id, view)
             _start_auto_next(self.bot, channel_id, ctx.guild.id)
         except Exception as e:
-            await status_msg.edit(content=f"Error playing track: {e}")
+            await _fail(f"Error playing track: {e}")
 
     @commands.hybrid_command(name="radio", description="Browse or search internet radio stations")
     @app_commands.describe(query="Station name to search, or leave blank to browse by country/genre")
@@ -2667,7 +2994,11 @@ class MusicCog(commands.Cog):
             return
 
         gs = self.bot.get_guild_state(ctx.guild.id)
-        tracks = pending["tracks"]
+        try:
+            tracks = await _await_pending_tracks(pending)
+        except Exception:
+            await ctx.send("Couldn't load the full track list — run `!play` with the playlist link to retry.")
+            return
         user_id = str(ctx.author.id)
 
         for t in tracks:
@@ -3032,8 +3363,17 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 _schedule_prefetch(bot, guild_id)
                 _schedule_autoplay_topup(bot, guild_id)
             except Exception as e:
-                consecutive_errors += 1
                 channel = bot.get_channel(channel_id)
+                # A removed/private/geo-blocked track is a fact about that track, not a
+                # sign the bot is broken, so it must not count toward the circuit
+                # breaker — three unavailable songs in a playlist used to end the
+                # session. The breaker is for systemic failure (network down, blocked
+                # IP), where retrying the whole queue would be pointless and noisy.
+                if is_permanent_resolve_error(e):
+                    if channel:
+                        await channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+                    continue
+                consecutive_errors += 1
                 if channel:
                     await channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:

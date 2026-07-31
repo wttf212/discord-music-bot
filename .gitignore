@@ -8,6 +8,7 @@ build/
 
 # Config (contains secrets)
 config.yaml
+.env
 
 # Per-guild runtime state (written by !bitrate, !settc, etc. — not source controlled)
 guild_settings.json

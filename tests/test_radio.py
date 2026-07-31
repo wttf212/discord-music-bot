@@ -69,9 +69,17 @@ class TestRadioHelpers(unittest.TestCase):
 class TestFetchRadioStations(unittest.TestCase):
     """Tests for _fetch_radio_stations helper (network mocked)."""
 
+    def setUp(self):
+        # _fetch_radio_stations sleeps between retry attempts; keep the suite fast
+        # and deterministic by skipping the real backoff.
+        p = patch("commands.time.sleep")
+        self.mock_sleep = p.start()
+        self.addCleanup(p.stop)
+
     def _make_conn_mock(self, data: list):
         import json
         mock_resp = MagicMock()
+        mock_resp.status = 200
         mock_resp.read.return_value = json.dumps(data).encode()
         mock_conn = MagicMock()
         mock_conn.getresponse.return_value = mock_resp
@@ -156,6 +164,91 @@ class TestFetchRadioStations(unittest.TestCase):
             with self.assertRaises(OSError) as cm:
                 commands._fetch_radio_stations("jazz")
         self.assertIn("radio-browser.info", str(cm.exception))
+
+    def _resp(self, status: int, body: bytes):
+        r = MagicMock()
+        r.status = status
+        r.read.return_value = body
+        return r
+
+    def test_non_200_status_raises_error(self):
+        """A 5xx response is never parsed as JSON -- raise an attributed OSError with the code."""
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = self._resp(502, b"<html>Bad Gateway</html>")
+        with patch("commands.http.client.HTTPSConnection", return_value=mock_conn):
+            with self.assertRaises(OSError) as cm:
+                commands._fetch_radio_stations(None)
+        self.assertIn("502", str(cm.exception))
+        self.assertIn("radio-browser.info", str(cm.exception))
+        # Retried across the mirror pool, with a backoff between attempts, before giving up.
+        self.assertEqual(mock_conn.getresponse.call_count, commands._RADIO_ATTEMPTS)
+        self.assertEqual(self.mock_sleep.call_count, commands._RADIO_ATTEMPTS - 1)
+
+    def test_empty_body_raises_clear_error(self):
+        """An empty 200 body (the original crash) becomes a clear OSError, not a raw JSONDecodeError."""
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = self._resp(200, b"")
+        with patch("commands.http.client.HTTPSConnection", return_value=mock_conn):
+            with self.assertRaises(OSError) as cm:
+                commands._fetch_radio_stations(None)
+        self.assertIn("radio-browser.info", str(cm.exception))
+        self.assertIn("invalid response", str(cm.exception))
+
+    def test_garbage_body_raises_clear_error(self):
+        """A non-JSON (HTML) 200 body becomes a clear OSError, not a raw JSONDecodeError."""
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = self._resp(200, b"<!DOCTYPE html><html>error</html>")
+        with patch("commands.http.client.HTTPSConnection", return_value=mock_conn):
+            with self.assertRaises(OSError) as cm:
+                commands._fetch_radio_stations(None)
+        self.assertIn("radio-browser.info", str(cm.exception))
+
+    def test_non_utf8_body_raises_clear_error(self):
+        """A non-UTF-8 200 body (json.loads raises UnicodeDecodeError, not JSONDecodeError)
+        must still be caught, retried, and surfaced as a clear OSError -- not the raw
+        \"'utf-8' codec can't decode byte...\" text."""
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = self._resp(200, b"\x80\x81 service unavailable \xe9")
+        with patch("commands.http.client.HTTPSConnection", return_value=mock_conn):
+            with self.assertRaises(OSError) as cm:
+                commands._fetch_radio_stations(None)
+        self.assertIn("radio-browser.info", str(cm.exception))
+        self.assertIn("invalid response", str(cm.exception))
+        self.assertEqual(mock_conn.getresponse.call_count, commands._RADIO_ATTEMPTS)
+
+    def test_incomplete_read_is_retried(self):
+        """A truncated body (http.client.IncompleteRead is an HTTPException, not OSError)
+        must be caught and retried, not leaked to the caller on the first attempt."""
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.side_effect = http.client.IncompleteRead(b"partial")
+        mock_conn = MagicMock()
+        mock_conn.getresponse.return_value = mock_resp
+        with patch("commands.http.client.HTTPSConnection", return_value=mock_conn):
+            with self.assertRaises(OSError) as cm:
+                commands._fetch_radio_stations(None)
+        self.assertIn("radio-browser.info", str(cm.exception))
+        self.assertEqual(mock_resp.read.call_count, commands._RADIO_ATTEMPTS)
+
+    def test_transient_failure_then_success_returns_data(self):
+        """A bad mirror on the first attempt is retried; a healthy mirror next returns data."""
+        import json
+        good = self._resp(200, json.dumps(SAMPLE_STATIONS[:2]).encode())
+        mock_conn = MagicMock()
+        mock_conn.getresponse.side_effect = [self._resp(503, b""), good]
+        with patch("commands.http.client.HTTPSConnection", return_value=mock_conn):
+            result = commands._fetch_radio_stations(None)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(mock_conn.getresponse.call_count, 2)
+
+    def test_success_on_first_attempt_does_not_retry(self):
+        """A healthy first response returns immediately -- no extra attempts, no backoff."""
+        conn_p, mock_conn = self._patch(SAMPLE_STATIONS[:3])
+        with conn_p:
+            result = commands._fetch_radio_stations(None)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(mock_conn.getresponse.call_count, 1)
+        self.mock_sleep.assert_not_called()
 
 
 class TestRadioPickerView(unittest.TestCase):

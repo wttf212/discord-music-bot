@@ -90,3 +90,74 @@ class TestBufferedAudioSource(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestStallDetection(unittest.TestCase):
+    """Silence is right for a hiccup, wrong for a dead stream.
+
+    Without a stall cut-off the track "plays" inaudibly for its full remaining length
+    while the queue waits and nothing in the log says why.
+    """
+
+    class _NeverYields:
+        """A source that is open but never produces data — a stalled CDN."""
+        def __init__(self):
+            self.blocked = threading.Event()
+
+        def read(self):
+            self.blocked.wait(30)     # hold the fill thread; never deliver a frame
+            return b""
+
+        def cleanup(self):
+            self.blocked.set()
+
+    def test_brief_underrun_yields_silence_not_eof(self):
+        src = audio_player._BufferedAudioSource(self._NeverYields(), first_frame=b"x" * 8)
+        try:
+            self.assertEqual(src.read(), b"x" * 8)          # primed frame
+            for _ in range(5):
+                self.assertEqual(src.read(), src._SILENCE,
+                                 "a momentary gap must not end the track")
+        finally:
+            src.cleanup()
+
+    def test_sustained_stall_ends_the_track(self):
+        src = audio_player._BufferedAudioSource(self._NeverYields())
+        try:
+            for _ in range(audio_player._STALL_FRAMES - 1):
+                self.assertEqual(src.read(), src._SILENCE)
+            self.assertEqual(src.read(), b"",
+                             "a stalled stream must end so auto-next can move on")
+        finally:
+            src.cleanup()
+
+    def test_stall_threshold_is_a_sane_duration(self):
+        self.assertGreaterEqual(audio_player._STALL_SECONDS, 5.0)
+        self.assertLessEqual(audio_player._STALL_SECONDS, 30.0)
+
+    def test_recovered_stream_resets_the_stall_counter(self):
+        """A gap followed by data must not leave the track primed to die later."""
+        class _Resumes:
+            def __init__(self):
+                self.sent = False
+            def read(self):
+                if not self.sent:
+                    self.sent = True
+                    return b"y" * audio_player._PCM_FRAME_SIZE
+                time.sleep(30)
+                return b""
+            def cleanup(self):
+                pass
+
+        src = audio_player._BufferedAudioSource(_Resumes())
+        try:
+            deadline = time.monotonic() + 2
+            got_data = False
+            while time.monotonic() < deadline and not got_data:
+                if src.read() == b"y" * audio_player._PCM_FRAME_SIZE:
+                    got_data = True
+            self.assertTrue(got_data, "the real frame never arrived")
+            self.assertEqual(src._starved_frames, 0,
+                             "receiving data must reset the stall counter")
+        finally:
+            src.cleanup()

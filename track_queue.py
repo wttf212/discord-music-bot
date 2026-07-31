@@ -24,7 +24,7 @@ class TrackQueue:
 
     def __init__(self):
         self._queue: deque[Track] = deque()
-        self._history = []
+        self._history: deque[Track] = deque(maxlen=100)
         self.current: Track | None = None
         self.fair_play: bool = True
         self.last_played_user: str | None = None
@@ -108,6 +108,18 @@ class TrackQueue:
             return track
         return None
 
+    def discard(self, track: Track) -> bool:
+        """Remove this exact pending track by identity. True if it was queued.
+
+        Index-based remove() is unusable here: the prefetch picks its target via
+        preview_fair_order(), whose ordering is not the raw queue order.
+        """
+        for i, queued in enumerate(self._queue):
+            if queued is track:
+                del self._queue[i]
+                return True
+        return False
+
     def move(self, src: int, dst: int) -> Track | None:
         """Move the 1-based src-th pending track to the 1-based dst position."""
         n = len(self._queue)
@@ -152,6 +164,12 @@ class TrackQueue:
 
     def list(self):
         return list(self._queue)
+
+    def __len__(self) -> int:
+        return len(self._queue)
+
+    def __iter__(self):
+        return iter(self._queue)
 
     def shuffle(self) -> int:
         """Randomise pending tracks in-place. Returns count of shuffled tracks.

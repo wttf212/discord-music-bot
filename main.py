@@ -104,6 +104,20 @@ class MusicBot(commands.Bot):
         # synced = await self.tree.sync(guild=discord.Object(id=0))
         # print(f"[main] Synced {len(synced)} command(s) to guild")
 
+    async def close(self):
+        """Disarm every guild's auto-next chain before discord.py tears down voice.
+
+        The voice disconnect inside super().close() fires after_playback, which sets
+        _playback_done and would otherwise wake _auto_next -- it can't tell shutdown
+        from a track ending, so it pops the queue and calls play() until
+        MAX_CONSECUTIVE_ERRORS. Ctrl+C has no other teardown hook.
+        """
+        for gs in list(self._guild_states.values()):
+            gs.auto_next_gen += 1
+            if gs.auto_next_task and not gs.auto_next_task.done():
+                gs.auto_next_task.cancel()
+        await super().close()
+
 
 def main():
     # --- TLS-01c: curl_cffi startup check ---
@@ -120,7 +134,20 @@ def main():
     with open(os.path.join(_base_dir, "config.yaml"), "r") as f:
         config = yaml.safe_load(f)
 
-    token = config["bot_token"]
+    # The token comes from the environment first so a production deployment never has
+    # to put a credential in config.yaml (docker-compose passes DISCORD_BOT_TOKEN
+    # through, and the file is mounted read-only). config.yaml stays supported for
+    # local development. Never log the value.
+    token = (os.environ.get("DISCORD_BOT_TOKEN") or "").strip() or config.get("bot_token")
+    if not token or token == "YOUR_BOT_TOKEN_HERE":
+        print("[main] No bot token. Set the DISCORD_BOT_TOKEN environment variable "
+              "(recommended) or bot_token in config.yaml.")
+        sys.exit(1)
+    if os.environ.get("DISCORD_BOT_TOKEN"):
+        print("[main] Bot token loaded from DISCORD_BOT_TOKEN")
+        if config.get("bot_token") and config["bot_token"] != "YOUR_BOT_TOKEN_HERE":
+            print("[main] Note: config.yaml also contains a bot_token — the environment "
+                  "wins. Consider removing it so the credential lives in one place.")
 
     # --- COOKIE-02: cookies_file startup check ---
     # Mirrors the TLS-01c guard pattern: warn and continue; never sys.exit().
