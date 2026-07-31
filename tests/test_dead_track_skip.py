@@ -165,6 +165,23 @@ class TestPrefetchDropsDeadTracks(unittest.TestCase):
         self.assertEqual(m.call_count, 1)
         self.assertIsNotNone(t.resolved_info)
 
+class TestCircuitBreakerScoping(unittest.TestCase):
+    """Unavailable tracks must not trip the systemic-failure breaker."""
+
+    def test_auto_next_excludes_permanent_errors_from_the_counter(self):
+        import inspect
+        src = inspect.getsource(commands._auto_next)
+        marker = src.index("is_permanent_resolve_error(e)")
+        counter = src.index("consecutive_errors += 1")
+        self.assertLess(marker, counter,
+                        "permanent per-track errors must be handled before the counter "
+                        "increments, or a few dead songs end the session")
+
+    def test_breaker_still_exists_for_systemic_failure(self):
+        import inspect
+        src = inspect.getsource(commands._auto_next)
+        self.assertIn("MAX_CONSECUTIVE_ERRORS", src)
+        self.assertIn("stopping auto-play", src)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

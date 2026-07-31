@@ -1243,6 +1243,12 @@ try:
 except Exception:  # pragma: no cover - libopus/discord internals absent
     _PCM_FRAME_SIZE = 3840
 
+# How long the jitter buffer may run dry before the track is declared dead. A silent
+# frame is the right response to a momentary hiccup; sustained silence means the CDN
+# stopped feeding us, and pretending to play for the rest of the track just hides it.
+_STALL_SECONDS = 15.0
+_STALL_FRAMES = int(_STALL_SECONDS / 0.02)   # one PCM frame = 20 ms
+
 
 class _BufferedAudioSource(discord.AudioSource):
     """Jitter buffer that decouples discord.py's real-time audio thread from
@@ -1268,6 +1274,7 @@ class _BufferedAudioSource(discord.AudioSource):
         self._closed = threading.Event()
         self._first_frame = first_frame
         self._first_pending = bool(first_frame)
+        self._starved_frames = 0   # consecutive underruns; see read()
         self._thread = threading.Thread(target=self._fill, daemon=True, name="pcm-jitter-buffer")
         self._thread.start()
 
@@ -1300,10 +1307,22 @@ class _BufferedAudioSource(discord.AudioSource):
             self._first_pending = False
             return self._first_frame
         try:
-            return self._queue.get_nowait()
+            frame = self._queue.get_nowait()
+            self._starved_frames = 0
+            return frame
         except queue.Empty:
             if self._eof.is_set():
                 return b""  # stream finished and drained → stop playback
+            self._starved_frames += 1
+            if self._starved_frames >= _STALL_FRAMES:
+                # Silence is the right answer to a hiccup, the wrong one to a dead
+                # stream: without this the track "plays" inaudibly to its full length
+                # while the queue waits, and nobody can tell why. Ending it hands
+                # control back to auto-next, which moves on to the next track.
+                print(f"[player] Stream stalled for {_STALL_SECONDS:.0f}s with no data "
+                      f"— ending the track so playback can continue")
+                self._eof.set()
+                return b""
             return self._SILENCE  # transient underrun → gap, not a rushed catch-up
 
     def is_opus(self) -> bool:

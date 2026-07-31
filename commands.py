@@ -3363,8 +3363,17 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 _schedule_prefetch(bot, guild_id)
                 _schedule_autoplay_topup(bot, guild_id)
             except Exception as e:
-                consecutive_errors += 1
                 channel = bot.get_channel(channel_id)
+                # A removed/private/geo-blocked track is a fact about that track, not a
+                # sign the bot is broken, so it must not count toward the circuit
+                # breaker — three unavailable songs in a playlist used to end the
+                # session. The breaker is for systemic failure (network down, blocked
+                # IP), where retrying the whole queue would be pointless and noisy.
+                if is_permanent_resolve_error(e):
+                    if channel:
+                        await channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+                    continue
+                consecutive_errors += 1
                 if channel:
                     await channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
