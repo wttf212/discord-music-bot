@@ -56,10 +56,14 @@ def _warm(statuses, url=URL, debug=False):
     fake_requests.Session = lambda **kw: session
     fake_root = types.ModuleType("curl_cffi")
     fake_root.requests = fake_requests
+    # Zero the backoff DELAYS but keep the ladder LENGTH: the code waits on _shutdown
+    # (so shutdown can wake it) rather than time.sleep, so patching time.sleep no
+    # longer stops it — while attempt-count assertions still mean what they say.
+    instant = (0.0,) * len(audio_player._STREAM_SETTLE_BACKOFF)
     with patch.dict(sys.modules, {"curl_cffi": fake_root,
                                   "curl_cffi.requests": fake_requests}), \
          patch.object(audio_player, "_IMPERSONATE_AVAILABLE", True), \
-         patch.object(audio_player.time, "sleep", lambda s: None):
+         patch.object(audio_player, "_STREAM_SETTLE_BACKOFF", instant):
         return warm_stream_url(url, debug=debug), session
 
 

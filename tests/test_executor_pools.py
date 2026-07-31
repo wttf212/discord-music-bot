@@ -100,3 +100,32 @@ class TestConcurrencyHeadroom(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestGracefulShutdown(unittest.TestCase):
+    """Workers park in multi-second sleeps; exit must not wait them out."""
+
+    def tearDown(self):
+        audio_player._shutdown.clear()
+
+    def test_shutdown_interrupts_a_warm_up_immediately(self):
+        import time
+        audio_player._shutdown.set()
+        started = time.perf_counter()
+        # The ladder would otherwise sleep ~5.7s before giving up.
+        result = audio_player.warm_stream_url(
+            "https://r1.googlevideo.com/videoplayback?id=x")
+        self.assertFalse(result)
+        self.assertLess(time.perf_counter() - started, 0.5)
+
+    def test_close_shuts_audio_down(self):
+        import inspect
+        import main
+        self.assertIn("shutdown_audio()", inspect.getsource(main.MusicBot.close))
+
+    def test_sleeps_are_interruptible_not_bare(self):
+        """time.sleep in a worker cannot be woken; _shutdown.wait can."""
+        src = _src(_AUDIO_SRC)
+        # The sleeps that run on EVERY track start must be wakeable.
+        self.assertIn("_shutdown.wait(delay)", src)      # CDN warm-up ladder
+        self.assertIn("_shutdown.is_set()", src)         # settle loop + retry entry
