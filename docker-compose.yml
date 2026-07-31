@@ -6,10 +6,19 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - bot-data:/data
+      # yt-dlp caches the YouTube player JS and signature functions here. Without a
+      # volume it is thrown away on every recreate and the first resolve after a
+      # restart costs ~6.8s instead of ~3.0s.
+      - ytdlp-cache:/root/.cache/yt-dlp
       # Optional: mount a cookies.txt file for YouTube visitor cookie auth (see config.example.yaml)
       # - ./cookies.txt:/data/cookies.txt
     environment:
       - GUILD_SETTINGS_FILE=/data/guild_settings.json
+      # Keeps the bot token out of config.yaml. Put it in a .env file next to this
+      # compose file (DISCORD_BOT_TOKEN=...) — compose picks that up automatically and
+      # it is easy to gitignore. Overrides bot_token in config.yaml when set.
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
 
 volumes:
   bot-data:
+  ytdlp-cache:

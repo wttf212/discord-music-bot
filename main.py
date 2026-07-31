@@ -134,7 +134,20 @@ def main():
     with open(os.path.join(_base_dir, "config.yaml"), "r") as f:
         config = yaml.safe_load(f)
 
-    token = config["bot_token"]
+    # The token comes from the environment first so a production deployment never has
+    # to put a credential in config.yaml (docker-compose passes DISCORD_BOT_TOKEN
+    # through, and the file is mounted read-only). config.yaml stays supported for
+    # local development. Never log the value.
+    token = (os.environ.get("DISCORD_BOT_TOKEN") or "").strip() or config.get("bot_token")
+    if not token or token == "YOUR_BOT_TOKEN_HERE":
+        print("[main] No bot token. Set the DISCORD_BOT_TOKEN environment variable "
+              "(recommended) or bot_token in config.yaml.")
+        sys.exit(1)
+    if os.environ.get("DISCORD_BOT_TOKEN"):
+        print("[main] Bot token loaded from DISCORD_BOT_TOKEN")
+        if config.get("bot_token") and config["bot_token"] != "YOUR_BOT_TOKEN_HERE":
+            print("[main] Note: config.yaml also contains a bot_token — the environment "
+                  "wins. Consider removing it so the credential lives in one place.")
 
     # --- COOKIE-02: cookies_file startup check ---
     # Mirrors the TLS-01c guard pattern: warn and continue; never sys.exit().
