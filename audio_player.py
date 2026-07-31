@@ -13,8 +13,31 @@ from collections import OrderedDict
 from urllib.error import URLError
 from urllib.parse import urlparse, parse_qs
 
+from concurrent.futures import ThreadPoolExecutor
+
 import discord
 from yt_dlp.utils import DownloadError
+
+# Audio work runs on dedicated pools, NOT asyncio's default executor.
+#
+# The default pool is min(32, cpu+4) — six workers on a 2-vCPU VPS. Starting one track
+# can hold two of them for seconds (a resolve, then the CDN settle wait or warm-up),
+# so at 10-50 guilds peak transitions would queue behind each other and present as
+# exactly the latency this codebase spent a lot of effort removing. Worse, the default
+# pool is shared with everything else asyncio hands off, so audio waits would starve
+# unrelated work and vice versa.
+#
+# Two pools, because the two kinds of work want opposite sizing:
+#   RESOLVE is CPU-bound — a yt-dlp resolve spends ~2s running the player JS challenge
+#     in Deno. Oversubscribing that thrashes a small box, so it scales with cores.
+#   STREAM is pure waiting — settle backoffs, 1-byte warm probes, FFmpeg spawn,
+#     subprocess reaping. Threads here are blocked, not busy, so the pool can be wide
+#     and must not be throttled by core count.
+_CPU_COUNT = os.cpu_count() or 2
+_RESOLVE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(4, min(8, _CPU_COUNT)), thread_name_prefix="yt-resolve")
+_STREAM_EXECUTOR = ThreadPoolExecutor(
+    max_workers=32, thread_name_prefix="audio-stream")
 
 # Load bgutil PO token provider plugin for yt-dlp
 _base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1426,12 +1449,13 @@ class AudioPlayer:
                 if self._debug:
                     print("[debug][player] Resolving audio URL via in-process yt-dlp")
                 info = await loop.run_in_executor(
-                    None, get_audio_url_with_retry, url_or_query, yt["client"], self._debug, cookies_file
+                    _RESOLVE_EXECUTOR, get_audio_url_with_retry,
+                    url_or_query, yt["client"], self._debug, cookies_file
                 )
 
             proc = await loop.run_in_executor(
-                None, _open_audio_stream, url_or_query, yt["client"], cookies_file,
-                info, self._debug
+                _STREAM_EXECUTOR, _open_audio_stream, url_or_query, yt["client"],
+                cookies_file, info, self._debug
             )
             self._ytdlp_proc = proc  # track immediately so a concurrent stop reaps it
 
@@ -1457,7 +1481,7 @@ class AudioPlayer:
             # FFmpeg still reads only from the yt-dlp stdout pipe (pipe=True).
             proc_stdout = proc.stdout
             src = await loop.run_in_executor(
-                None,
+                _STREAM_EXECUTOR,
                 lambda: discord.FFmpegPCMAudio(
                     proc_stdout,
                     executable=self._ffmpeg_path,
@@ -1476,7 +1500,7 @@ class AudioPlayer:
             # Block in the executor until FFmpeg produces its first PCM frame. An empty
             # frame from a cached URL means the stream produced no audio (stale/revoked) —
             # tear down and re-resolve fresh. A fresh resolve is accepted as-is.
-            frame = await loop.run_in_executor(None, src.read)
+            frame = await loop.run_in_executor(_STREAM_EXECUTOR, src.read)
             if not frame and used_cache:
                 if self._debug:
                     print("[debug][player] Cached stream URL produced no audio — re-resolving fresh")
@@ -1527,7 +1551,7 @@ class AudioPlayer:
         # The already-read first_frame is emitted first; a short prefill builds a
         # small cushion before playback starts.
         source = _BufferedAudioSource(source, first_frame=first_frame)
-        await loop.run_in_executor(None, source.prefill)
+        await loop.run_in_executor(_STREAM_EXECUTOR, source.prefill)
 
         # Configure Opus encoder before play() so first frames use music settings.
         # discord.py defaults: fec=True, expected_packet_loss=0.15, signal_type='auto'
@@ -1630,7 +1654,7 @@ class AudioPlayer:
         # Build the FFmpeg source off the event loop — Popen spawn is blocking and
         # would otherwise stall every guild's interactions during a radio start.
         source = await loop.run_in_executor(
-            None,
+            _STREAM_EXECUTOR,
             lambda: discord.FFmpegPCMAudio(
                 stream_url,
                 executable=self._ffmpeg_path,
@@ -1689,7 +1713,7 @@ class AudioPlayer:
         # so a 3-second timeout is conservative. Falls back gracefully on slow stations.
         try:
             first_frame = await asyncio.wait_for(
-                loop.run_in_executor(None, source.read),
+                loop.run_in_executor(_STREAM_EXECUTOR, source.read),
                 timeout=3.0,
             )
             if first_frame:

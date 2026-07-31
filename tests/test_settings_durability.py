@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -78,6 +79,7 @@ class TestAtomicWrite(SettingsTestCase):
                     # partial file, which is the property that matters. In-process
                     # readers take the same lock as the writer and never hit this.
                     seen.append("LOCKED")
+                time.sleep(0.001)   # an external reader, not a pathological spin loop
 
         t = threading.Thread(target=reader, daemon=True)
         t.start()

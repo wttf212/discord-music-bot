@@ -15,6 +15,10 @@ SETTINGS_FILE = os.environ.get(
 # the later read can miss the earlier write.
 _settings_lock = threading.RLock()
 
+# Windows-only: how long to keep retrying os.replace() when something else holds the
+# settings file open. Generous because losing a setting is worse than a slow save.
+_REPLACE_TIMEOUT = 2.0
+
 
 def load_settings() -> dict:
     if not os.path.isfile(SETTINGS_FILE):
@@ -48,14 +52,16 @@ def save_settings(data: dict):
                 f.flush()
                 os.fsync(f.fileno())   # the rename is atomic; the CONTENT must be on disk first
             # Windows refuses to rename over a file another process has open, and an
-            # AV scanner or the indexer can hold it for a few milliseconds. POSIX never
-            # hits this; the retry is cheap either way.
-            for attempt in range(10):
+            # AV scanner, backup agent or the indexer can hold it briefly. Retry on a
+            # time budget rather than a fixed count so a loaded box doesn't turn a
+            # transient lock into a lost setting. POSIX never enters this path.
+            deadline = time.monotonic() + _REPLACE_TIMEOUT
+            while True:
                 try:
                     os.replace(tmp_path, SETTINGS_FILE)
                     break
                 except PermissionError:
-                    if attempt == 9:
+                    if time.monotonic() >= deadline:
                         raise
                     time.sleep(0.02)
         except BaseException:

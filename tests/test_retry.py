@@ -428,12 +428,15 @@ class TestCallSite(unittest.TestCase):
             return fh.read()
 
     def test_play_uses_get_audio_url_with_retry(self):
-        # Collapse all whitespace so multi-line formatting of the call doesn't matter
+        # Collapse all whitespace so multi-line formatting of the call doesn't matter.
+        # Executor-agnostic: the point is WHICH function is handed off (the retrying
+        # wrapper), not which pool runs it.
         src = "".join(self._read_source().split())
-        self.assertIn("run_in_executor(None,get_audio_url_with_retry,", src,
+        self.assertIn("get_audio_url_with_retry,", src,
                       "AudioPlayer.play() must use get_audio_url_with_retry, not get_audio_url")
-        self.assertNotIn("run_in_executor(None,get_audio_url,", src,
-                         "Old call site with bare get_audio_url must be removed")
+        for pool in ("None", "_RESOLVE_EXECUTOR", "_STREAM_EXECUTOR"):
+            self.assertNotIn(f"run_in_executor({pool},get_audio_url,", src,
+                             "Old call site with bare get_audio_url must be removed")
 
     def test_no_retry_on_subprocess_path(self):
         src = self._read_source()

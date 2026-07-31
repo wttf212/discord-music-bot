@@ -14,6 +14,7 @@ from audio_player import (
     is_playlist_url, extract_playlist_info, get_audio_url_with_retry,
     is_stream_info_fresh, get_related_tracks, _youtube_video_id,
     warm_stream_url, _can_stream_in_process, is_permanent_resolve_error,
+    _RESOLVE_EXECUTOR, _STREAM_EXECUTOR,
 )
 from spotify import is_spotify_url, resolve_spotify, SpotifyError
 import weather
@@ -769,7 +770,7 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
     # Start-playback path: overlap the URL resolve with the voice connect.
     yt_cfg = bot.config.get("youtube", {})
     resolve_fut = loop.run_in_executor(
-        None, get_audio_url_with_retry, url,
+        _RESOLVE_EXECUTOR, get_audio_url_with_retry, url,
         yt_cfg.get("client", "web"), bot.config.get("debug", False),
         yt_cfg.get("cookies_file") or None,
     )
@@ -1794,7 +1795,8 @@ async def _prefetch_next_track(bot, guild_id):
             _last_prefetch_monotonic = time.monotonic()
             try:
                 info = await asyncio.get_event_loop().run_in_executor(
-                    None, get_audio_url_with_retry, track.query, yt_client, False, cookies_file
+                    _RESOLVE_EXECUTOR, get_audio_url_with_retry,
+                    track.query, yt_client, False, cookies_file
                 )
                 break
             except Exception as e:
@@ -1821,7 +1823,7 @@ async def _prefetch_next_track(bot, guild_id):
         # window out itself, exactly as before.
         if _can_stream_in_process(info):
             warmed = await asyncio.get_event_loop().run_in_executor(
-                None, warm_stream_url, info["url"], debug
+                _STREAM_EXECUTOR, warm_stream_url, info["url"], debug
             )
             if debug and not warmed:
                 print("[debug][prefetch] CDN URL still cold — playback will wait it out")
@@ -1855,7 +1857,7 @@ async def _autoplay_pick(bot, guild_id, seed):
             yt_client = bot.config.get("youtube", {}).get("client", "web")
             seed_url = seed.url or seed.query
             related = await asyncio.get_event_loop().run_in_executor(
-                None, get_related_tracks, seed_url, yt_client, 25
+                _RESOLVE_EXECUTOR, get_related_tracks, seed_url, yt_client, 25
             )
             gs.autoplay_pool = [t for t in related if t.get("url") and t["url"] not in gs.autoplay_history]
         while gs.autoplay_pool:
@@ -1909,7 +1911,8 @@ async def _resolve_track_info(bot, channel_id: int, track: Track):
         yt_client = bot.config.get("youtube", {}).get("client", "web")
         cookies_file = bot.config.get("youtube", {}).get("cookies_file") or None
         info = await asyncio.get_event_loop().run_in_executor(
-            None, get_audio_url_with_retry, track.query, yt_client, False, cookies_file
+            _RESOLVE_EXECUTOR, get_audio_url_with_retry,
+            track.query, yt_client, False, cookies_file
         )
         track.title = info["title"]
         track.thumbnail = info.get("thumbnail", "")
@@ -2219,7 +2222,7 @@ class MusicCog(commands.Cog):
                 # instead of blocking on a full "Fetching playlist info…" enumeration.
                 status_msg = await ctx.send("Loading playlist…")
                 try:
-                    first_info = await loop.run_in_executor(None, extract_playlist_info, query, yt_client, 1)
+                    first_info = await loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client, 1)
                 except Exception as e:
                     await status_msg.edit(content=f"Error fetching playlist: {e}")
                     return
@@ -2236,7 +2239,7 @@ class MusicCog(commands.Cog):
                 _schedule_prefetch(self.bot, ctx.guild.id)
                 asyncio.create_task(_safe_delete(status_msg))
 
-                full_fut = loop.run_in_executor(None, extract_playlist_info, query, yt_client)
+                full_fut = loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client)
                 entry = _make_offer(full_fut, playlist_title)
 
                 current = gs.queue.current
@@ -2255,7 +2258,7 @@ class MusicCog(commands.Cog):
             # returns, non-blocking, before voice-join).
             status_msg = await ctx.send("Loading playlist…")
             try:
-                first_info = await loop.run_in_executor(None, extract_playlist_info, query, yt_client, 1)
+                first_info = await loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client, 1)
             except Exception as e:
                 await status_msg.edit(content=f"Error fetching playlist: {e}")
                 return
@@ -2266,7 +2269,7 @@ class MusicCog(commands.Cog):
             playlist_title = first_info["title"]
             first_track_info = first_tracks[0]
 
-            full_fut = loop.run_in_executor(None, extract_playlist_info, query, yt_client)
+            full_fut = loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client)
 
             # Join voice if not already connected
             if not voice_client or not voice_client.is_connected():
@@ -2371,7 +2374,7 @@ class MusicCog(commands.Cog):
         # (they are independent — connect needs no resolved URL, resolve needs no voice).
         yt_cfg = self.bot.config.get("youtube", {})
         resolve_fut = loop.run_in_executor(
-            None, get_audio_url_with_retry, query,
+            _RESOLVE_EXECUTOR, get_audio_url_with_retry, query,
             yt_cfg.get("client", "web"), self.bot.config.get("debug", False),
             yt_cfg.get("cookies_file") or None,
         )
