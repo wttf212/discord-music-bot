@@ -99,14 +99,17 @@ class TestEditCard(unittest.TestCase):
 class TestCallbacksAcknowledgeFirst(unittest.TestCase):
     """The 3s budget must not be spent on votes or cooldown checks."""
 
-    CALLBACKS = ("playpause_callback", "prev_callback", "next_callback", "stop_callback")
+    CALLBACKS = ("playpause_callback", "prev_callback", "next_callback",
+                 "stop_callback", "queue_callback")
+    SECONDARY = ("loop_callback", "shuffle_callback", "grab_callback")
 
     def _body(self, name):
-        fn = getattr(cmds._ControlsRow, name)
+        row = cmds._ControlsRow if hasattr(cmds._ControlsRow, name) else cmds._SecondaryRow
+        fn = getattr(row, name)
         return inspect.getsource(getattr(fn, "callback", fn))
 
     def test_ack_is_the_first_await(self):
-        for name in self.CALLBACKS:
+        for name in self.CALLBACKS + self.SECONDARY:
             src = self._body(name)
             awaits = [ln.strip() for ln in src.splitlines() if "await " in ln]
             self.assertTrue(awaits, f"{name}: no awaits found")
@@ -114,21 +117,30 @@ class TestCallbacksAcknowledgeFirst(unittest.TestCase):
                           f"{name} must acknowledge before anything else, got: {awaits[0]}")
 
     def test_no_raw_defer_left_in_transport_buttons(self):
-        for name in self.CALLBACKS:
+        for name in self.CALLBACKS + self.SECONDARY:
             self.assertNotIn("interaction.response.defer()", self._body(name),
                              f"{name} should go through _ack")
 
     def test_no_raw_send_message_after_defer(self):
         """response.send_message after a defer raises InteractionResponded."""
-        for name in self.CALLBACKS:
+        for name in self.CALLBACKS + self.SECONDARY:
             self.assertNotIn("interaction.response.send_message", self._body(name),
                              f"{name} must use _respond, which is followup-aware")
 
-    def test_playpause_does_not_use_response_edit_message(self):
-        """edit_message is unavailable once deferred — must go through _edit_card."""
-        src = self._body("playpause_callback")
-        self.assertNotIn("interaction.response.edit_message", src)
-        self.assertIn("_edit_card(interaction", src)
+    def test_card_editing_callbacks_do_not_use_response_edit_message(self):
+        """edit_message is unavailable once deferred — must go through _edit_card,
+        which also survives an expired token by editing the message directly."""
+        for name in ("playpause_callback", "loop_callback", "shuffle_callback"):
+            src = self._body(name)
+            self.assertNotIn("interaction.response.edit_message", src, name)
+            self.assertIn("_edit_card(interaction", src, name)
+
+    def test_grab_acknowledges_before_dming(self):
+        """The DM is a network round-trip; doing it first risks the 3s token."""
+        src = self._body("grab_callback")
+        ack_at = src.index("_ack(interaction)")
+        dm_at = src.index("interaction.user.send")
+        self.assertLess(ack_at, dm_at, "grab must acknowledge before sending the DM")
 
 
 class TestPrefetchFloor(unittest.TestCase):

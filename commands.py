@@ -1004,6 +1004,7 @@ class _ControlsRow(discord.ui.ActionRow):
     @discord.ui.button(label="☰", style=discord.ButtonStyle.secondary, custom_id="btn_queue")  # ☰
     async def queue_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Read-only: show the queue privately (ephemeral), no fairness vote required.
+        await _ack(interaction)          # first — the 3s token clock is already running
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
         tracks = gs.queue.list()
@@ -1020,7 +1021,7 @@ class _ControlsRow(discord.ui.ActionRow):
         text = "\n".join(lines)
         if len(text) > 1900:
             text = text[:1900].rsplit("\n", 1)[0] + "\n*…more*"
-        await interaction.response.send_message(text, ephemeral=True)
+        await _respond(interaction, text)
 
 
 def _loading_offer_text(title: str) -> str:
@@ -1149,41 +1150,46 @@ class _SecondaryRow(discord.ui.ActionRow):
 
     @discord.ui.button(label="Loop: Off", style=discord.ButtonStyle.secondary, custom_id="btn_loop")
     async def loop_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ack(interaction)          # first — the 3s token clock is already running
         if _on_cooldown(interaction.guild_id, interaction.user.id, "loop", 1.0):
-            await interaction.response.send_message("One moment…", ephemeral=True)
+            await _respond(interaction, "One moment…")
             return
         gs = self.view.bot.get_guild_state(interaction.guild_id)
         gs.queue.cycle_loop()
         kwargs = {**self.view._kwargs, "queue_tracks": gs.queue.preview_fair_order()}
-        await interaction.response.edit_message(view=build_player_view(self.view.bot, **kwargs))
+        await _edit_card(interaction, build_player_view(self.view.bot, **kwargs))
 
     @discord.ui.button(label="Shuffle", style=discord.ButtonStyle.secondary, custom_id="btn_shuffle")
     async def shuffle_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ack(interaction)          # first — the 3s token clock is already running
         if _on_cooldown(interaction.guild_id, interaction.user.id, "shuffle", 1.5):
-            await interaction.response.send_message("One moment…", ephemeral=True)
+            await _respond(interaction, "One moment…")
             return
         gs = self.view.bot.get_guild_state(interaction.guild_id)
         gs.queue.shuffle()
         kwargs = {**self.view._kwargs, "queue_tracks": gs.queue.preview_fair_order()}
-        await interaction.response.edit_message(view=build_player_view(self.view.bot, **kwargs))
+        await _edit_card(interaction, build_player_view(self.view.bot, **kwargs))
 
     @discord.ui.button(label="Grab", style=discord.ButtonStyle.secondary, custom_id="btn_grab")
     async def grab_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Acknowledge before the DM: sending it is a network round-trip that can
+        # easily outlast the 3s interaction token on a loaded bot.
+        await _ack(interaction)
         if _on_cooldown(interaction.guild_id, interaction.user.id, "grab", 3.0):
-            await interaction.response.send_message("You just grabbed this — give it a moment.", ephemeral=True)
+            await _respond(interaction, "You just grabbed this — give it a moment.")
             return
         gs = self.view.bot.get_guild_state(interaction.guild_id)
         current = gs.queue.current
         if not current or not gs.player.is_playing:
-            await interaction.response.send_message("Nothing is playing to grab.", ephemeral=True)
+            await _respond(interaction, "Nothing is playing to grab.")
             return
         try:
             await interaction.user.send(embed=_build_grab_embed(gs, current))
-            await interaction.response.send_message("Sent it to your DMs.", ephemeral=True)
+            await _respond(interaction, "Sent it to your DMs.")
         except discord.Forbidden:
-            await interaction.response.send_message(
+            await _respond(
+                interaction,
                 "I couldn't DM you — enable **Allow direct messages from server members**.",
-                ephemeral=True,
             )
 
 
