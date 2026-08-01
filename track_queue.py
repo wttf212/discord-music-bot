@@ -83,6 +83,17 @@ class TrackQueue:
         self.last_played_user = self.current.requested_by if self.current else None
         return self.current
 
+    def requeue_front(self, track: Track) -> None:
+        """Put a track back at the head of the queue after a failed start.
+
+        Clears `current` because this track never actually played: leaving it set would
+        make the following next() file it into history (loop off), append a second copy
+        to the back (loop 'queue'), or return it without popping the copy we just pushed
+        (loop 'track').
+        """
+        self._queue.appendleft(track)
+        self.current = None
+
     def previous(self) -> Track | None:
         if not self._history:
             return None
