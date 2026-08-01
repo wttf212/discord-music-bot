@@ -3391,9 +3391,15 @@ class MusicCog(commands.Cog):
 # minutes. The auto-next chain has to wait that out: play() raises "Not connected to a
 # voice channel", which the yt-dlp classifier reads as an ambiguous-therefore-retryable
 # TRACK error, so three queued songs got eaten and the breaker tripped in milliseconds.
-# We never call connect() ourselves here — that races discord.py's in-flight reconnect.
+# guild.voice_client is not None -> discord.py is still retrying; we must not race it.
+# guild.voice_client is None     -> discord.py ran cleanup() and abandoned the client;
+# nothing in discord.py will ever recreate it, so we have to connect() ourselves.
 _VOICE_RECOVERY_TIMEOUT = 300.0  # seconds to wait for the socket to come back
 _VOICE_RECOVERY_POLL = 1.0      # seconds between connection checks
+_VOICE_RECONNECT_ATTEMPTS = 3    # bounded self-connects once discord.py has given up
+_VOICE_RECONNECT_BACKOFF = 5.0   # seconds, multiplied by the attempt number
+# 3 attempts x 30s connect timeout + 5s + 10s backoff = 105s worst case, comfortably
+# inside _VOICE_RECOVERY_TIMEOUT; the outer deadline check remains the hard bound.
 
 
 def _live_voice_client(bot, gs, guild_id):
@@ -3403,13 +3409,52 @@ def _live_voice_client(bot, gs, guild_id):
     return vc if (vc is not None and vc.is_connected()) else None
 
 
-async def _wait_for_voice_recovery(bot, gs, guild_id, generation) -> bool:
+def _voice_channel_hint(bot, gs, guild_id):
+    """The voice channel we were last in, read from whichever client object still
+    holds one, else None. Captured at voice-down detection time, before anything
+    clears the stale client object."""
+    guild = bot.get_guild(guild_id)
+    vc = (guild.voice_client if guild else None) or gs.player._voice_client
+    return vc.channel if vc is not None else None
+
+
+async def _self_reconnect(bot, gs, guild_id, generation, voice_channel) -> bool:
+    """One bounded attempt to reconnect after discord.py abandoned the client.
+
+    False if superseded (before or during the connect()) or if connect() itself
+    fails. Never touches gs.player if a newer chain took over while we awaited.
+    """
+    if gs.auto_next_gen != generation:
+        return False
+    gs.player._voice_client = None  # drop the object discord.py already cleaned up
+    print(f"[commands] discord.py dropped the voice client — reconnecting to "
+          f"{voice_channel} (guild {guild_id})")
+    try:
+        vc = await voice_channel.connect()
+    except Exception as e:
+        print(f"[commands] Voice reconnect failed: {e} (guild {guild_id})")
+        return False
+    # connect() blocks up to 30s — ample room for a !!stop or a fresh !!play to land.
+    # Adopting the client from a superseded chain would clobber the live chain's
+    # gs.player._voice_client (the 'NoneType' .pid class of bug) — treat as critical.
+    # Don't disconnect the client we just made either: guild.voice_client is valid
+    # now, so the newer chain reuses or tears it down through the normal paths.
+    if gs.auto_next_gen != generation:
+        return False
+    # Bitrate and EQ are deliberately not restored here — play() re-applies both
+    # from gs.player's per-guild dicts on every call.
+    gs.player.set_voice_client(vc)
+    return True
+
+
+async def _wait_for_voice_recovery(bot, gs, guild_id, generation, voice_channel=None) -> bool:
     """Poll until discord.py restores the voice socket. True when it is back.
 
     False on timeout OR when a newer chain (!!stop / a fresh !!play) superseded this one,
     so the caller must re-check the generation before reporting anything to the user.
     """
     deadline = time.monotonic() + _VOICE_RECOVERY_TIMEOUT
+    attempts = 0
     while time.monotonic() < deadline:
         if gs.auto_next_gen != generation:
             return False
@@ -3417,6 +3462,22 @@ async def _wait_for_voice_recovery(bot, gs, guild_id, generation) -> bool:
         if vc is not None:
             gs.player.set_voice_client(vc)  # re-sync in case discord.py swapped objects
             return True
+        guild = bot.get_guild(guild_id)
+        if guild is not None and guild.voice_client is None:
+            # discord.py ran cleanup() and dropped the client, so there is no in-flight
+            # reconnect left to race and polling can never succeed. Connect ourselves.
+            if voice_channel is None or attempts >= _VOICE_RECONNECT_ATTEMPTS:
+                return False
+            if not any(not m.bot for m in getattr(voice_channel, "members", ())):
+                print(f"[commands] Voice channel is empty — not rejoining (guild {guild_id})")
+                return False
+            attempts += 1
+            if await _self_reconnect(bot, gs, guild_id, generation, voice_channel):
+                return True
+            if gs.auto_next_gen != generation:
+                return False
+            await asyncio.sleep(_VOICE_RECONNECT_BACKOFF * attempts)
+            continue
         await asyncio.sleep(_VOICE_RECOVERY_POLL)
     return False
 
@@ -3492,12 +3553,13 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 # reconnecting. Put the track back, wait the socket out, and leave the
                 # breaker alone.
                 if _live_voice_client(bot, gs, guild_id) is None:
+                    target_channel = _voice_channel_hint(bot, gs, guild_id)
                     gs.queue.requeue_front(next_track)
                     print(f"[commands] Voice connection down — holding auto-play up to "
                           f"{_VOICE_RECOVERY_TIMEOUT:.0f}s (guild {guild_id})")
                     if channel:
                         await channel.send("Lost the voice connection — waiting for it to come back.")
-                    if await _wait_for_voice_recovery(bot, gs, guild_id, generation):
+                    if await _wait_for_voice_recovery(bot, gs, guild_id, generation, target_channel):
                         print(f"[commands] Voice reconnected — resuming auto-play (guild {guild_id})")
                         continue
                     if gs.auto_next_gen != generation:

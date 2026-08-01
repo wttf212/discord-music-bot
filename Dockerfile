@@ -32,5 +32,6 @@ RUN curl -fsSL \
 # Persistent data directory for guild settings
 RUN mkdir -p /data
 ENV GUILD_SETTINGS_FILE=/data/guild_settings.json
+ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "main.py"]
