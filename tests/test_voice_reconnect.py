@@ -123,19 +123,33 @@ class _Member:
 class _VoiceChannel:
     """Non-empty channel so the queue-drained auto-leave branch stays a no-op here."""
 
-    def __init__(self):
-        self.members = [_Member(bot=False)]
+    def __init__(self, members=None, connect_result=None, connect_error=None, on_connect=None):
+        self.members = members if members is not None else [_Member(bot=False)]
+        self.connect_result = connect_result
+        self.connect_error = connect_error
+        self.on_connect = on_connect
+        self.connect_calls = 0
+
+    async def connect(self):
+        self.connect_calls += 1
+        if self.on_connect:
+            self.on_connect()
+        if self.connect_error is not None:
+            raise self.connect_error
+        if self.connect_result is not None:
+            return self.connect_result
+        return _VC(connected=True, channel=self)
 
 
 class _VC:
     """Fake discord.py VoiceClient tracking connection state across polls."""
 
-    def __init__(self, connected: bool, flip_after: int | None = None, on_check=None):
+    def __init__(self, connected: bool, flip_after: int | None = None, on_check=None, channel=None):
         self._connected = connected
         self.flip_after = flip_after
         self.on_check = on_check
         self.check_count = 0
-        self.channel = _VoiceChannel()
+        self.channel = channel if channel is not None else _VoiceChannel()
 
     def is_connected(self):
         self.check_count += 1
@@ -264,6 +278,8 @@ class TestAutoNextVoiceRecovery(unittest.TestCase):
                               for m in sent), 1)
         self.assertFalse(any("skipping track" in m.lower() for m in sent))
         self.assertFalse(any("consecutive errors" in m.lower() for m in sent))
+        self.assertEqual(vc.channel.connect_calls, 0,
+                          "discord.py is still retrying — we must not race it with our own connect()")
 
     def test_playback_resumes_when_voice_comes_back(self):
         with patch.object(commands, "_VOICE_RECOVERY_TIMEOUT", 5.0):
@@ -325,6 +341,113 @@ class TestAutoNextVoiceRecovery(unittest.TestCase):
         # 3 of the 4 queued tracks were attempted (and lost) before the breaker tripped;
         # none of them come back to the front of the queue the way a voice-down requeue would.
         self.assertEqual(gs.queue.list(), [tracks[3]])
+
+
+class TestSelfReconnect(unittest.TestCase):
+    """discord.py has run cleanup() and dropped the voice client entirely — polling
+    can never succeed, so the auto-next chain must reconnect itself, bounded and
+    generation-safe. In every test the guild is `_Guild(None)` (discord.py gave up)
+    and the stale channel hint comes from `gs.player._voice_client.channel`.
+    """
+
+    def setUp(self):
+        self._patches = [
+            patch.object(commands, "build_player_view", return_value=None),
+            patch.object(commands, "_get_requester_name", return_value="someone"),
+            patch.object(commands, "send_new_np", side_effect=self._noop),
+            patch.object(commands, "update_np_stopped", side_effect=self._noop),
+            patch.object(commands, "_schedule_prefetch", return_value=None),
+            patch.object(commands, "_schedule_autoplay_topup", return_value=None),
+            patch.object(commands, "_VOICE_RECOVERY_TIMEOUT", 5.0),
+            patch.object(commands, "_VOICE_RECOVERY_POLL", 0.01),
+            patch.object(commands, "_VOICE_RECONNECT_BACKOFF", 0.01),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    async def _noop(*a, **k):
+        return None
+
+    def test_client_gone_self_connects_once_and_resumes(self):
+        channel = _VoiceChannel()
+        vc = _VC(connected=False, channel=channel)
+        player = _Player(vc)
+        gs = _GS(player)
+        track = Track(query="a", title="a", requested_by="u")
+        gs.queue.add(track)
+        bot = _Bot(gs, _Guild(None))
+
+        asyncio.run(commands._auto_next(bot, 10, 1, 1))
+
+        self.assertEqual(channel.connect_calls, 1)
+        self.assertEqual(player.play_calls, ["a"])
+        self.assertIsNone(gs.queue.current)
+        self.assertEqual(len(gs.queue), 0)
+        sent = bot._channel.sent
+        self.assertFalse(any("didn't come back" in m.lower() or "did not come back" in m.lower()
+                              for m in sent))
+
+    def test_empty_channel_is_not_rejoined(self):
+        channel = _VoiceChannel(members=[_Member(bot=True)])
+        vc = _VC(connected=False, channel=channel)
+        player = _Player(vc)
+        gs = _GS(player)
+        track = Track(query="a", title="a", requested_by="u")
+        gs.queue.add(track)
+        bot = _Bot(gs, _Guild(None))
+
+        asyncio.run(commands._auto_next(bot, 10, 1, 1))
+
+        self.assertEqual(channel.connect_calls, 0)
+        self.assertEqual(player.play_calls, [])
+        self.assertEqual(gs.queue.list(), [track], "the track must stay in the queue")
+
+    def test_generation_change_during_connect_aborts(self):
+        channel = _VoiceChannel()
+        vc = _VC(connected=False, channel=channel)
+        player = _Player(vc)
+        gs = _GS(player)
+        track = Track(query="a", title="a", requested_by="u")
+        gs.queue.add(track)
+        bot = _Bot(gs, _Guild(None))
+
+        def bump_generation():
+            gs.auto_next_gen = 2
+
+        channel.on_connect = bump_generation
+
+        asyncio.run(commands._auto_next(bot, 10, 1, 1))
+
+        self.assertEqual(player.play_calls, [])
+        self.assertEqual(gs.queue.list(), [track], "the track must stay in the queue")
+        self.assertIsNone(gs.player._voice_client,
+                           "the superseded generation must not adopt the reconnected client")
+        sent = bot._channel.sent
+        self.assertFalse(any("didn't come back" in m.lower() or "did not come back" in m.lower()
+                              for m in sent), "an aborted-by-generation connect must not give up out loud")
+
+    def test_connect_failure_does_not_trip_the_breaker(self):
+        channel = _VoiceChannel(connect_error=RuntimeError("boom"))
+        vc = _VC(connected=False, channel=channel)
+        player = _Player(vc)
+        gs = _GS(player)
+        track = Track(query="a", title="a", requested_by="u")
+        gs.queue.add(track)
+        bot = _Bot(gs, _Guild(None))
+
+        asyncio.run(commands._auto_next(bot, 10, 1, 1))
+
+        self.assertGreaterEqual(channel.connect_calls, 1)
+        self.assertLessEqual(channel.connect_calls, commands._VOICE_RECONNECT_ATTEMPTS)
+        self.assertEqual(player.play_calls, [])
+        self.assertEqual(gs.queue.list(), [track], "the track must stay in the queue")
+        sent = bot._channel.sent
+        self.assertEqual(sum("didn't come back" in m.lower() or "did not come back" in m.lower()
+                              for m in sent), 1)
+        self.assertFalse(any("skipping track" in m.lower() for m in sent))
+        self.assertFalse(any("consecutive errors" in m.lower() for m in sent))
 
 
 if __name__ == "__main__":
