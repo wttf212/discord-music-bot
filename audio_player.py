@@ -1793,5 +1793,5 @@ class AudioPlayer:
         self.stop_playback()
         if self._voice_client and self._voice_client.is_connected():
             await self._voice_client.disconnect()
-            self._voice_client = None
+        self._voice_client = None
         print("[audio] Disconnected from voice channel")

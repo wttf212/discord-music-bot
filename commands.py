@@ -3387,6 +3387,40 @@ class MusicCog(commands.Cog):
             f"`{p}shutdown` — Shut down the bot *(owner only)*"
         )
 
+# A 1006 voice-socket drop puts discord.py into its own reconnect loop, which can take
+# minutes. The auto-next chain has to wait that out: play() raises "Not connected to a
+# voice channel", which the yt-dlp classifier reads as an ambiguous-therefore-retryable
+# TRACK error, so three queued songs got eaten and the breaker tripped in milliseconds.
+# We never call connect() ourselves here — that races discord.py's in-flight reconnect.
+_VOICE_RECOVERY_TIMEOUT = 300.0  # seconds to wait for the socket to come back
+_VOICE_RECOVERY_POLL = 1.0      # seconds between connection checks
+
+
+def _live_voice_client(bot, gs, guild_id):
+    """This guild's voice client if it is currently connected, else None."""
+    guild = bot.get_guild(guild_id)
+    vc = (guild.voice_client if guild else None) or gs.player._voice_client
+    return vc if (vc is not None and vc.is_connected()) else None
+
+
+async def _wait_for_voice_recovery(bot, gs, guild_id, generation) -> bool:
+    """Poll until discord.py restores the voice socket. True when it is back.
+
+    False on timeout OR when a newer chain (!!stop / a fresh !!play) superseded this one,
+    so the caller must re-check the generation before reporting anything to the user.
+    """
+    deadline = time.monotonic() + _VOICE_RECOVERY_TIMEOUT
+    while time.monotonic() < deadline:
+        if gs.auto_next_gen != generation:
+            return False
+        vc = _live_voice_client(bot, gs, guild_id)
+        if vc is not None:
+            gs.player.set_voice_client(vc)  # re-sync in case discord.py swapped objects
+            return True
+        await asyncio.sleep(_VOICE_RECOVERY_POLL)
+    return False
+
+
 def _start_auto_next(bot, channel_id, guild_id):
     """Cancel any existing auto-next chain for this guild and start a fresh one."""
     gs = bot.get_guild_state(guild_id)
@@ -3454,6 +3488,26 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 _schedule_autoplay_topup(bot, guild_id)
             except Exception as e:
                 channel = bot.get_channel(channel_id)
+                # A dead voice socket is not a bad track — discord.py is already
+                # reconnecting. Put the track back, wait the socket out, and leave the
+                # breaker alone.
+                if _live_voice_client(bot, gs, guild_id) is None:
+                    gs.queue.requeue_front(next_track)
+                    print(f"[commands] Voice connection down — holding auto-play up to "
+                          f"{_VOICE_RECOVERY_TIMEOUT:.0f}s (guild {guild_id})")
+                    if channel:
+                        await channel.send("Lost the voice connection — waiting for it to come back.")
+                    if await _wait_for_voice_recovery(bot, gs, guild_id, generation):
+                        print(f"[commands] Voice reconnected — resuming auto-play (guild {guild_id})")
+                        continue
+                    if gs.auto_next_gen != generation:
+                        return  # superseded by !!stop / a new !!play while we waited
+                    print(f"[commands] Voice did not come back — stopping auto-play (guild {guild_id})")
+                    if channel:
+                        await channel.send(
+                            "Voice connection didn't come back — stopping auto-play. "
+                            "The queue is still here.")
+                    break
                 # A removed/private/geo-blocked track is a fact about that track, not a
                 # sign the bot is broken, so it must not count toward the circuit
                 # breaker — three unavailable songs in a playlist used to end the
