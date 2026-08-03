@@ -992,6 +992,9 @@ class _ControlsRow(discord.ui.ActionRow):
             return
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
+        if _live_voice_client(self.view.bot, gs, guild_id) is None:
+            await _respond(interaction, "Voice connection is down — reconnecting. Try again in a moment.")
+            return
         prev_track = gs.queue.previous()
         if not prev_track:
             await interaction.followup.send("No previous track in history.", ephemeral=True)
@@ -1018,7 +1021,10 @@ class _ControlsRow(discord.ui.ActionRow):
             await send_new_np(self.view.bot, interaction.channel.id, view)
             _start_auto_next(self.view.bot, interaction.channel.id, guild_id)
         except Exception as e:
-            await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+            print(f"[commands] Manual advance failed (guild {guild_id}): {e}")
+            if not _recover_manual_advance(self.view.bot, gs, guild_id,
+                                           interaction.channel.id, prev_track):
+                await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
 
     @discord.ui.button(label="►", style=discord.ButtonStyle.primary, custom_id="btn_next")  # ►
     async def next_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1029,6 +1035,9 @@ class _ControlsRow(discord.ui.ActionRow):
             return
         guild_id = interaction.guild_id
         gs = self.view.bot.get_guild_state(guild_id)
+        if _live_voice_client(self.view.bot, gs, guild_id) is None:
+            await _respond(interaction, "Voice connection is down — reconnecting. Try again in a moment.")
+            return
         if gs.auto_next_task and not gs.auto_next_task.done():
             gs.auto_next_task.cancel()
             gs.auto_next_task = None
@@ -1051,7 +1060,10 @@ class _ControlsRow(discord.ui.ActionRow):
                 await send_new_np(self.view.bot, interaction.channel.id, view)
                 _start_auto_next(self.view.bot, interaction.channel.id, guild_id)
             except Exception as e:
-                await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+                print(f"[commands] Manual advance failed (guild {guild_id}): {e}")
+                if not _recover_manual_advance(self.view.bot, gs, guild_id,
+                                               interaction.channel.id, next_track):
+                    await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
             await update_np_stopped(self.view.bot, interaction.channel.id)
 
@@ -2692,6 +2704,9 @@ class MusicCog(commands.Cog):
 
         gs = self.bot.get_guild_state(ctx.guild.id)
         channel_id = ctx.channel.id
+        if _live_voice_client(self.bot, gs, ctx.guild.id) is None:
+            await ctx.send("Voice connection is down — reconnecting. Try again in a moment.")
+            return
         # Cancel the existing auto-next task and invalidate its generation
         if gs.auto_next_task and not gs.auto_next_task.done():
             gs.auto_next_task.cancel()
@@ -2716,7 +2731,9 @@ class MusicCog(commands.Cog):
                 await send_new_np(self.bot, channel_id, view)
                 _start_auto_next(self.bot, channel_id, ctx.guild.id)
             except Exception as e:
-                await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+                print(f"[commands] Manual advance failed (guild {ctx.guild.id}): {e}")
+                if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track):
+                    await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
             await ctx.send("Skipped. Queue is empty.")
             channel_id = gs.current_text_channel_id or ctx.channel.id
@@ -2989,6 +3006,9 @@ class MusicCog(commands.Cog):
             await ctx.send(f"Usage: `{self.bot.command_prefix}skipto <position>`")
             return
         gs = self.bot.get_guild_state(ctx.guild.id)
+        if _live_voice_client(self.bot, gs, ctx.guild.id) is None:
+            await ctx.send("Voice connection is down — reconnecting. Try again in a moment.")
+            return
         if not gs.queue.skip_to(position):
             await ctx.send(f"No track at position {position}.")
             return
@@ -3017,7 +3037,9 @@ class MusicCog(commands.Cog):
             await send_new_np(self.bot, channel_id, view)
             _start_auto_next(self.bot, channel_id, ctx.guild.id)
         except Exception as e:
-            await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+            print(f"[commands] Manual advance failed (guild {ctx.guild.id}): {e}")
+            if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track):
+                await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
 
     @commands.hybrid_command(name="clear", description="Clear the upcoming queue (keeps the current track)")
     async def clear(self, ctx: commands.Context):
@@ -3407,6 +3429,22 @@ def _live_voice_client(bot, gs, guild_id):
     guild = bot.get_guild(guild_id)
     vc = (guild.voice_client if guild else None) or gs.player._voice_client
     return vc if (vc is not None and vc.is_connected()) else None
+
+
+def _recover_manual_advance(bot, gs, guild_id, channel_id, track) -> bool:
+    """Voice died *during* a manual advance's play(). Put the track back and hand
+    control to the auto-next chain, which knows how to wait a reconnect out.
+
+    False when voice is fine — a genuinely dead track must keep its existing
+    skip-and-move-on behaviour; requeueing a permanently broken track and
+    re-arming the chain would retry it forever.
+    """
+    if _live_voice_client(bot, gs, guild_id) is None:
+        if track is not None:
+            gs.queue.requeue_front(track)
+        _start_auto_next(bot, channel_id, guild_id)
+        return True
+    return False
 
 
 def _voice_channel_hint(bot, gs, guild_id):
