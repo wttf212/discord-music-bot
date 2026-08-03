@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sys
 import yaml
@@ -262,6 +263,16 @@ def main():
             if gs.empty_channel_task and not gs.empty_channel_task.done():
                 gs.empty_channel_task.cancel()
                 gs.empty_channel_task = None
+
+    # A voice-socket drop is invisible at the default INFO level: the decisive lines
+    # ("Received voice WSMessage(CLOSED...)", "Not handling close code", "Not connected,
+    # waiting for 30.0s...") are all DEBUG. Raise only these two — global DEBUG buries
+    # them under per-event gateway traffic. Both are event-driven (connect/disconnect/
+    # reconnect), so this stays quiet in normal operation. Unconditional on purpose:
+    # prod runs debug: false, and gating it there would guarantee the next voice
+    # incident is as undiagnosable as the 2026-08-02 one.
+    logging.getLogger("discord.voice_state").setLevel(logging.DEBUG)
+    logging.getLogger("discord.player").setLevel(logging.DEBUG)
 
     try:
         bot.run(token)
