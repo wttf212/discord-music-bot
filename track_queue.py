@@ -16,6 +16,11 @@ class Track:
     # resolved_at is wall-clock (time.time()) for TTL fallback freshness checks.
     resolved_info: dict | None = None
     resolved_at: float = 0.0
+    # True once this track has played during the current lap of loop_mode
+    # "queue". Only ever consulted while looping, so loop "off"/"track"
+    # ordering is unchanged. Reset when a lap rolls over and when the track is
+    # selected, so a stale mark cannot survive a trip through loop "off".
+    lap_played: bool = False
 
 
 class TrackQueue:
@@ -58,30 +63,94 @@ class TrackQueue:
             self.current = None
             return None
 
+        picks, lap_rolled = self._fair_sequence(1)
+        chosen = picks[0]        # _queue is non-empty here, so there is always one
+
         curr = self.current
         if curr is not None and not curr.is_radio:
             if self.loop_mode == "queue":
+                curr.lap_played = True    # it has had its turn this lap
                 self._queue.append(curr)  # cycle the finished track to the back
             else:
                 self._history.append(curr)
+        if lap_rolled:
+            for t in self._queue:
+                t.lap_played = False
+        self.discard(chosen)              # by identity, not value equality
+        chosen.lap_played = False
+        self.current = chosen
+        self.last_played_user = chosen.requested_by
+        return chosen
 
-        if self.fair_play and self.last_played_user is not None and len(self._queue) > 1:
-            # Find the first track by a DIFFERENT user than last_played_user
-            next_idx = 0
-            for i, track in enumerate(self._queue):
-                if track.requested_by != self.last_played_user:
-                    next_idx = i
-                    break
-            
-            # Move track to front if a different user was found
-            if next_idx > 0:
-                track_to_play = self._queue[next_idx]
-                self._queue.remove(track_to_play) # Deque remove is safer for types
-                self._queue.appendleft(track_to_play)
+    def _lap_pool(self):
+        """The candidate set next() picks from: the pending queue plus, under a
+        queue loop, the finished `current` that is about to be cycled to the
+        back. Marks are honoured ONLY under loop "queue" -- that is what keeps
+        loop "off"/"track" ordering bit-identical to before laps existed."""
+        pool = list(self._queue)
+        looping = self.loop_mode == "queue"
+        marks = [t.lap_played and looping for t in pool]
+        if looping and self.current is not None and not self.current.is_radio:
+            pool.append(self.current)
+            marks.append(True)
+        return pool, marks
 
-        self.current = self._queue.popleft()
-        self.last_played_user = self.current.requested_by if self.current else None
-        return self.current
+    @staticmethod
+    def _pick_index(tracks, marks, last_user, fair_play, blocked=-1):
+        """Index of the track to play, or -1 if nothing is eligible.
+
+        Fair play takes the first track by a requester other than last_user,
+        else the first eligible track. Tracks already played this lap are
+        ineligible; the caller rolls the lap over when none are left.
+        """
+        interleave = fair_play and last_user is not None
+        first_unplayed = -1
+        for i, t in enumerate(tracks):
+            if marks[i] or i == blocked:
+                continue
+            if first_unplayed < 0:
+                first_unplayed = i
+                if not interleave:
+                    return i
+            if t.requested_by != last_user:
+                return i
+        return first_unplayed
+
+    def _fair_sequence(self, limit):
+        """The next `limit` tracks in the exact order next() will take them, plus
+        whether the FIRST of them needed a new lap. Pure: mutates nothing.
+
+        This is the ONLY ordering rule in the class. next() consumes one step and
+        pops what it names; preview_fair_order() consumes `limit` steps and pops
+        nothing. Neither has a rule of its own, so playback, the Up Next card and
+        the CDN prefetch cannot drift apart.
+        """
+        pool, marks = self._lap_pool()
+        looping = self.loop_mode == "queue"
+        # The just-finished track sits at the tail of the pool. It must not be
+        # picked as the very NEXT track (that would replay it back-to-back), but
+        # it rejoins the rotation from step 1 on, exactly as next() lets it.
+        blocked = len(pool) - 1 if len(pool) > len(self._queue) else -1
+        last_user = self.last_played_user
+        result, rolled_first = [], False
+        while pool and len(result) < limit:
+            if all(marks):
+                if result:
+                    break                 # one lap is enough for a preview
+                marks = [False] * len(marks)
+                rolled_first = True
+            i = self._pick_index(pool, marks, last_user, self.fair_play, blocked)
+            if i < 0:
+                break                     # only the just-finished track is left
+            chosen = pool.pop(i)
+            marks.pop(i)
+            blocked = -1                  # the block applies to step 0 only
+            result.append(chosen)
+            last_user = chosen.requested_by
+            if looping and not chosen.is_radio:
+                pool.append(chosen)       # cycles to the back, played this lap
+                marks.append(True)
+        return result, rolled_first
 
     def requeue_front(self, track: Track) -> None:
         """Put a track back at the head of the queue after a failed start.
@@ -132,13 +201,18 @@ class TrackQueue:
         return False
 
     def move(self, src: int, dst: int) -> Track | None:
-        """Move the 1-based src-th pending track to the 1-based dst position."""
+        """Move the 1-based src-th pending track to the 1-based dst position.
+
+        Under loop "queue" a moved track may play twice in one lap: an explicit
+        user action wins over the lap bookkeeping.
+        """
         n = len(self._queue)
         if not (1 <= src <= n and 1 <= dst <= n):
             return None
         track = self._queue[src - 1]
         del self._queue[src - 1]
         self._queue.insert(dst - 1, track)
+        track.lap_played = False   # an explicit reposition is honoured this lap
         return track
 
     def skip_to(self, index: int) -> bool:
@@ -188,33 +262,21 @@ class TrackQueue:
         items = list(self._queue)
         random.shuffle(items)
         self._queue = deque(items)
+        for t in items:
+            t.lap_played = False   # a reshuffled rotation starts a fresh lap
         return len(items)
 
     def preview_fair_order(self, limit: int = 10):
-        """Return up to 'limit' tracks in predicted fair-play order without mutating state.
+        """Up to 'limit' tracks in the exact order next() will play them.
            Capped to prevent O(N^2) CPU locks causing interaction timeouts.
+
+        Under loop "queue" this models the finished track cycling to the back and
+        stops after one lap, so the Up Next card and the CDN prefetch name the
+        tracks playback will actually reach. The first entry is always a PENDING
+        track, never self.current, so gs.queue.discard() on the prefetch target
+        still matches by identity (commands.py:1918).
         """
-        if not self.fair_play or len(self._queue) <= 1:
-            q_list = list(self._queue)
-            return q_list[:limit]
-
-        remaining = list(self._queue)
-        result = []
-        last_user = self.last_played_user
-
-        while remaining and len(result) < limit:
-            # Find first track by a different user
-            chosen_idx = 0
-            if last_user is not None:
-                for i, t in enumerate(remaining):
-                    if t.requested_by != last_user:
-                        chosen_idx = i
-                        break
-            chosen = remaining.pop(chosen_idx)
-            result.append(chosen)
-            last_user = chosen.requested_by
-
-        return result
+        return self._fair_sequence(limit)[0]
 
     def is_empty(self) -> bool:
         return len(self._queue) == 0
