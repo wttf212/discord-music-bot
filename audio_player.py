@@ -162,9 +162,38 @@ def _is_youtube(query: str) -> bool:
     return any(h in query for h in ("youtube.com", "youtu.be", "music.youtube.com"))
 
 
+def _no_results_error(query: str) -> RuntimeError:
+    """The error for a search YouTube answered with zero results.
+
+    Usually an age-gated result set rather than a genuinely unknown track: an
+    anonymous search gets a "Confirm your age" panel and estimatedResults: 0 instead
+    of hits, so the same search repeated can never return anything. The message
+    carries a marker listed in _NON_RETRYABLE_SUBSTRINGS to keep it off the backoff
+    path — retrying would only triple the search traffic for a fixed outcome.
+    """
+    return RuntimeError(
+        f"No YouTube search results for {query!r} — the query may be age-restricted "
+        f"(an anonymous search gets a 'Confirm your age' page instead of results). "
+        f"Set youtube.cookies_file to search with an age-verified account."
+    )
+
+
+def _drop_artist_prefix(query: str) -> str | None:
+    """'Artist - Title' -> 'Title', or None when there is no prefix to drop.
+
+    A last resort for a search that returned nothing: YouTube's age filter is
+    sensitive to the *combination* of terms, so the bare title often clears a filter
+    that the full "Artist - Title" string trips.
+    """
+    if " - " not in query:
+        return None
+    return query.split(" - ", 1)[1].strip() or None
+
+
 _NON_RETRYABLE_SUBSTRINGS = (
     "video unavailable",
     "sign in to confirm",
+    "no youtube search results",
     "confirm your age",
     "age-restricted",
     "age restricted",
@@ -541,8 +570,14 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
 
 
 def _resolve_audio_url(query: str, client: str, debug: bool = False,
-                       cookies_file: str | None = None, *, force_cli: bool = False) -> dict:
-    """Extract audio URL and title via yt-dlp. Supports YouTube, SoundCloud, and others."""
+                       cookies_file: str | None = None, *, force_cli: bool = False,
+                       _retry_of: str | None = None) -> dict:
+    """Extract audio URL and title via yt-dlp. Supports YouTube, SoundCloud, and others.
+
+    ``_retry_of`` carries the query this call is the zero-results fallback for. It both
+    guards that fallback to a single level and keeps the user-facing error naming the
+    query that was actually asked for, not the trimmed one we retried with.
+    """
     original_query = query
     ffmpeg_exe = _find_ffmpeg("ffmpeg")
     ydl_opts = {
@@ -603,7 +638,26 @@ def _resolve_audio_url(query: str, client: str, debug: bool = False,
     with _resolver(resolver_key, ydl_opts) as ydl:
         info = ydl.extract_info(query, download=False)
         if "entries" in info:
-            info = info["entries"][0]
+            entries = info["entries"] or []
+            if not entries:
+                # A search YouTube answered with nothing. Dropping a leading
+                # "Artist - " often clears its age filter (the filter keys on the
+                # term combination), so spend one more search on the bare title
+                # before giving up. Guarded to depth 1 by _retry_of, and skipped for
+                # URLs, which have no search to redo. Recursing inside the _resolver
+                # block is safe: that lock is a try-lock, so the inner call takes a
+                # cold throwaway instance rather than blocking — ~0.45s on a path
+                # that would otherwise fail outright.
+                is_search = not original_query.startswith(("http://", "https://"))
+                fallback = _drop_artist_prefix(original_query) if is_search and not _retry_of else None
+                if fallback:
+                    print(f"[yt-dlp] No results for {original_query!r} — retrying once "
+                          f"with {fallback!r}")
+                    return _resolve_audio_url(fallback, client, debug, cookies_file,
+                                              force_cli=force_cli,
+                                              _retry_of=original_query)
+                raise _no_results_error(_retry_of or original_query)
+            info = entries[0]
 
         if debug:
             print(f"[debug][yt-dlp] Title: {info.get('title', 'Unknown')}")
