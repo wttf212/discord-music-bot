@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -103,6 +104,33 @@ def _drain(reader):
     data = reader.stdout.read()
     reader.wait(timeout=5)
     return data
+
+
+def _wait_until(cond, timeout=2.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return cond()
+
+
+class StalledResponse(FakeResponse):
+    """A window that delivers ``head`` and then stalls like a dead CDN edge.
+
+    Blocks after the head until ``release`` is set: the stand-in for libcurl's
+    low-speed abort (LOW_SPEED_LIMIT 1 B/s for _STREAM_TIMEOUT = 30 s). The timeout only
+    matters if terminate() regresses, so the test fails in seconds instead of hanging.
+    """
+
+    def __init__(self, head, total, release, timeout=2.0):
+        super().__init__(200, head, content_length=total)
+        self._release = release
+        self._timeout = timeout
+
+    def iter_content(self, chunk_size=65536):
+        yield self._body
+        self._release.wait(self._timeout)
 
 
 class TestHelpers(unittest.TestCase):
@@ -314,6 +342,69 @@ class TestPopenCompatibility(unittest.TestCase):
             self.assertTrue(hasattr(reader, attr), f"missing Popen attribute {attr}")
         self.assertIsNone(reader.stderr, "no child process means no stderr to drain")
         _drain(reader)
+
+
+class TestTerminateNeverBlocks(unittest.TestCase):
+    """stop_playback() runs on the event-loop thread, so terminate() must never wait.
+
+    The freeze this pins: discord.py 2.7.1's popen-stdin-writer thread sits in
+    ``stdout.read(8192)``, holding the BufferedReader lock, while a stalled CDN has put
+    fewer than 8 KiB in the pipe. Closing stdout on the caller's thread waited for that
+    lock until libcurl gave up (~30 s), and every guild froze with it.
+    """
+
+    HEAD = b"\x1a" * 100   # < 8 KiB, so the parked read(8192) cannot complete
+
+    def _parked_reader(self):
+        release = threading.Event()
+        total = 1 << 20
+        reader, _ = _reader([StalledResponse(self.HEAD, total, release)],
+                            url=GV.format(total))
+        got = []
+        # What discord.py's FFmpegAudio._pipe_writer does with the source pipe.
+        writer = threading.Thread(target=lambda: got.append(reader.stdout.read(8192)),
+                                  daemon=True)
+        writer.start()
+        self.addCleanup(writer.join, 5)
+        self.addCleanup(release.set)
+        time.sleep(0.2)
+        self.assertTrue(writer.is_alive(), "precondition: a read(8192) must be parked")
+        return reader, release, writer, got
+
+    def _assert_fast(self, fn):
+        start = time.perf_counter()
+        fn()
+        elapsed = time.perf_counter() - start
+        self.assertLess(elapsed, 0.1, f"{fn.__name__}() blocked its caller for {elapsed:.2f}s")
+
+    def test_terminate_returns_while_a_read_is_parked(self):
+        reader, release, writer, got = self._parked_reader()
+        self._assert_fast(reader.terminate)
+        # The close still happens, once the stalled read hands the lock back.
+        release.set()
+        writer.join(5)
+        self.assertEqual(got, [self.HEAD])
+        self.assertTrue(_wait_until(lambda: reader.stdout.closed), "stdout never closed")
+
+    def test_stop_playback_returns_while_a_read_is_parked(self):
+        reader, _, _, _ = self._parked_reader()
+        with patch.object(audio_player, "_find_ffmpeg", return_value="ffmpeg"):
+            player = audio_player.AudioPlayer({"audio": {"sample_rate": 48000, "channels": 2}})
+        player._ytdlp_proc = reader
+        self._assert_fast(player.stop_playback)
+        self.assertIsNone(player._ytdlp_proc)
+        self.assertTrue(reader._closed.is_set(), "the pump must be told to stop")
+
+    def test_terminate_still_unblocks_a_pump_parked_in_write(self):
+        """Nobody reading: the pump blocks in os.write on a full pipe, and only closing
+        the read end wakes it."""
+        total = 1 << 20   # far more than any OS pipe buffer holds
+        reader, _ = _reader([FakeResponse(200, b"a" * total)], url=GV.format(total))
+        time.sleep(0.2)
+        self.assertIsNone(reader.poll(), "precondition: the pump must be parked in os.write")
+        self._assert_fast(reader.terminate)
+        reader.wait(timeout=2)   # raises TimeoutExpired if the pump never woke
+        self.assertTrue(_wait_until(lambda: reader.stdout.closed), "stdout never closed")
 
 
 class TestStreamFactory(unittest.TestCase):
