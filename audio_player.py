@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import math
 import queue
 import random
 import shutil
@@ -234,6 +235,8 @@ _SYSTEMIC_SUBSTRINGS = (
 def is_systemic_resolve_error(exc: BaseException) -> bool:
     """True when YouTube is refusing this server rather than this track: the bot check,
     the rate limit, an IP block (see _SYSTEMIC_SUBSTRINGS)."""
+    if isinstance(exc, YouTubeBlockedError):
+        return True
     msg = str(exc).lower()
     if any(s in msg for s in _SYSTEMIC_SUBSTRINGS):
         return True
@@ -525,16 +528,112 @@ def _release_resolve(video_id: str, result: dict | None = None) -> None:
         entry.event.set()
 
 
+# --- YouTube block: one cooldown shared by every guild -------------------------
+#
+# A bot check or a rate limit is a verdict on this server's IP or session, so once one
+# guild's resolve has run into it, every guild's will. Left to find that out for itself,
+# each playing guild kept sending requests to an IP YouTube had already flagged. Instead
+# the first refusal holds every YouTube resolve off for a cooldown: they fail at once,
+# with no request sent. When it runs out, ONE resolve goes through as a probe while the
+# rest wait for its answer. Any reply that is not a refusal lifts the block; another
+# refusal lengthens the next cooldown. Cache hits need no request and keep playing
+# throughout, and other sites (SoundCloud) are never held off.
+_YT_BLOCK_COOLDOWNS = (60.0, 120.0, 300.0, 600.0, 900.0)   # per refusal in a row
+_YT_PROBE_WINDOW = 30.0      # how long the others wait on a probe before one of them tries
+_yt_block_lock = threading.Lock()
+_yt_block_until = 0.0        # time.monotonic() before which YouTube resolves are refused
+_yt_block_strikes = 0        # refusals since YouTube last answered; picks the cooldown
+_yt_block_probing = False    # _yt_block_until is a probe's window, not a cooldown
+
+
+def _fmt_wait(seconds: float) -> str:
+    """'about N min', rounded up so nobody is told to come back before the wait is over."""
+    return f"about {max(1, math.ceil(seconds / 60))} min"
+
+
+class YouTubeBlockedError(RuntimeError):
+    """Raised instead of resolving while YouTube is refusing this server.
+
+    ``probing`` means the cooldown has run out and another resolve is finding out whether
+    the block has lifted. Its answer applies to everyone, so waiting on it is no strike.
+    """
+
+    def __init__(self, retry_after: float, probing: bool = False):
+        self.retry_after = retry_after
+        self.probing = probing
+        super().__init__(f"YouTube is refusing requests from this server right now — "
+                         f"try again in {_fmt_wait(retry_after)}.")
+
+
+def youtube_block_remaining() -> float:
+    """Seconds until YouTube resolves are let through again (0 when they are)."""
+    return max(0.0, _yt_block_until - time.monotonic())
+
+
+def _youtube_gate() -> None:
+    """Refuse a YouTube resolve during a block; once it runs out, admit exactly one probe."""
+    global _yt_block_until, _yt_block_probing
+    with _yt_block_lock:
+        now = time.monotonic()
+        if now < _yt_block_until:
+            raise YouTubeBlockedError(_yt_block_until - now, probing=_yt_block_probing)
+        if _yt_block_strikes:
+            _yt_block_until = now + _YT_PROBE_WINDOW
+            _yt_block_probing = True
+            print("[yt-dlp] YouTube block cooldown over — sending one resolve to see if it lifted")
+
+
+def _youtube_note_outcome(exc: BaseException | None) -> None:
+    """Record how an admitted YouTube resolve went (None = it succeeded)."""
+    global _yt_block_until, _yt_block_strikes, _yt_block_probing
+    with _yt_block_lock:
+        now = time.monotonic()
+        if now < _yt_block_until and not _yt_block_probing:
+            # Mid-cooldown, so this resolve was admitted before the block landed: a failure
+            # is the same block again, a success predates it. Neither moves anything.
+            return
+        if exc is not None and is_systemic_resolve_error(exc):
+            _yt_block_strikes += 1
+            cooldown = _YT_BLOCK_COOLDOWNS[min(_yt_block_strikes, len(_YT_BLOCK_COOLDOWNS)) - 1]
+            _yt_block_until = now + cooldown
+            _yt_block_probing = False
+            reason = str(exc).strip().splitlines()[0][:200]
+            print(f"[yt-dlp] YouTube is refusing this server ({reason}) — holding every "
+                  f"YouTube resolve off for {cooldown:.0f}s ({_yt_block_strikes} in a row)")
+        elif _yt_block_strikes:
+            print("[yt-dlp] YouTube is answering again — block lifted")
+            _yt_block_strikes = 0
+            _yt_block_until = 0.0
+            _yt_block_probing = False
+
+
+def _resolve_gated(query: str, client: str, debug: bool, cookies_file: str | None) -> dict:
+    """_resolve_audio_url, held behind the shared YouTube block. Other sites go straight
+    through: a YouTube block says nothing about them."""
+    if not (_is_youtube(query) or not query.startswith(("http://", "https://"))):
+        return _resolve_audio_url(query, client, debug, cookies_file)
+    _youtube_gate()
+    try:
+        result = _resolve_audio_url(query, client, debug, cookies_file)
+    except Exception as e:
+        _youtube_note_outcome(e)
+        raise
+    _youtube_note_outcome(None)
+    return result
+
+
 def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: str | None = None,
                   *, force_cli: bool = False) -> dict:
     """Resolve a track to a streamable CDN URL + metadata.
 
     Wraps the actual extraction with the two things that keep repeat and concurrent
     plays cheap: the video-id resolve cache, and in-flight de-duplication so two
-    callers racing for the same video make one API call between them.
+    callers racing for the same video make one API call between them. A YouTube cache
+    miss also has to get past the shared block (_resolve_gated).
 
-    ``force_cli`` forces the bgutil CLI PO token provider and bypasses both. It is set
-    only by the internal one-shot retry after a degraded resolve.
+    ``force_cli`` forces the bgutil CLI PO token provider and bypasses all three. It is
+    set only by the internal one-shot retry after a degraded resolve, which runs inside a
+    resolve that was already let through.
     """
     if force_cli:
         return _resolve_audio_url(query, client, debug, cookies_file, force_cli=True)
@@ -550,7 +649,7 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
 
     video_id = _youtube_video_id(query)
     if not video_id:
-        return _resolve_audio_url(query, client, debug, cookies_file)
+        return _resolve_gated(query, client, debug, cookies_file)
 
     inflight = _claim_resolve(video_id)
     if inflight is not None:
@@ -562,11 +661,11 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
         if inflight.result is not None:
             return _copy_stream_info(inflight.result)
         # Leader failed or timed out — do it ourselves rather than inherit its failure.
-        return _resolve_audio_url(query, client, debug, cookies_file)
+        return _resolve_gated(query, client, debug, cookies_file)
 
     result = None
     try:
-        result = _resolve_audio_url(query, client, debug, cookies_file)
+        result = _resolve_gated(query, client, debug, cookies_file)
         return result
     finally:
         _release_resolve(video_id, result)
