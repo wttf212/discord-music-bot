@@ -1786,6 +1786,27 @@ async def _do_update_np_embed(bot, channel, msg_id, view):
         await channel.get_partial_message(msg_id).edit(view=view)
     except Exception as e:
         print(f"[commands] Failed to update NP card: {e}")
+        return
+    gs = bot.get_guild_state(channel.guild.id)
+    if gs.np_message_id == msg_id:
+        gs.np_views.append(view)
+    else:
+        view.stop()  # the card was replaced while this edit was in flight
+
+
+def _release_np_views(gs):
+    """Stop every view on a Now-Playing card that is being replaced or deleted.
+
+    PlayerView never times out, and discord.py's ViewStore keeps a view until it is
+    stopped: deleting the message doesn't drop it, so every card ever sent stayed in
+    memory. Each in-place edit stores another view on the same card, and they're all
+    stopped together here. Never stop one while its card is live: the store
+    unregisters by custom_id, which would take the newer view's buttons with it.
+    """
+    views, gs.np_views = gs.np_views, []
+    for view in views:
+        view.stop()
+
 
 async def update_np_embed(bot, channel_id: int, view: "PlayerView"):
     """Edit the existing NP message card in-place (no new message)."""
@@ -1812,6 +1833,7 @@ async def _clear_np(bot, channel_id: int):
     gs = bot.get_guild_state(channel.guild.id)
     msg_id = gs.np_message_id
     gs.np_message_id = None
+    _release_np_views(gs)
     if msg_id:
         await _safe_delete(channel.get_partial_message(msg_id))
 
@@ -2083,10 +2105,12 @@ async def send_new_np(bot, channel_id: int, view: "PlayerView"):
     old_msg_id = gs.np_message_id
     if old_msg_id:
         asyncio.create_task(_safe_delete(channel.get_partial_message(old_msg_id)))
+    _release_np_views(gs)
 
     try:
         new_msg = await channel.send(view=view)
         gs.np_message_id = new_msg.id
+        gs.np_views.append(view)
     except Exception as e:
         print(f"[commands] Failed to send NP message: {e}")
 
