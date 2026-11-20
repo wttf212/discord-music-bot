@@ -7,6 +7,7 @@ runs forever: FFmpeg blocks writing PCM nobody reads, discord.py's stdin-writer 
 blocks behind it and keeps the source alive, and the jitter buffer's fill thread spins.
 """
 import asyncio
+import contextlib
 import os
 import sys
 import threading
@@ -119,6 +120,7 @@ class _Harness:
                 and all(f.cleaned.is_set() for f in self.ffmpegs)
                 and not any(b._thread.is_alive() for b in self.buffers))
 
+    @contextlib.contextmanager
     def patched(self):
         harness = self
 
@@ -127,24 +129,12 @@ class _Harness:
                 super().__init__(*args, **kwargs)
                 harness.buffers.append(self)
 
-        patches = [
-            patch.object(audio_player, "get_audio_url_with_retry",
-                         lambda *a, **k: dict(INFO)),
-            patch.object(audio_player, "_open_audio_stream", self.open_stream),
-            patch.object(discord, "FFmpegPCMAudio", lambda *a, **k: _FakeFFmpeg(harness)),
-            patch.object(audio_player, "_BufferedAudioSource", _RecordingBuffer),
-        ]
-
-        class _All:
-            def __enter__(self):
-                for p in patches:
-                    p.start()
-
-            def __exit__(self, *exc):
-                for p in reversed(patches):
-                    p.stop()
-
-        return _All()
+        with patch.object(audio_player, "get_audio_url_with_retry",
+                          lambda *a, **k: dict(INFO)), \
+             patch.object(audio_player, "_open_audio_stream", self.open_stream), \
+             patch.object(discord, "FFmpegPCMAudio", lambda *a, **k: _FakeFFmpeg(harness)), \
+             patch.object(audio_player, "_BufferedAudioSource", _RecordingBuffer):
+            yield
 
 
 class TestAbortedStartLeavesNothingRunning(unittest.TestCase):
