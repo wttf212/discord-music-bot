@@ -1023,7 +1023,7 @@ class _ControlsRow(discord.ui.ActionRow):
         except Exception as e:
             print(f"[commands] Manual advance failed (guild {guild_id}): {e}")
             if not _recover_manual_advance(self.view.bot, gs, guild_id,
-                                           interaction.channel.id, prev_track):
+                                           interaction.channel.id, prev_track, e):
                 await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
 
     @discord.ui.button(label="►", style=discord.ButtonStyle.primary, custom_id="btn_next")  # ►
@@ -1062,7 +1062,7 @@ class _ControlsRow(discord.ui.ActionRow):
             except Exception as e:
                 print(f"[commands] Manual advance failed (guild {guild_id}): {e}")
                 if not _recover_manual_advance(self.view.bot, gs, guild_id,
-                                               interaction.channel.id, next_track):
+                                               interaction.channel.id, next_track, e):
                     await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
             await update_np_stopped(self.view.bot, interaction.channel.id)
@@ -2762,7 +2762,7 @@ class MusicCog(commands.Cog):
                 _start_auto_next(self.bot, channel_id, ctx.guild.id)
             except Exception as e:
                 print(f"[commands] Manual advance failed (guild {ctx.guild.id}): {e}")
-                if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track):
+                if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track, e):
                     await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
             await ctx.send("Skipped. Queue is empty.")
@@ -3062,7 +3062,7 @@ class MusicCog(commands.Cog):
             info = await gs.player.play(next_track.query, next_track.resolved_info, next_track.resolved_at)
         except Exception as e:
             print(f"[commands] Manual advance failed (guild {ctx.guild.id}): {e}")
-            if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track):
+            if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track, e):
                 await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
             return
         # Armed before any reply: a reply that fails (a dead interaction token) must
@@ -3468,19 +3468,30 @@ def _live_voice_client(bot, gs, guild_id):
     return vc if (vc is not None and vc.is_connected()) else None
 
 
-def _recover_manual_advance(bot, gs, guild_id, channel_id, track) -> bool:
-    """Voice died *during* a manual advance's play(). Put the track back and hand
-    control to the auto-next chain, which knows how to wait a reconnect out.
+def _recover_manual_advance(bot, gs, guild_id, channel_id, track, error) -> bool:
+    """A manual advance's play() failed after the advance had cancelled the auto-next
+    chain. Hand control to a fresh chain, or auto-play stops on the failed track.
 
-    False when voice is fine — a genuinely dead track must keep its existing
-    skip-and-move-on behaviour; requeueing a permanently broken track and
-    re-arming the chain would retry it forever.
+    Voice died *during* the play(): put the track back; the chain knows how to wait a
+    reconnect out. True: nothing was skipped.
+
+    Otherwise the track itself failed, and the chain moves on from it as it does from
+    a track that fails under it. A dead one (is_permanent_resolve_error) never comes
+    back: loop "off" files it into history, and a loop drops it from its rotation
+    here, as _auto_next does, or next() would hand it straight back. False: the caller
+    reports the skip. A newer advance (or a stop) that moved on while this play() ran
+    owns the chain, so nothing is touched then: arming one too would run two play()s.
     """
     if _live_voice_client(bot, gs, guild_id) is None:
         if track is not None:
             gs.queue.requeue_front(track)
         _start_auto_next(bot, channel_id, guild_id)
         return True
+    if gs.queue.current is not track:
+        return False
+    if is_permanent_resolve_error(error) and gs.queue.loop_mode != "off":
+        gs.queue.current = None
+    _start_auto_next(bot, channel_id, guild_id)
     return False
 
 
@@ -3651,6 +3662,14 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 # session. The breaker is for systemic failure (network down, blocked
                 # IP), where retrying the whole queue would be pointless and noisy.
                 if is_permanent_resolve_error(e):
+                    # It fails the same way every time, but under a loop next() would hand it
+                    # straight back (loop "track") or cycle it round to fail again next lap
+                    # (loop "queue"): a YouTube request and a message per turn, forever.
+                    # Clearing `current` drops it from the rotation, so next() moves on.
+                    # Loop "off" keeps it, as before: next() files it into history and
+                    # autoplay can still seed from it.
+                    if gs.queue.loop_mode != "off":
+                        gs.queue.current = None
                     if channel:
                         await channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
                     continue
