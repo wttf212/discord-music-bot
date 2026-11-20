@@ -166,7 +166,7 @@ class TestPrefetchWarmsOnlyWhatItShould(unittest.TestCase):
         def boom(*a, **k):
             raise RuntimeError("probe exploded")
 
-        with patch.object(commands, "get_audio_url_with_retry", return_value=info), \
+        with patch.object(commands, "resolve_audio", return_value=info), \
              patch.object(commands, "warm_stream_url", boom):
             asyncio.run(commands._prefetch_next_track(bot, 1))
 

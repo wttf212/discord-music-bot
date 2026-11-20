@@ -50,12 +50,13 @@ class TestPools(unittest.TestCase):
     def test_threads_are_named_for_diagnosis(self):
         self.assertEqual(audio_player._RESOLVE_EXECUTOR._thread_name_prefix, "yt-resolve")
         self.assertEqual(audio_player._STREAM_EXECUTOR._thread_name_prefix, "audio-stream")
+        self.assertEqual(audio_player._PLAYLIST_EXECUTOR._thread_name_prefix, "yt-playlist")
 
 
 class TestNoAudioWorkLeftOnTheDefaultPool(unittest.TestCase):
     """run_in_executor(None, ...) puts work on the shared default pool."""
 
-    LONG_RUNNING = ("get_audio_url_with_retry", "_open_audio_stream", "warm_stream_url",
+    LONG_RUNNING = ("get_audio_url", "_open_audio_stream", "warm_stream_url",
                     "extract_playlist_info", "get_related_tracks", "FFmpegPCMAudio",
                     "src.read", "source.prefill", "source.read")
 
@@ -73,8 +74,17 @@ class TestNoAudioWorkLeftOnTheDefaultPool(unittest.TestCase):
         self.assertEqual(leaked, [], f"still on the shared default pool: {leaked}")
 
     def test_resolves_go_to_the_resolve_pool(self):
+        text = "".join(_src(_AUDIO_SRC).split())
+        self.assertIn("_RESOLVE_LANE.run(get_audio_url,", text)
+        self.assertIn("_RESOLVE_LANE=_Lane(_RESOLVE_EXECUTOR,", text)
+
+    def test_nothing_bypasses_the_lanes(self):
+        """Submitting straight to the resolve or playlist pool skips the lane's priority
+        and background cap — back to one FIFO queue shared by every guild."""
         text = "".join(_src(_CMD_SRC).split()) + "".join(_src(_AUDIO_SRC).split())
-        self.assertIn("run_in_executor(_RESOLVE_EXECUTOR,get_audio_url_with_retry,", text)
+        for pool in ("_RESOLVE_EXECUTOR", "_PLAYLIST_EXECUTOR"):
+            self.assertNotIn(f"run_in_executor({pool},", text)
+            self.assertNotIn(f"{pool}.submit(", text)
 
     def test_warm_up_goes_to_the_stream_pool(self):
         """The warm-up blocks for up to the whole settle ladder — it must never sit in

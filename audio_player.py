@@ -1,5 +1,7 @@
 import asyncio
 import contextlib
+import functools
+import math
 import queue
 import random
 import shutil
@@ -9,14 +11,14 @@ import sys
 import os
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from urllib.error import URLError
 from urllib.parse import urlparse, parse_qs
 
 from concurrent.futures import ThreadPoolExecutor
 
 import discord
-from yt_dlp.utils import DownloadError
+from yt_dlp.utils import DownloadCancelled, DownloadError
 
 # Audio work runs on dedicated pools, NOT asyncio's default executor.
 #
@@ -33,11 +35,126 @@ from yt_dlp.utils import DownloadError
 #   STREAM is pure waiting — settle backoffs, 1-byte warm probes, FFmpeg spawn,
 #     subprocess reaping. Threads here are blocked, not busy, so the pool can be wide
 #     and must not be throttled by core count.
+# A third pool, PLAYLIST, takes playlist enumeration and autoplay Mix refills: flat
+# metadata (no Deno), but one 2000-track enumeration pages YouTube for ~20 s, and in the
+# resolve pool that held a worker a user's !play needed for the whole time.
+#
+# Work reaches RESOLVE and PLAYLIST only through a _Lane (below), never by submitting to
+# the pool directly: a bare pool is one FIFO queue shared by every guild.
 _CPU_COUNT = os.cpu_count() or 2
+_RESOLVE_WORKERS = max(4, min(8, _CPU_COUNT))   # also the cap on concurrent Deno solves
 _RESOLVE_EXECUTOR = ThreadPoolExecutor(
-    max_workers=max(4, min(8, _CPU_COUNT)), thread_name_prefix="yt-resolve")
+    max_workers=_RESOLVE_WORKERS, thread_name_prefix="yt-resolve")
 _STREAM_EXECUTOR = ThreadPoolExecutor(
     max_workers=32, thread_name_prefix="audio-stream")
+_PLAYLIST_WORKERS = 3
+_PLAYLIST_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_PLAYLIST_WORKERS, thread_name_prefix="yt-playlist")
+
+
+class _Lane:
+    """Admission to a worker pool: user-facing work first, background work capped.
+
+    A bare ThreadPoolExecutor is one FIFO queue, so a guild's cold !play waited behind
+    whatever any guild had submitted first — prefetches, queue-add lookups, retries.
+    A lane admits at most one job per worker, so nothing ever queues inside the pool;
+    the queueing happens here instead, where it can be ordered:
+      * waiting user-facing jobs are admitted before background ones (FIFO within each);
+      * background jobs may hold at most ``background_slots`` workers, so no amount of
+        background work from any number of guilds can take the last ones.
+
+    A slot is freed when its thread finishes, not when the awaiting task gives up: a
+    cancelled await does not stop a running thread, and freeing the slot early would
+    put two jobs on one worker again.
+
+    State is touched only on the event loop thread (workers hand releases back with
+    call_soon_threadsafe). The bot has one loop; every asyncio.run() in the tests is a
+    new one, so the lane rebinds — and forgets old jobs — when the loop changes.
+    """
+
+    def __init__(self, executor: ThreadPoolExecutor, slots: int, background_slots: int):
+        self._executor = executor
+        self._slots = slots
+        self._background_slots = background_slots
+        self._loop = None
+
+    def _bind(self, loop) -> None:
+        self._loop = loop
+        self._running = 0
+        self._running_background = 0
+        self._waiting = {False: deque(), True: deque()}   # keyed by `background`
+
+    def _has_room(self, background: bool) -> bool:
+        if self._running >= self._slots:
+            return False
+        return not background or self._running_background < self._background_slots
+
+    def _take(self, background: bool) -> None:
+        self._running += 1
+        if background:
+            self._running_background += 1
+
+    def _admit(self) -> None:
+        for background in (False, True):          # user-facing waiters first
+            waiting = self._waiting[background]
+            while waiting and self._has_room(background):
+                waiter = waiting.popleft()
+                if not waiter.done():              # skip waiters cancelled in the queue
+                    self._take(background)
+                    waiter.set_result(None)
+
+    def _release(self, loop, background: bool) -> None:
+        if loop is not self._loop:
+            return          # a job from an earlier event loop; its state is gone
+        self._running -= 1
+        if background:
+            self._running_background -= 1
+        self._admit()
+
+    def _release_from_worker(self, loop, background: bool, _job) -> None:
+        try:
+            loop.call_soon_threadsafe(self._release, loop, background)
+        except RuntimeError:
+            pass            # loop already closed — nothing left to admit
+
+    async def run(self, fn, *args, background: bool = False):
+        """Run fn(*args) on the pool once admitted, and return (or raise) its result."""
+        loop = asyncio.get_running_loop()
+        if loop is not self._loop:
+            self._bind(loop)
+        waiting = self._waiting[background]
+        if waiting or not self._has_room(background) or (background and self._waiting[False]):
+            waiter = loop.create_future()
+            waiting.append(waiter)
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                if waiter.done() and not waiter.cancelled():
+                    self._release(loop, background)    # admitted, then cancelled
+                else:
+                    with contextlib.suppress(ValueError):
+                        waiting.remove(waiter)
+                    self._admit()
+                raise
+        else:
+            self._take(background)
+        try:
+            job = self._executor.submit(fn, *args)
+        except BaseException:
+            self._release(loop, background)
+            raise
+        job.add_done_callback(functools.partial(self._release_from_worker, loop, background))
+        return await asyncio.wrap_future(job, loop=loop)
+
+
+# RESOLVE: user-facing resolves (a cold !play, a skip or track change with no prefetch, a
+# playlist's first track) are admitted first; background ones (prefetch, queue-add
+# lookups) may hold half the workers. The slots are the pool's workers, so the cap on
+# concurrent Deno solves is unchanged.
+_RESOLVE_LANE = _Lane(_RESOLVE_EXECUTOR, _RESOLVE_WORKERS, max(1, _RESOLVE_WORKERS // 2))
+# PLAYLIST: enumerations are background and may hold 2 of the 3 workers, so an autoplay
+# refill — which can sit on a track transition — always finds one free.
+_PLAYLIST_LANE = _Lane(_PLAYLIST_EXECUTOR, _PLAYLIST_WORKERS, _PLAYLIST_WORKERS - 1)
 
 # Set on shutdown. Worker threads park in settle backoffs and retry sleeps for several
 # seconds at a time, and concurrent.futures joins its (non-daemon) workers at
@@ -52,6 +169,7 @@ def shutdown_audio() -> None:
     _shutdown.set()
     _RESOLVE_EXECUTOR.shutdown(wait=False, cancel_futures=True)
     _STREAM_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    _PLAYLIST_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
 # Load bgutil PO token provider plugin for yt-dlp
 _base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -200,7 +318,7 @@ _NON_RETRYABLE_SUBSTRINGS = (
     "private video",
     "this video has been removed",
     "this video is not available",
-    "not available in your country",
+    "available in your country",   # YouTube's own: "...has not made this video available in your country"
     "geo restricted",
     "geo-blocked",
     "members-only",
@@ -244,6 +362,34 @@ _FAST_RETRY_SUBSTRINGS = (
     "temporary failure in name resolution",
 )
 
+# YouTube refusing THIS SERVER (its IP or its session) rather than one video. Every other
+# track fails the same way until the flag decays, so these must neither be retried inside
+# a resolve (each retry is one more request to an IP YouTube has already flagged) nor be
+# skipped as a dead track: skipping empties the queue in seconds, and under loop or
+# autoplay never stops. Checked before the per-track list, because some of these carry
+# per-track wording too ("Sign in to confirm", "Video unavailable").
+_SYSTEMIC_SUBSTRINGS = (
+    "not a bot",                 # "Sign in to confirm you’re not a bot". YouTube's apostrophe is
+                                 # curly, and "sign in to confirm" alone is also the age gate.
+    "rate-limited by youtube",   # yt-dlp's rewrite of the reason below
+    "try again later",           # "This content isn't available, try again later"
+    "being blocked by youtube",  # "All player responses are invalid. Your IP is likely being blocked by Youtube"
+    "captcha",                   # "YouTube is requiring a captcha challenge before playback"
+)
+
+
+def is_systemic_resolve_error(exc: BaseException) -> bool:
+    """True when YouTube is refusing this server rather than this track: the bot check,
+    the rate limit, an IP block (see _SYSTEMIC_SUBSTRINGS)."""
+    if isinstance(exc, YouTubeBlockedError):
+        return True
+    msg = str(exc).lower()
+    if any(s in msg for s in _SYSTEMIC_SUBSTRINGS):
+        return True
+    # A YouTube 403/401 refuses the request, not the video: an unavailable video comes back
+    # as a 200 whose playability status says so. Another site's 403 stays per-track.
+    return "[youtube" in msg and ("http error 403" in msg or "http error 401" in msg)
+
 
 def _retry_base_delay(exc: BaseException, base_delay: float, fast_delay: float) -> float:
     """Pick the backoff base for this error: fast for transient connection/timeout
@@ -260,7 +406,8 @@ def _is_retryable_ytdlp_error(exc: BaseException) -> bool:
     """Classify a yt-dlp (or connection-layer) exception as retryable or not.
 
     Returns False for permanent policy errors that retrying would accelerate
-    IP bans on (video unavailable, sign-in required, age-restricted, geo-blocked).
+    IP bans on (video unavailable, sign-in required, age-restricted, geo-blocked),
+    and for YouTube refusing this server outright (is_systemic_resolve_error).
     Returns True for transient network/rate-limit errors and all ambiguous cases
     (conservative: prefer retry over silent drop for unrecognised errors).
     """
@@ -270,6 +417,8 @@ def _is_retryable_ytdlp_error(exc: BaseException) -> bool:
 
     # String-based classification (case-insensitive substring match)
     msg = str(exc).lower()
+    if is_systemic_resolve_error(exc):
+        return False
     if any(s in msg for s in _NON_RETRYABLE_SUBSTRINGS):
         return False
     if any(s in msg for s in _RETRYABLE_SUBSTRINGS):
@@ -284,15 +433,22 @@ def is_permanent_resolve_error(exc: BaseException) -> bool:
 
     Lets the prefetch drop such a track from the queue instead of leaving it to fail at
     playback, where it costs a failed play plus a cold start for whatever follows.
+
+    A YouTube block is never this, though it is not retryable either: it is a verdict on
+    this server, and the next track would fail the same way (is_systemic_resolve_error).
     """
-    return not _is_retryable_ytdlp_error(exc)
+    if isinstance(exc, StreamFailedError):
+        return False  # its text can quote a "Forbidden" from the CDN; see the class
+    return not _is_retryable_ytdlp_error(exc) and not is_systemic_resolve_error(exc)
 
 
-def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.0,
-                        fast_delay: float = 1.5, jitter: float = 0.25, **kwargs):
-    """Retry a synchronous callable with exponential backoff + jitter.
+async def _retry_with_backoff(submit, *, max_attempts: int = 3, base_delay: float = 5.0,
+                              fast_delay: float = 1.5, jitter: float = 0.25):
+    """Await ``submit()`` — one submission per attempt — with exponential backoff + jitter.
 
-    Runs inside the executor thread — uses time.sleep (NOT asyncio.sleep).
+    The backoff is an asyncio.sleep on the event loop between submissions. It used to be
+    a time.sleep inside the resolve worker, which parked that worker for 3.75-12.5 s on
+    every 429/5xx while other guilds' resolves queued behind it.
     Re-raises immediately on non-retryable errors to avoid accelerating IP bans
     when YouTube returns a permanent policy error (video unavailable, sign-in,
     age-restricted, geo-block).
@@ -304,7 +460,7 @@ def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.
     last_exc = None
     for attempt in range(max_attempts):
         try:
-            return fn(*args, **kwargs)
+            return await submit()
         except Exception as exc:
             last_exc = exc
             if not _is_retryable_ytdlp_error(exc):
@@ -324,13 +480,7 @@ def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.
                 f"[retry] attempt {attempt + 1}/{max_attempts} failed: "
                 f"{exc_class}: {msg_preview} — sleeping {sleep_seconds:.1f}s"
             )
-            # Deliberately time.sleep, not _shutdown.wait: the retry-tier tests patch
-            # time.sleep to assert the backoff values, and that coverage is worth more
-            # than interrupting a sleep that only happens when a resolve is already
-            # failing. The check above stops FURTHER retries once shutdown starts, and
-            # the sleeps that actually run on every track start (settle, warm-up) are
-            # interruptible.
-            time.sleep(sleep_seconds)
+            await asyncio.sleep(sleep_seconds)
     # Unreachable (loop always either returns or raises), but keep the invariant explicit.
     raise last_exc  # type: ignore[misc]
 
@@ -467,16 +617,30 @@ def _resolver(key: tuple, ydl_opts: dict):
             yield ydl
 
 
-def get_audio_url_with_retry(query: str, client: str, debug: bool = False, cookies_file: str | None = None) -> dict:
-    """Retrying wrapper around get_audio_url (RETRY-01).
+async def resolve_audio(query: str, client: str, debug: bool = False,
+                        cookies_file: str | None = None, *, background: bool = False) -> dict:
+    """Resolve a track for playback: the async front door to get_audio_url (RETRY-01).
 
-    Retries on HTTP 429, 5xx, and connection-layer errors with exponential backoff
-    (3 attempts, base 5s, ±25% jitter). Surfaces video-unavailable / sign-in /
-    age-restricted / geo-blocked errors immediately — retrying those accelerates
-    IP bans.
+    * A still-fresh resolve-cache hit is answered here, before anything is submitted —
+      a replayed or looped track needs no worker, no Deno and no YouTube call.
+    * The resolve runs in _RESOLVE_LANE. Pass ``background=True`` for work nobody is
+      waiting on (prefetch, queue-add lookups) so it can never delay a user's !play.
+    * Retries on HTTP 429, 5xx, and connection-layer errors with exponential backoff
+      (3 attempts, base 5s, ±25% jitter), sleeping on the event loop between attempts.
+      Surfaces video-unavailable / sign-in / age-restricted / geo-blocked errors
+      immediately — retrying those accelerates IP bans.
+    * A YouTube block (is_systemic_resolve_error) is not retried either. Every attempt
+      meets the shared cooldown inside get_audio_url (_resolve_gated), so during a
+      block a cache miss fails at once with YouTubeBlockedError and sends no request.
     """
-    return _retry_with_backoff(
-        get_audio_url, query, client, debug, cookies_file,
+    cached = _resolve_cache_get(query)
+    if cached is not None:
+        if debug:
+            print(f"[debug][yt-dlp] Resolve cache hit: {cached['title']!r}")
+        return cached
+    return await _retry_with_backoff(
+        lambda: _RESOLVE_LANE.run(get_audio_url, query, client, debug, cookies_file,
+                                  background=background),
         max_attempts=3, base_delay=5.0, jitter=0.25,
     )
 
@@ -522,16 +686,112 @@ def _release_resolve(video_id: str, result: dict | None = None) -> None:
         entry.event.set()
 
 
+# --- YouTube block: one cooldown shared by every guild -------------------------
+#
+# A bot check or a rate limit is a verdict on this server's IP or session, so once one
+# guild's resolve has run into it, every guild's will. Left to find that out for itself,
+# each playing guild kept sending requests to an IP YouTube had already flagged. Instead
+# the first refusal holds every YouTube resolve off for a cooldown: they fail at once,
+# with no request sent. When it runs out, ONE resolve goes through as a probe while the
+# rest wait for its answer. Any reply that is not a refusal lifts the block; another
+# refusal lengthens the next cooldown. Cache hits need no request and keep playing
+# throughout, and other sites (SoundCloud) are never held off.
+_YT_BLOCK_COOLDOWNS = (60.0, 120.0, 300.0, 600.0, 900.0)   # per refusal in a row
+_YT_PROBE_WINDOW = 30.0      # how long the others wait on a probe before one of them tries
+_yt_block_lock = threading.Lock()
+_yt_block_until = 0.0        # time.monotonic() before which YouTube resolves are refused
+_yt_block_strikes = 0        # refusals since YouTube last answered; picks the cooldown
+_yt_block_probing = False    # _yt_block_until is a probe's window, not a cooldown
+
+
+def _fmt_wait(seconds: float) -> str:
+    """'about N min', rounded up so nobody is told to come back before the wait is over."""
+    return f"about {max(1, math.ceil(seconds / 60))} min"
+
+
+class YouTubeBlockedError(RuntimeError):
+    """Raised instead of resolving while YouTube is refusing this server.
+
+    ``probing`` means the cooldown has run out and another resolve is finding out whether
+    the block has lifted. Its answer applies to everyone, so waiting on it is no strike.
+    """
+
+    def __init__(self, retry_after: float, probing: bool = False):
+        self.retry_after = retry_after
+        self.probing = probing
+        super().__init__(f"YouTube is refusing requests from this server right now — "
+                         f"try again in {_fmt_wait(retry_after)}.")
+
+
+def youtube_block_remaining() -> float:
+    """Seconds until YouTube resolves are let through again (0 when they are)."""
+    return max(0.0, _yt_block_until - time.monotonic())
+
+
+def _youtube_gate() -> None:
+    """Refuse a YouTube resolve during a block; once it runs out, admit exactly one probe."""
+    global _yt_block_until, _yt_block_probing
+    with _yt_block_lock:
+        now = time.monotonic()
+        if now < _yt_block_until:
+            raise YouTubeBlockedError(_yt_block_until - now, probing=_yt_block_probing)
+        if _yt_block_strikes:
+            _yt_block_until = now + _YT_PROBE_WINDOW
+            _yt_block_probing = True
+            print("[yt-dlp] YouTube block cooldown over — sending one resolve to see if it lifted")
+
+
+def _youtube_note_outcome(exc: BaseException | None) -> None:
+    """Record how an admitted YouTube resolve went (None = it succeeded)."""
+    global _yt_block_until, _yt_block_strikes, _yt_block_probing
+    with _yt_block_lock:
+        now = time.monotonic()
+        if now < _yt_block_until and not _yt_block_probing:
+            # Mid-cooldown, so this resolve was admitted before the block landed: a failure
+            # is the same block again, a success predates it. Neither moves anything.
+            return
+        if exc is not None and is_systemic_resolve_error(exc):
+            _yt_block_strikes += 1
+            cooldown = _YT_BLOCK_COOLDOWNS[min(_yt_block_strikes, len(_YT_BLOCK_COOLDOWNS)) - 1]
+            _yt_block_until = now + cooldown
+            _yt_block_probing = False
+            reason = str(exc).strip().splitlines()[0][:200]
+            print(f"[yt-dlp] YouTube is refusing this server ({reason}) — holding every "
+                  f"YouTube resolve off for {cooldown:.0f}s ({_yt_block_strikes} in a row)")
+        elif _yt_block_strikes:
+            print("[yt-dlp] YouTube is answering again — block lifted")
+            _yt_block_strikes = 0
+            _yt_block_until = 0.0
+            _yt_block_probing = False
+
+
+def _resolve_gated(query: str, client: str, debug: bool, cookies_file: str | None) -> dict:
+    """_resolve_audio_url, held behind the shared YouTube block. Other sites go straight
+    through: a YouTube block says nothing about them."""
+    if not (_is_youtube(query) or not query.startswith(("http://", "https://"))):
+        return _resolve_audio_url(query, client, debug, cookies_file)
+    _youtube_gate()
+    try:
+        result = _resolve_audio_url(query, client, debug, cookies_file)
+    except Exception as e:
+        _youtube_note_outcome(e)
+        raise
+    _youtube_note_outcome(None)
+    return result
+
+
 def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: str | None = None,
                   *, force_cli: bool = False) -> dict:
     """Resolve a track to a streamable CDN URL + metadata.
 
     Wraps the actual extraction with the two things that keep repeat and concurrent
     plays cheap: the video-id resolve cache, and in-flight de-duplication so two
-    callers racing for the same video make one API call between them.
+    callers racing for the same video make one API call between them. A YouTube cache
+    miss also has to get past the shared block (_resolve_gated).
 
-    ``force_cli`` forces the bgutil CLI PO token provider and bypasses both. It is set
-    only by the internal one-shot retry after a degraded resolve.
+    ``force_cli`` forces the bgutil CLI PO token provider and bypasses all three. It is
+    set only by the internal one-shot retry after a degraded resolve, which runs inside a
+    resolve that was already let through.
     """
     if force_cli:
         return _resolve_audio_url(query, client, debug, cookies_file, force_cli=True)
@@ -547,7 +807,7 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
 
     video_id = _youtube_video_id(query)
     if not video_id:
-        return _resolve_audio_url(query, client, debug, cookies_file)
+        return _resolve_gated(query, client, debug, cookies_file)
 
     inflight = _claim_resolve(video_id)
     if inflight is not None:
@@ -559,11 +819,11 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
         if inflight.result is not None:
             return _copy_stream_info(inflight.result)
         # Leader failed or timed out — do it ourselves rather than inherit its failure.
-        return _resolve_audio_url(query, client, debug, cookies_file)
+        return _resolve_gated(query, client, debug, cookies_file)
 
     result = None
     try:
-        result = _resolve_audio_url(query, client, debug, cookies_file)
+        result = _resolve_gated(query, client, debug, cookies_file)
         return result
     finally:
         _release_resolve(video_id, result)
@@ -886,6 +1146,13 @@ class _StreamStartError(RuntimeError):
     """The in-process reader could not open the stream; caller falls back."""
 
 
+class StreamFailedError(RuntimeError):
+    """A freshly resolved track's stream gave no audio at all: it never opened, or ended
+    before the first frame. That proves nothing about the track (a CDN refusing every
+    fresh URL looks exactly like this), so it is a counted failure, never a dead track,
+    whatever the stream's stderr happened to say."""
+
+
 class _CurlStreamReader:
     """Streams a progressive CDN URL into a pipe FFmpeg can read.
 
@@ -1026,13 +1293,26 @@ class _CurlStreamReader:
         return self._returncode if self._finished.is_set() else None
 
     def terminate(self):
+        # Never close stdout on the caller's thread: stop_playback() calls this on the
+        # event loop. discord.py's popen-stdin-writer thread can be parked in
+        # stdout.read(8192) holding the BufferedReader lock, and with the CDN stalled and
+        # under 8 KiB in the pipe that read only returns once libcurl's low-speed abort
+        # (~30 s) ends the pump. close() waits on the same lock, so closing inline froze
+        # every guild for that long. _closed stops the pump writing anything more; the
+        # close itself runs on a daemon thread.
+        if self._closed.is_set():
+            return
         self._closed.set()
+        threading.Thread(target=self._close_stdout, daemon=True,
+                         name="curl-cdn-reader-close").start()
+
+    kill = terminate
+
+    def _close_stdout(self):
         try:
             self.stdout.close()   # unblocks a pump thread parked in os.write
         except Exception:
             pass
-
-    kill = terminate
 
     def wait(self, timeout=None):
         if not self._finished.wait(timeout):
@@ -1233,13 +1513,32 @@ def is_playlist_url(query: str) -> bool:
 MAX_PLAYLIST_TRACKS = 2000  # hard cap on tracks loaded from a single playlist (~20 browse pages, paced)
 
 
-def extract_playlist_info(query: str, client: str, limit: int = MAX_PLAYLIST_TRACKS) -> dict:
+def _stop_requests_when(ydl, cancel: threading.Event | None) -> None:
+    """Make ``ydl`` refuse its next HTTP request once ``cancel`` (or shutdown) is set.
+
+    Every page an extractor fetches goes through YoutubeDL.urlopen, so this is where a
+    paged enumeration stops between pages: DownloadCancelled is raised before the
+    request leaves the box, and yt-dlp passes it straight up through extract_info.
+    """
+    urlopen = ydl.urlopen
+
+    def guarded(req):
+        if _shutdown.is_set() or (cancel is not None and cancel.is_set()):
+            raise DownloadCancelled("playlist enumeration cancelled")
+        return urlopen(req)
+
+    ydl.urlopen = guarded
+
+
+def extract_playlist_info(query: str, client: str, limit: int = MAX_PLAYLIST_TRACKS,
+                          cancel: threading.Event | None = None) -> dict:
     """Extract playlist title and track list using yt-dlp (metadata only, no streams).
 
     Returns {"title": str, "tracks": [{"url": str, "title": str}, ...]},
     capped at ``limit`` entries (default MAX_PLAYLIST_TRACKS). Pass limit=1 to
     fetch just the first track fast (one page) so playback can start before the
-    full enumeration finishes.
+    full enumeration finishes. Setting ``cancel`` (or shutting down) stops it before
+    its next page request with DownloadCancelled.
     """
     limit = max(1, min(limit, MAX_PLAYLIST_TRACKS))
     ydl_opts = {
@@ -1260,6 +1559,7 @@ def extract_playlist_info(query: str, client: str, limit: int = MAX_PLAYLIST_TRA
         ydl_opts["extractor_args"] = {"youtube": yt_args}
 
     with YoutubeDL(ydl_opts) as ydl:
+        _stop_requests_when(ydl, cancel)
         info = ydl.extract_info(query, download=False)
 
     # entries may be a lazy generator; materialize it
@@ -1283,6 +1583,23 @@ def extract_playlist_info(query: str, client: str, limit: int = MAX_PLAYLIST_TRA
         "title": info.get("title", "Unknown Playlist"),
         "tracks": tracks[:limit],
     }
+
+
+async def enumerate_playlist(query: str, client: str) -> dict:
+    """Enumerate a whole playlist (up to MAX_PLAYLIST_TRACKS) in the playlist lane.
+
+    Background work: nobody is waiting on it until they click "Load playlist".
+    Cancelling the awaiting task abandons it — the worker stops before its next page
+    request instead of paging the rest of a 2000-track list for an offer that was
+    superseded or expired.
+    """
+    cancel = threading.Event()
+    try:
+        return await _PLAYLIST_LANE.run(extract_playlist_info, query, client,
+                                        MAX_PLAYLIST_TRACKS, cancel, background=True)
+    except asyncio.CancelledError:
+        cancel.set()
+        raise
 
 
 class _PrimedAudioSource(discord.AudioSource):
@@ -1414,6 +1731,54 @@ class _BufferedAudioSource(discord.AudioSource):
             pass
 
 
+def _discard_pipeline(*parts) -> None:
+    """Tear down stream pipeline pieces that never reached the voice client.
+
+    An abandoned start otherwise runs forever: FFmpeg blocks writing PCM nobody reads,
+    discord.py's stdin-writer thread blocks behind it and keeps the source alive (so
+    AudioSource.__del__ never runs), the jitter buffer's fill thread spins on its full
+    queue, and an unowned stream reader parks in os.write. The teardown runs on a daemon
+    thread: FFmpegPCMAudio.cleanup() can block in communicate(), a reap waits up to 2 s.
+    """
+    if not parts:
+        return
+
+    def _teardown():
+        for part in reversed(parts):   # consumers first: jitter buffer, FFmpeg, stream
+            try:
+                if isinstance(part, discord.AudioSource):
+                    part.cleanup()
+                else:
+                    part.terminate()
+                    _reap_process(part)
+            except Exception:
+                pass
+
+    threading.Thread(target=_teardown, daemon=True, name="pipeline-discard").start()
+
+
+def _discard_late_result(fut) -> None:
+    """Done-callback: discard what an executor built for a play() that was cancelled."""
+    if not fut.cancelled() and fut.exception() is None:
+        _discard_pipeline(fut.result())
+
+
+async def _adopt(built: list, fut):
+    """Await an executor call that builds a pipeline piece, and record the piece.
+
+    Cancelling the awaiting task does not stop the executor call, and asyncio drops
+    whatever it returns, so a stream reader or FFmpeg built that way would run with no
+    owner. Shielded, the result stays reachable and is discarded once it lands.
+    """
+    try:
+        part = await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        fut.add_done_callback(_discard_late_result)
+        raise
+    built.append(part)
+    return part
+
+
 class AudioPlayer:
     """Audio player using discord.py VoiceClient + FFmpegPCMAudio.
 
@@ -1458,6 +1823,19 @@ class AudioPlayer:
             return self._guild_bitrates.get(guild_id, self._default_bitrate)
         return self._default_bitrate
 
+    def _encoder_settings(self) -> dict:
+        """Opus settings for VoiceClient.play(), which builds a NEW encoder from them for
+        every PCM source. Tuning voice_client.encoder before play() is thrown away.
+
+        discord.py's defaults (FEC on, 15% expected loss, signal 'auto') spend ~15% of
+        the bitrate on error correction and don't optimise for music. With FEC off,
+        discord.py leaves the expected loss at libopus's 0%.
+        """
+        guild_id = self._voice_client.guild.id if hasattr(self._voice_client, "guild") else None
+        # opus.Encoder raises ValueError outside 16-512 kbps; !bitrate accepts 1-512.
+        kbps = min(512, max(16, self.get_bitrate_for_guild(guild_id) // 1000))
+        return {"bitrate": kbps, "fec": False, "bandwidth": "full", "signal_type": "music"}
+
     def get_eq_for_guild(self, guild_id: int | None) -> tuple[int, int]:
         """Return (bass_db, treble_db) for this guild, defaulting to (0, 0) = flat."""
         if guild_id is None:
@@ -1479,13 +1857,42 @@ class AudioPlayer:
         ``prefetched_info`` is an optional get_audio_url() result resolved earlier
         (background prefetch or enqueue). When still fresh it is reused instead of
         resolving again, collapsing the transition resolve to an instant handoff;
-        a stale/revoked cached URL transparently falls back to a fresh resolve.
+        a stale/revoked cached URL transparently falls back to a fresh resolve. A stream
+        that gives no audio even from a fresh resolve raises StreamFailedError.
 
         Architecture: an in-process curl_cffi reader (or, for sources it does not cover,
         the yt-dlp subprocess) pipes audio bytes to FFmpeg's stdin (pipe=True).
         FFmpeg only decodes — it never makes HTTP requests to YouTube CDN.
         This bypasses the HTTP 403 that YouTube returns to FFmpeg's TLS fingerprint.
         """
+        # Every pipeline piece the start builds goes in `built`, so a start abandoned
+        # part-way (task cancelled by a skip, voice dropped, voice_client.play() raising)
+        # tears down what it made instead of leaking FFmpeg and its threads for good.
+        built: list = []
+        # _start_playback bumps the generation before its first await; a newer
+        # play()/play_radio() bumps it again and owns the playback state from then on.
+        gen = self._playback_gen + 1
+        try:
+            return await self._start_playback(url_or_query, prefetched_info,
+                                              prefetched_at, built)
+        except BaseException:
+            if self._ytdlp_proc in built:
+                self._ytdlp_proc = None
+            _discard_pipeline(*built)
+            # The start flags its track as playing and clears _playback_done before the
+            # prefill and voice_client.play(). Left so, wait_for_playback() never returns
+            # and auto-next stalls on a track that never started.
+            if self._playback_gen == gen:
+                self.is_playing = False
+                self.current_track_title = None
+                self.current_artist = ""
+                self.current_duration = None
+                self._playback_done.set()
+            raise
+
+    async def _start_playback(self, url_or_query: str, prefetched_info: dict | None,
+                              prefetched_at: float, built: list) -> dict:
+        """play()'s body; appends each pipeline piece to ``built`` as it is created."""
         import discord
 
         if self._debug:
@@ -1545,15 +1952,13 @@ class AudioPlayer:
             else:
                 if self._debug:
                     print("[debug][player] Resolving audio URL via in-process yt-dlp")
-                info = await loop.run_in_executor(
-                    _RESOLVE_EXECUTOR, get_audio_url_with_retry,
-                    url_or_query, yt["client"], self._debug, cookies_file
-                )
+                info = await resolve_audio(url_or_query, yt["client"], self._debug,
+                                           cookies_file)
 
-            proc = await loop.run_in_executor(
+            proc = await _adopt(built, loop.run_in_executor(
                 _STREAM_EXECUTOR, _open_audio_stream, url_or_query, yt["client"],
                 cookies_file, info, self._debug
-            )
+            ))
             self._ytdlp_proc = proc  # track immediately so a concurrent stop reaps it
 
             # The stream may fail to open at all (invalid/expired URL). A cached URL that
@@ -1569,7 +1974,7 @@ class AudioPlayer:
                     if self._debug:
                         print("[debug][player] Cached stream URL failed immediately — re-resolving fresh")
                     continue
-                raise RuntimeError(
+                raise StreamFailedError(
                     f"audio stream failed to open ({proc.poll()}) before playback started: {stderr[:500]}"
                 )
 
@@ -1577,7 +1982,7 @@ class AudioPlayer:
             # (~10-80 ms on Windows with AV) and would otherwise stall every guild.
             # FFmpeg still reads only from the yt-dlp stdout pipe (pipe=True).
             proc_stdout = proc.stdout
-            src = await loop.run_in_executor(
+            src = await _adopt(built, loop.run_in_executor(
                 _STREAM_EXECUTOR,
                 lambda: discord.FFmpegPCMAudio(
                     proc_stdout,
@@ -1586,7 +1991,7 @@ class AudioPlayer:
                     options=ffmpeg_options,
                     stderr=subprocess.PIPE,
                 ),
-            )
+            ))
 
             # Drain stderr before priming so a full pipe can't deadlock read().
             # The in-process reader has no stderr (no child process) — nothing to drain.
@@ -1595,12 +2000,15 @@ class AudioPlayer:
                 threading.Thread(target=_drain_stderr, args=(proc, "[yt-dlp-pipe]"), daemon=True).start()
 
             # Block in the executor until FFmpeg produces its first PCM frame. An empty
-            # frame from a cached URL means the stream produced no audio (stale/revoked) —
-            # tear down and re-resolve fresh. A fresh resolve is accepted as-is.
+            # frame means the stream produced no audio. From a cached URL that is
+            # stale/revoked — tear down and re-resolve fresh. From a fresh resolve it is a
+            # failure: accepting it "played" the track for 0 s and reset auto-next's
+            # breaker, so a CDN refusing every fresh URL walked the whole queue.
             frame = await loop.run_in_executor(_STREAM_EXECUTOR, src.read)
-            if not frame and used_cache:
+            if not frame:
                 if self._debug:
-                    print("[debug][player] Cached stream URL produced no audio — re-resolving fresh")
+                    print("[debug][player] Stream produced no audio — "
+                          + ("re-resolving fresh" if used_cache else "failing the play"))
                 try:
                     proc.terminate()
                 except Exception:
@@ -1613,6 +2021,8 @@ class AudioPlayer:
                 self._ytdlp_proc = None
                 candidate = None
                 invalidate_resolve_cache(url_or_query)
+                if not used_cache:
+                    raise StreamFailedError("The audio stream ended before producing any audio")
                 continue
 
             source = src
@@ -1648,28 +2058,14 @@ class AudioPlayer:
         # The already-read first_frame is emitted first; a short prefill builds a
         # small cushion before playback starts.
         source = _BufferedAudioSource(source, first_frame=first_frame)
+        built.append(source)
         await loop.run_in_executor(_STREAM_EXECUTOR, source.prefill)
 
-        # Configure Opus encoder before play() so first frames use music settings.
-        # discord.py defaults: fec=True, expected_packet_loss=0.15, signal_type='auto'
-        # These defaults waste ~15% of bitrate on error correction and don't optimise for music.
-        encoder = getattr(self._voice_client, 'encoder', None)
-        if encoder:
-            try:
-                guild_id = self._voice_client.guild.id if hasattr(self._voice_client, 'guild') else None
-                bitrate_bps = self.get_bitrate_for_guild(guild_id)
-                encoder.set_signal_type('music')
-                encoder.set_fec(False)
-                encoder.set_expected_packet_loss_percent(0.01)
-                encoder.set_bitrate(bitrate_bps // 1000)
-                encoder.set_bandwidth('full')
-                if self._debug:
-                    print(f"[debug][player] Opus encoder: signal=music, bitrate={bitrate_bps // 1000}kbps, FEC=off, PLP=0%, bandwidth=full")
-            except Exception as e:
-                if self._debug:
-                    print(f"[debug][player] Could not configure opus encoder: {e}")
+        encoder_settings = self._encoder_settings()
+        if self._debug:
+            print(f"[debug][player] Opus encoder: signal=music, bitrate={encoder_settings['bitrate']}kbps, FEC=off, PLP=0%, bandwidth=full")
 
-        self._voice_client.play(source, after=after_playback)
+        self._voice_client.play(source, after=after_playback, **encoder_settings)
 
         if self._debug:
             print(f"[debug][player] Playback started for: {title}")
@@ -1791,20 +2187,6 @@ class AudioPlayer:
             self.current_track_title = None
             loop.call_soon_threadsafe(self._playback_done.set)
 
-        # Configure Opus encoder before play() so first frames use music settings.
-        encoder = getattr(self._voice_client, "encoder", None)
-        if encoder:
-            try:
-                guild_id = self._voice_client.guild.id if hasattr(self._voice_client, "guild") else None
-                bitrate_bps = self.get_bitrate_for_guild(guild_id)
-                encoder.set_signal_type("music")
-                encoder.set_fec(False)
-                encoder.set_expected_packet_loss_percent(0.01)
-                encoder.set_bitrate(bitrate_bps // 1000)
-                encoder.set_bandwidth("full")
-            except Exception:
-                pass
-
         # Prime with one frame so the audio thread's first read() is instant.
         # Reduced probesize means FFmpeg produces the first frame within ~100ms,
         # so a 3-second timeout is conservative. Falls back gracefully on slow stations.
@@ -1818,7 +2200,7 @@ class AudioPlayer:
         except asyncio.TimeoutError:
             pass
 
-        self._voice_client.play(source, after=after_playback)
+        self._voice_client.play(source, after=after_playback, **self._encoder_settings())
 
         if self._debug:
             print(f"[debug][player] Radio playback started: {title}")

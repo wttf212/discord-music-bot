@@ -1,6 +1,7 @@
 import asyncio
 import http.client
 import json
+import random
 import re
 import time
 import urllib.parse
@@ -11,10 +12,11 @@ from discord.ext import commands
 from discord import app_commands
 from track_queue import Track
 from audio_player import (
-    is_playlist_url, extract_playlist_info, get_audio_url_with_retry,
+    is_playlist_url, extract_playlist_info, resolve_audio, enumerate_playlist,
     is_stream_info_fresh, get_related_tracks, _youtube_video_id,
     warm_stream_url, _can_stream_in_process, is_permanent_resolve_error,
-    _RESOLVE_EXECUTOR, _STREAM_EXECUTOR,
+    is_systemic_resolve_error, youtube_block_remaining, YouTubeBlockedError, _fmt_wait,
+    _RESOLVE_LANE, _PLAYLIST_LANE, _STREAM_EXECUTOR,
 )
 from spotify import is_spotify_url, resolve_spotify, SpotifyError
 import weather
@@ -621,6 +623,13 @@ async def _play_radio_selected(bot, ctx: commands.Context, station: dict,
             )
             return
 
+    # Disarm the armed auto-next chain before stopping playback (see prev/next button
+    # pattern): the stop sets _playback_done, and a live chain would start a competing play().
+    if gs.auto_next_task and not gs.auto_next_task.done():
+        gs.auto_next_task.cancel()
+        gs.auto_next_task = None
+    gs.auto_next_gen += 1
+
     # Stop current playback if any
     if gs.player.is_playing:
         gs.player.stop_playback()
@@ -802,7 +811,6 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
     voice_channel = ctx.author.voice.channel
     user_id = str(ctx.author.id)
     channel_id = ctx.channel.id
-    loop = asyncio.get_event_loop()
 
     url = result["url"]
     r_title = result.get("title") or url
@@ -837,11 +845,10 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
 
     # Start-playback path: overlap the URL resolve with the voice connect.
     yt_cfg = bot.config.get("youtube", {})
-    resolve_fut = loop.run_in_executor(
-        _RESOLVE_EXECUTOR, get_audio_url_with_retry, url,
-        yt_cfg.get("client", "web"), bot.config.get("debug", False),
+    resolve_fut = asyncio.create_task(resolve_audio(
+        url, yt_cfg.get("client", "web"), bot.config.get("debug", False),
         yt_cfg.get("cookies_file") or None,
-    )
+    ))
 
     if not voice_client or not voice_client.is_connected():
         if voice_client:  # stale client — force-disconnect before reconnecting
@@ -1023,7 +1030,7 @@ class _ControlsRow(discord.ui.ActionRow):
         except Exception as e:
             print(f"[commands] Manual advance failed (guild {guild_id}): {e}")
             if not _recover_manual_advance(self.view.bot, gs, guild_id,
-                                           interaction.channel.id, prev_track):
+                                           interaction.channel.id, prev_track, e):
                 await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
 
     @discord.ui.button(label="►", style=discord.ButtonStyle.primary, custom_id="btn_next")  # ►
@@ -1062,7 +1069,7 @@ class _ControlsRow(discord.ui.ActionRow):
             except Exception as e:
                 print(f"[commands] Manual advance failed (guild {guild_id}): {e}")
                 if not _recover_manual_advance(self.view.bot, gs, guild_id,
-                                               interaction.channel.id, next_track):
+                                               interaction.channel.id, next_track, e):
                     await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
             await update_np_stopped(self.view.bot, interaction.channel.id)
@@ -1717,6 +1724,8 @@ def _discard_future(fut):
     """Retrieve and swallow a future's result/exception so a discarded in-flight
     resolve (e.g. after a failed voice connect) doesn't log 'never retrieved'."""
     def _swallow(f):
+        if f.cancelled():
+            return      # result() would raise CancelledError into the loop's handler
         try:
             f.result()
         except Exception:
@@ -1725,6 +1734,14 @@ def _discard_future(fut):
         fut.add_done_callback(_swallow)
     except Exception:
         pass
+
+
+def _abandon_enumeration(fut):
+    """Drop a playlist enumeration nobody will read (superseded or expired offer, failed
+    voice connect or first track). Cancelling stops its worker before the next page
+    request; merely discarding it let a 2000-track enumeration page YouTube for ~20 s."""
+    fut.cancel()
+    _discard_future(fut)
 
 
 # Per-(guild, user, action) button cooldowns. Stops machine-gunning the card
@@ -1757,6 +1774,12 @@ async def check_channel(ctx: commands.Context) -> bool:
     if str(ctx.channel.id) == allowed:
         return True
 
+    # A slash command has no message to delete, and unless its interaction is
+    # answered Discord shows "The application did not respond".
+    if ctx.interaction:
+        await _respond(ctx.interaction, f"Please use commands in <#{allowed}>.")
+        return False
+
     # Wrong channel: delete and notify
     try:
         await ctx.message.delete()
@@ -1780,6 +1803,27 @@ async def _do_update_np_embed(bot, channel, msg_id, view):
         await channel.get_partial_message(msg_id).edit(view=view)
     except Exception as e:
         print(f"[commands] Failed to update NP card: {e}")
+        return
+    gs = bot.get_guild_state(channel.guild.id)
+    if gs.np_message_id == msg_id:
+        gs.np_views.append(view)
+    else:
+        view.stop()  # the card was replaced while this edit was in flight
+
+
+def _release_np_views(gs):
+    """Stop every view on a Now-Playing card that is being replaced or deleted.
+
+    PlayerView never times out, and discord.py's ViewStore keeps a view until it is
+    stopped: deleting the message doesn't drop it, so every card ever sent stayed in
+    memory. Each in-place edit stores another view on the same card, and they're all
+    stopped together here. Never stop one while its card is live: the store
+    unregisters by custom_id, which would take the newer view's buttons with it.
+    """
+    views, gs.np_views = gs.np_views, []
+    for view in views:
+        view.stop()
+
 
 async def update_np_embed(bot, channel_id: int, view: "PlayerView"):
     """Edit the existing NP message card in-place (no new message)."""
@@ -1806,6 +1850,7 @@ async def _clear_np(bot, channel_id: int):
     gs = bot.get_guild_state(channel.guild.id)
     msg_id = gs.np_message_id
     gs.np_message_id = None
+    _release_np_views(gs)
     if msg_id:
         await _safe_delete(channel.get_partial_message(msg_id))
 
@@ -1884,8 +1929,12 @@ async def _prefetch_next_track(bot, guild_id):
             # The floor is enforced on EVERY iteration, not just before the loop: a run
             # of dead tracks would otherwise fire back-to-back resolves and punch
             # straight through the rate limit that exists to protect the IP.
-            wait = _PREFETCH_MIN_INTERVAL - (time.monotonic() - _last_prefetch_monotonic)
-            if wait > 0:
+            # And it is RE-CHECKED after every sleep: guilds that hit the floor together
+            # compute the same wait and wake together, so a single check let them all
+            # fire at once. The claim below follows the check with no await in between,
+            # so exactly one waker takes each slot and the rest sleep again.
+            while (wait := _PREFETCH_MIN_INTERVAL
+                    - (time.monotonic() - _last_prefetch_monotonic)) > 0:
                 if debug:
                     print(f"[debug][prefetch] throttled — deferring {wait:.1f}s")
                 await asyncio.sleep(wait)
@@ -1906,10 +1955,8 @@ async def _prefetch_next_track(bot, guild_id):
                 return
             _last_prefetch_monotonic = time.monotonic()
             try:
-                info = await asyncio.get_event_loop().run_in_executor(
-                    _RESOLVE_EXECUTOR, get_audio_url_with_retry,
-                    track.query, yt_client, False, cookies_file
-                )
+                info = await resolve_audio(track.query, yt_client, False, cookies_file,
+                                           background=True)
                 break
             except Exception as e:
                 # Removed / private / geo-blocked: it can never play, so take it out now
@@ -1968,9 +2015,7 @@ async def _autoplay_pick(bot, guild_id, seed):
         if not gs.autoplay_pool:
             yt_client = bot.config.get("youtube", {}).get("client", "web")
             seed_url = seed.url or seed.query
-            related = await asyncio.get_event_loop().run_in_executor(
-                _RESOLVE_EXECUTOR, get_related_tracks, seed_url, yt_client, 25
-            )
+            related = await _PLAYLIST_LANE.run(get_related_tracks, seed_url, yt_client, 25)
             gs.autoplay_pool = [t for t in related if t.get("url") and t["url"] not in gs.autoplay_history]
         while gs.autoplay_pool:
             cand = gs.autoplay_pool.pop(0)
@@ -2022,10 +2067,8 @@ async def _resolve_track_info(bot, channel_id: int, track: Track):
     try:
         yt_client = bot.config.get("youtube", {}).get("client", "web")
         cookies_file = bot.config.get("youtube", {}).get("cookies_file") or None
-        info = await asyncio.get_event_loop().run_in_executor(
-            _RESOLVE_EXECUTOR, get_audio_url_with_retry,
-            track.query, yt_client, False, cookies_file
-        )
+        info = await resolve_audio(track.query, yt_client, False, cookies_file,
+                                   background=True)
         track.title = info["title"]
         track.thumbnail = info.get("thumbnail", "")
         track.url = info.get("webpage_url", "")
@@ -2077,10 +2120,12 @@ async def send_new_np(bot, channel_id: int, view: "PlayerView"):
     old_msg_id = gs.np_message_id
     if old_msg_id:
         asyncio.create_task(_safe_delete(channel.get_partial_message(old_msg_id)))
+    _release_np_views(gs)
 
     try:
         new_msg = await channel.send(view=view)
         gs.np_message_id = new_msg.id
+        gs.np_views.append(view)
     except Exception as e:
         print(f"[commands] Failed to send NP message: {e}")
 
@@ -2252,7 +2297,6 @@ class MusicCog(commands.Cog):
         # Playlist detection: play first track, offer to add the rest
         # ---------------------------------------------------------------
         if is_playlist_url(query):
-            loop = asyncio.get_event_loop()
             yt_client = self.bot.config.get("youtube", {}).get("client", "web")
             channel_id = ctx.channel.id
             user_id = str(ctx.author.id)
@@ -2268,8 +2312,8 @@ class MusicCog(commands.Cog):
                 old = self.bot.pending_playlists.get(str(channel_id))
                 if old is not None and old.get("future") is not None:
                     # A second playlist offer for this channel superseded an
-                    # in-flight enumeration — drop its future so it isn't orphaned.
-                    _discard_future(old["future"])
+                    # in-flight enumeration — stop it rather than let it page on.
+                    _abandon_enumeration(old["future"])
 
                 entry = {
                     "query": query, "user_id": user_id, "guild_id": guild_id,
@@ -2283,7 +2327,7 @@ class MusicCog(commands.Cog):
                     if self.bot.pending_playlists.get(str(channel_id)) is entry:
                         self.bot.pending_playlists.pop(str(channel_id), None)
                         if entry.get("future"):
-                            _discard_future(entry["future"])
+                            _abandon_enumeration(entry["future"])
                         current = gs.queue.current
                         if current:
                             try:
@@ -2308,6 +2352,10 @@ class MusicCog(commands.Cog):
                 try:
                     full_info = await full_fut
                     action, extra, remaining = _resolve_offer_outcome(full_info, playlist_title)
+                except asyncio.CancelledError:
+                    if asyncio.current_task().cancelling():
+                        raise       # this command itself is being cancelled
+                    return          # enumeration abandoned: the replacement owns the card
                 except Exception as e:
                     print(f"[commands] Playlist enumeration failed after start: {e}")
                     action, extra, remaining = "error", _error_offer_text(playlist_title), []
@@ -2334,7 +2382,7 @@ class MusicCog(commands.Cog):
                 # instead of blocking on a full "Fetching playlist info…" enumeration.
                 status_msg = await ctx.send("Loading playlist…")
                 try:
-                    first_info = await loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client, 1)
+                    first_info = await _RESOLVE_LANE.run(extract_playlist_info, query, yt_client, 1)
                 except Exception as e:
                     await status_msg.edit(content=f"Error fetching playlist: {e}")
                     return
@@ -2351,7 +2399,7 @@ class MusicCog(commands.Cog):
                 _schedule_prefetch(self.bot, ctx.guild.id)
                 asyncio.create_task(_safe_delete(status_msg))
 
-                full_fut = loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client)
+                full_fut = asyncio.create_task(enumerate_playlist(query, yt_client))
                 entry = _make_offer(full_fut, playlist_title)
 
                 current = gs.queue.current
@@ -2370,7 +2418,7 @@ class MusicCog(commands.Cog):
             # returns, non-blocking, before voice-join).
             status_msg = await ctx.send("Loading playlist…")
             try:
-                first_info = await loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client, 1)
+                first_info = await _RESOLVE_LANE.run(extract_playlist_info, query, yt_client, 1)
             except Exception as e:
                 await status_msg.edit(content=f"Error fetching playlist: {e}")
                 return
@@ -2381,7 +2429,7 @@ class MusicCog(commands.Cog):
             playlist_title = first_info["title"]
             first_track_info = first_tracks[0]
 
-            full_fut = loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client)
+            full_fut = asyncio.create_task(enumerate_playlist(query, yt_client))
 
             # Join voice if not already connected
             if not voice_client or not voice_client.is_connected():
@@ -2402,7 +2450,7 @@ class MusicCog(commands.Cog):
                     if saved_bass != 0 or saved_treble != 0:
                         await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
                 except Exception as e:
-                    _discard_future(full_fut)
+                    _abandon_enumeration(full_fut)
                     await status_msg.edit(content=f"Failed to join voice channel: {e}")
                     return
 
@@ -2420,7 +2468,13 @@ class MusicCog(commands.Cog):
                 gs.queue.current = Track(query=first_track_info["url"], title=title,
                                          requested_by=user_id, thumbnail=track_thumbnail, url=track_url)
             except Exception as e:
-                _discard_future(full_fut)
+                _abandon_enumeration(full_fut)
+                # Track 1 resolves inside play(), after the disarm. A YouTube block or a voice
+                # drop is no fault of the playlist, and the chain cancelled above may have been
+                # waiting one out with a track it kept: re-arm it, as a manual skip does.
+                if (is_systemic_resolve_error(e)
+                        or _live_voice_client(self.bot, gs, ctx.guild.id) is None):
+                    _start_auto_next(self.bot, channel_id, ctx.guild.id)
                 await status_msg.edit(content=f"Error playing first track: {e}")
                 return
 
@@ -2444,7 +2498,6 @@ class MusicCog(commands.Cog):
         # ---------------------------------------------------------------
         user_id = str(ctx.author.id)
         channel_id = ctx.channel.id
-        loop = asyncio.get_event_loop()
 
         voice_client = ctx.guild.voice_client
         voice_actually_playing = (
@@ -2485,11 +2538,10 @@ class MusicCog(commands.Cog):
         # Start-playback path: overlap the URL resolve with the voice connect
         # (they are independent — connect needs no resolved URL, resolve needs no voice).
         yt_cfg = self.bot.config.get("youtube", {})
-        resolve_fut = loop.run_in_executor(
-            _RESOLVE_EXECUTOR, get_audio_url_with_retry, query,
-            yt_cfg.get("client", "web"), self.bot.config.get("debug", False),
+        resolve_fut = asyncio.create_task(resolve_audio(
+            query, yt_cfg.get("client", "web"), self.bot.config.get("debug", False),
             yt_cfg.get("cookies_file") or None,
-        )
+        ))
 
         if not voice_client or not voice_client.is_connected():
             if voice_client:  # stale client — force-disconnect before reconnecting
@@ -2732,7 +2784,7 @@ class MusicCog(commands.Cog):
                 _start_auto_next(self.bot, channel_id, ctx.guild.id)
             except Exception as e:
                 print(f"[commands] Manual advance failed (guild {ctx.guild.id}): {e}")
-                if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track):
+                if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track, e):
                     await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
             await ctx.send("Skipped. Queue is empty.")
@@ -2843,9 +2895,31 @@ class MusicCog(commands.Cog):
 
         status = await ctx.send(f"Loading **{title}**…")
         first = sp_tracks[0]
+        # Resolve track 1 before the disarm, as the single-track path does: a track that
+        # can't be found, or a YouTube block, then fails here and leaves auto-play alone.
+        yt_cfg = self.bot.config.get("youtube", {})
         try:
-            played = await gs.player.play(first["query"])
+            info = await resolve_audio(
+                first["query"], yt_cfg.get("client", "web"), self.bot.config.get("debug", False),
+                yt_cfg.get("cookies_file") or None,
+            )
         except Exception as e:
+            await status.edit(content=f"Error playing first track: {_friendly_ytdlp_error(e)}")
+            return
+        resolved_at = time.time()
+        # Disarm the armed auto-next chain before play() (see prev/next button pattern above).
+        if gs.auto_next_task and not gs.auto_next_task.done():
+            gs.auto_next_task.cancel()
+            gs.auto_next_task = None
+        gs.auto_next_gen += 1
+        try:
+            played = await gs.player.play(first["query"], info, resolved_at)
+        except Exception as e:
+            # A voice drop (or a block met re-resolving a stale URL) is no fault of the
+            # track: re-arm auto-play, as a refused playlist start does.
+            if (is_systemic_resolve_error(e)
+                    or _live_voice_client(self.bot, gs, ctx.guild.id) is None):
+                _start_auto_next(self.bot, channel_id, ctx.guild.id)
             await status.edit(content=f"Error playing first track: {_friendly_ytdlp_error(e)}")
             return
         gs.queue.current = Track(query=first["query"], title=played["title"], requested_by=user_id,
@@ -2888,6 +2962,8 @@ class MusicCog(commands.Cog):
             return
         if not ctx.guild:
             return
+        if ctx.interaction:
+            await _ack(ctx.interaction)  # geocoding + weather refresh outlast the 3 s token
         if not await self._check_admin(ctx):
             return
         gid = str(ctx.guild.id)
@@ -3002,6 +3078,8 @@ class MusicCog(commands.Cog):
             return
         if not ctx.guild:
             return
+        if ctx.interaction:
+            await _ack(ctx.interaction)  # a cold resolve outlasts the 3 s token
         if position is None:
             await ctx.send(f"Usage: `{self.bot.command_prefix}skipto <position>`")
             return
@@ -3026,20 +3104,28 @@ class MusicCog(commands.Cog):
             return
         try:
             info = await gs.player.play(next_track.query, next_track.resolved_info, next_track.resolved_at)
-            next_track.title = info["title"]
-            next_track.thumbnail = info.get("thumbnail", "")
-            next_track.url = info.get("webpage_url", "")
-            view = build_player_view(self.bot, next_track.title,
-                                     thumbnail=next_track.thumbnail, url=next_track.url,
-                                     requester_name=_get_requester_name(self.bot, next_track.requested_by, ctx.guild),
-                                     queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
-            await ctx.send(f"Jumped to **{next_track.title}**.", delete_after=3)
-            await send_new_np(self.bot, channel_id, view)
-            _start_auto_next(self.bot, channel_id, ctx.guild.id)
         except Exception as e:
             print(f"[commands] Manual advance failed (guild {ctx.guild.id}): {e}")
-            if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track):
+            if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track, e):
                 await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+            elif ctx.interaction:
+                # Auto-play tells the channel why it waits; the deferred slash command
+                # ("is thinking…") still needs an answer of its own.
+                await _respond(ctx.interaction, "Couldn't start that track yet — it's back in "
+                                                "the queue, and auto-play will retry it.")
+            return
+        # Armed before any reply: a reply that fails (a dead interaction token) must
+        # not leave auto-play off after this track.
+        _start_auto_next(self.bot, channel_id, ctx.guild.id)
+        next_track.title = info["title"]
+        next_track.thumbnail = info.get("thumbnail", "")
+        next_track.url = info.get("webpage_url", "")
+        view = build_player_view(self.bot, next_track.title,
+                                 thumbnail=next_track.thumbnail, url=next_track.url,
+                                 requester_name=_get_requester_name(self.bot, next_track.requested_by, ctx.guild),
+                                 queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
+        await ctx.send(f"Jumped to **{next_track.title}**.", delete_after=3)
+        await send_new_np(self.bot, channel_id, view)
 
     @commands.hybrid_command(name="clear", description="Clear the upcoming queue (keeps the current track)")
     async def clear(self, ctx: commands.Context):
@@ -3124,8 +3210,19 @@ class MusicCog(commands.Cog):
 
         # Start playback if nothing is currently playing
         if not gs.player.is_playing:
+            # Not while voice is down: a chain waiting the drop out plays these tracks itself
+            # once voice is back, and the disarm below would cancel that wait (the manual
+            # skips refuse for the same reason).
+            if _live_voice_client(self.bot, gs, ctx.guild.id) is None:
+                await ctx.send("Voice connection is down, so nothing started yet — the tracks are queued.")
+                return
             next_track = gs.queue.next()
             if next_track:
+                # Disarm the armed auto-next chain before play() (see prev/next button pattern above).
+                if gs.auto_next_task and not gs.auto_next_task.done():
+                    gs.auto_next_task.cancel()
+                    gs.auto_next_task = None
+                gs.auto_next_gen += 1
                 try:
                     info = await gs.player.play(next_track.query, next_track.resolved_info, next_track.resolved_at)
                     title = info["title"]
@@ -3141,7 +3238,9 @@ class MusicCog(commands.Cog):
                     await send_new_np(self.bot, channel_id, view)
                     _start_auto_next(self.bot, channel_id, ctx.guild.id)
                 except Exception as e:
-                    await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+                    print(f"[commands] !!loadall playback start failed (guild {ctx.guild.id}): {e}")
+                    if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track, e):
+                        await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
 
     @commands.command(name="bitrate")
     async def bitrate(self, ctx: commands.Context, kbps: str = None):
@@ -3431,19 +3530,34 @@ def _live_voice_client(bot, gs, guild_id):
     return vc if (vc is not None and vc.is_connected()) else None
 
 
-def _recover_manual_advance(bot, gs, guild_id, channel_id, track) -> bool:
-    """Voice died *during* a manual advance's play(). Put the track back and hand
-    control to the auto-next chain, which knows how to wait a reconnect out.
+def _recover_manual_advance(bot, gs, guild_id, channel_id, track, error) -> bool:
+    """A manual advance's play() failed after the advance had cancelled the auto-next
+    chain. Hand control to a fresh chain, or auto-play stops on the failed track.
 
-    False when voice is fine — a genuinely dead track must keep its existing
-    skip-and-move-on behaviour; requeueing a permanently broken track and
-    re-arming the chain would retry it forever.
+    The failure was no fault of the track: voice died *during* the play(), or YouTube
+    is refusing this server (is_systemic_resolve_error, the shared cooldown's instant
+    refusal included). Put the track back; the chain knows how to wait either one out
+    and tells the channel why. Its breaker still bounds the retries during a block.
+    True: nothing was skipped.
+
+    Otherwise the track itself failed. It is not put back (a permanently broken track
+    would be retried forever), and the chain moves on from it as it does from a track
+    that fails under it. A dead one (is_permanent_resolve_error) never comes back:
+    loop "off" files it into history, and a loop drops it from its rotation here, as
+    _auto_next does, or next() would hand it straight back. False: the caller reports
+    the skip. A newer advance (or a stop) that moved on while this play() ran owns the
+    chain, so nothing is touched then: arming one too would run two play()s.
     """
-    if _live_voice_client(bot, gs, guild_id) is None:
+    if _live_voice_client(bot, gs, guild_id) is None or is_systemic_resolve_error(error):
         if track is not None:
             gs.queue.requeue_front(track)
         _start_auto_next(bot, channel_id, guild_id)
         return True
+    if gs.queue.current is not track:
+        return False
+    if is_permanent_resolve_error(error) and gs.queue.loop_mode != "off":
+        gs.queue.current = None
+    _start_auto_next(bot, channel_id, guild_id)
     return False
 
 
@@ -3520,6 +3634,28 @@ async def _wait_for_voice_recovery(bot, gs, guild_id, generation, voice_channel=
     return False
 
 
+# YouTube refusing this server (the bot check, its rate limit, an IP block) is not the
+# track's fault, so auto-next keeps the track and waits instead of skipping it. Each wait
+# covers what is left of the cooldown every guild shares (audio_player._youtube_gate), never
+# less than the floor, plus jitter so guilds whose waits end together don't all ask at once.
+# The breaker still ends the chain after three refusals in a row, with the queue intact.
+_SYSTEMIC_RETRY_FLOOR = 30.0    # seconds; minimum gap between a chain's failed resolves
+_SYSTEMIC_RETRY_JITTER = 10.0   # seconds of spread on top
+_BLOCK_WAIT_POLL = 1.0          # seconds between checks that this chain is still current
+
+
+async def _wait_out_block(gs, generation, delay: float) -> bool:
+    """Sleep through a YouTube block. False if a newer chain (!!stop, a fresh !!play)
+    superseded this one meanwhile; the caller must then exit without a word."""
+    deadline = time.monotonic() + delay
+    while gs.auto_next_gen == generation:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        await asyncio.sleep(min(remaining, _BLOCK_WAIT_POLL))
+    return False
+
+
 def _start_auto_next(bot, channel_id, guild_id):
     """Cancel any existing auto-next chain for this guild and start a fresh one."""
     gs = bot.get_guild_state(guild_id)
@@ -3540,6 +3676,7 @@ async def _auto_next(bot, channel_id, guild_id, generation):
     gs = bot.get_guild_state(guild_id)
     consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 3
+    announced_block = False  # told the channel about the current YouTube block yet?
     try:
         while True:
             # If a newer auto-next was started for this guild, this one is a zombie — exit
@@ -3574,6 +3711,7 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 next_track.thumbnail = info.get("thumbnail", "")
                 next_track.url = info.get("webpage_url", "")
                 consecutive_errors = 0  # reset on success
+                announced_block = False
                 view = build_player_view(bot, title,
                                         thumbnail=next_track.thumbnail,
                                         url=next_track.url,
@@ -3614,8 +3752,44 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 # session. The breaker is for systemic failure (network down, blocked
                 # IP), where retrying the whole queue would be pointless and noisy.
                 if is_permanent_resolve_error(e):
+                    # It fails the same way every time, but under a loop next() would hand it
+                    # straight back (loop "track") or cycle it round to fail again next lap
+                    # (loop "queue"): a YouTube request and a message per turn, forever.
+                    # Clearing `current` drops it from the rotation, so next() moves on.
+                    # Loop "off" keeps it, as before: next() files it into history and
+                    # autoplay can still seed from it.
+                    if gs.queue.loop_mode != "off":
+                        gs.queue.current = None
                     if channel:
                         await channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+                    continue
+                # YouTube refusing this server is no fault of the track's, and the next one
+                # would be refused the same way: skipping emptied the queue in seconds, and
+                # under loop or autoplay never stopped. Keep the track, count the strike and
+                # wait out the cooldown every guild shares.
+                if is_systemic_resolve_error(e):
+                    gs.queue.requeue_front(next_track)
+                    print(f"[commands] YouTube is refusing this server (guild {guild_id}): {e}")
+                    # Another guild's probe is already asking YouTube; its answer is ours too.
+                    if not (isinstance(e, YouTubeBlockedError) and e.probing):
+                        consecutive_errors += 1
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                        wait = youtube_block_remaining()
+                        if channel:
+                            await channel.send(
+                                "YouTube is still refusing requests from this server — stopping "
+                                "auto-play. The queue is still here; try again "
+                                + (f"in {_fmt_wait(wait)}." if wait else "later."))
+                        break
+                    delay = (max(_SYSTEMIC_RETRY_FLOOR, youtube_block_remaining())
+                             + random.uniform(0, _SYSTEMIC_RETRY_JITTER))
+                    if channel and not announced_block:
+                        announced_block = True
+                        await channel.send(
+                            f"YouTube is refusing requests from this server right now — pausing "
+                            f"auto-play and trying again in {_fmt_wait(delay)}. Nothing was skipped.")
+                    if not await _wait_out_block(gs, generation, delay):
+                        return  # superseded by !!stop / a new !!play while we waited
                     continue
                 consecutive_errors += 1
                 if channel:

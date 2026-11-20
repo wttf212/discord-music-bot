@@ -1,9 +1,10 @@
 """Tests for retry-with-backoff helpers (RETRY-01 — Phase 04-01).
 
 These tests exercise _is_retryable_ytdlp_error, _retry_with_backoff, and
-get_audio_url_with_retry WITHOUT hitting the network. All sleep calls are
+resolve_audio WITHOUT hitting the network. All sleep calls are
 patched so the tests run instantly.
 """
+import asyncio
 import random
 import sys
 import os
@@ -18,8 +19,32 @@ import audio_player
 from audio_player import (
     _is_retryable_ytdlp_error,
     _retry_with_backoff,
-    get_audio_url_with_retry,
+    resolve_audio,
 )
+
+
+def _run_retry(fn, sleeps, **kwargs):
+    """Drive the async _retry_with_backoff over a plain attempt function, recording the
+    backoff sleeps instead of waiting them out."""
+    async def submit():
+        return fn()
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    with patch.object(audio_player.asyncio, "sleep", fake_sleep):
+        return asyncio.run(_retry_with_backoff(submit, **kwargs))
+
+
+def _run_resolve(*args, sleeps=None, **kwargs):
+    """asyncio.run(resolve_audio(...)) with the backoff sleeps recorded, not waited."""
+    sleeps = [] if sleeps is None else sleeps
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    with patch.object(audio_player.asyncio, "sleep", fake_sleep):
+        return asyncio.run(resolve_audio(*args, **kwargs))
 
 
 # ---------------------------------------------------------------------------
@@ -164,8 +189,7 @@ class TestRetryWithBackoff(unittest.TestCase):
             calls.append("ok")
             return {"title": "t", "url": "u"}
 
-        with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
-            result = _retry_with_backoff(fn, "q", "c", False, None, max_attempts=3, base_delay=5.0, jitter=0.25)
+        result = _run_retry(fn, sleeps, max_attempts=3, base_delay=5.0, jitter=0.25)
 
         self.assertEqual(result, {"title": "t", "url": "u"})
         self.assertEqual(len(calls), 1)
@@ -184,8 +208,7 @@ class TestRetryWithBackoff(unittest.TestCase):
             calls.append("ok")
             return {"title": "t", "url": "u"}
 
-        with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
-            result = _retry_with_backoff(fn, "q", "c", False, None, max_attempts=3, base_delay=5.0, jitter=0.25)
+        result = _run_retry(fn, sleeps, max_attempts=3, base_delay=5.0, jitter=0.25)
 
         self.assertEqual(result, {"title": "t", "url": "u"})
         self.assertEqual(len(calls), 2)
@@ -201,9 +224,8 @@ class TestRetryWithBackoff(unittest.TestCase):
             calls.append("f")
             raise DownloadError("ERROR: HTTP Error 429: Too Many Requests")
 
-        with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
-            with self.assertRaises(DownloadError):
-                _retry_with_backoff(fn, "q", "c", False, None, max_attempts=3, base_delay=5.0, jitter=0.25)
+        with self.assertRaises(DownloadError):
+            _run_retry(fn, sleeps, max_attempts=3, base_delay=5.0, jitter=0.25)
 
         self.assertEqual(len(calls), 3)
         self.assertEqual(len(sleeps), 2)
@@ -221,10 +243,8 @@ class TestRetryWithBackoff(unittest.TestCase):
         def fn(*a, **k):
             raise ConnectionError("Connection reset by peer")
 
-        with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
-            with self.assertRaises(ConnectionError):
-                _retry_with_backoff(fn, "q", "c", False, None,
-                                    max_attempts=2, base_delay=5.0, fast_delay=1.5, jitter=0.0)
+        with self.assertRaises(ConnectionError):
+            _run_retry(fn, sleeps, max_attempts=2, base_delay=5.0, fast_delay=1.5, jitter=0.0)
 
         # fast_delay * 2^0 = 1.5 (well under the 5s rate-limit base)
         self.assertEqual(len(sleeps), 1)
@@ -237,10 +257,8 @@ class TestRetryWithBackoff(unittest.TestCase):
         def fn(*a, **k):
             raise DownloadError("ERROR: [youtube] abc: Read timed out")
 
-        with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
-            with self.assertRaises(DownloadError):
-                _retry_with_backoff(fn, "q", "c", False, None,
-                                    max_attempts=2, base_delay=5.0, fast_delay=1.5, jitter=0.0)
+        with self.assertRaises(DownloadError):
+            _run_retry(fn, sleeps, max_attempts=2, base_delay=5.0, fast_delay=1.5, jitter=0.0)
 
         self.assertAlmostEqual(sleeps[0], 1.5, places=5)
 
@@ -251,10 +269,8 @@ class TestRetryWithBackoff(unittest.TestCase):
         def fn(*a, **k):
             raise DownloadError("ERROR: HTTP Error 429: Too Many Requests")
 
-        with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
-            with self.assertRaises(DownloadError):
-                _retry_with_backoff(fn, "q", "c", False, None,
-                                    max_attempts=2, base_delay=5.0, fast_delay=1.5, jitter=0.0)
+        with self.assertRaises(DownloadError):
+            _run_retry(fn, sleeps, max_attempts=2, base_delay=5.0, fast_delay=1.5, jitter=0.0)
 
         self.assertAlmostEqual(sleeps[0], 5.0, places=5)
 
@@ -265,10 +281,8 @@ class TestRetryWithBackoff(unittest.TestCase):
         def fn(*a, **k):
             raise DownloadError("some unfamiliar error text")
 
-        with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
-            with self.assertRaises(DownloadError):
-                _retry_with_backoff(fn, "q", "c", False, None,
-                                    max_attempts=2, base_delay=5.0, fast_delay=1.5, jitter=0.0)
+        with self.assertRaises(DownloadError):
+            _run_retry(fn, sleeps, max_attempts=2, base_delay=5.0, fast_delay=1.5, jitter=0.0)
 
         self.assertAlmostEqual(sleeps[0], 5.0, places=5)
 
@@ -280,9 +294,8 @@ class TestRetryWithBackoff(unittest.TestCase):
             calls.append("p")
             raise DownloadError("ERROR: Video unavailable")
 
-        with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
-            with self.assertRaises(DownloadError):
-                _retry_with_backoff(fn, "q", "c", False, None, max_attempts=3, base_delay=5.0, jitter=0.25)
+        with self.assertRaises(DownloadError):
+            _run_retry(fn, sleeps, max_attempts=3, base_delay=5.0, jitter=0.25)
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(sleeps), 0)
@@ -294,26 +307,45 @@ class TestRetryWithBackoff(unittest.TestCase):
         def fn(*a, **k):
             raise DownloadError("ERROR: HTTP Error 429")
 
-        with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
-            with self.assertRaises(DownloadError):
-                _retry_with_backoff(fn, "q", "c", False, None, max_attempts=3, base_delay=5.0, jitter=0.25)
+        with self.assertRaises(DownloadError):
+            _run_retry(fn, sleeps, max_attempts=3, base_delay=5.0, jitter=0.25)
 
         # Even at the extreme of jitter, tier 0 max (6.25) < tier 1 min (7.5)
         self.assertLess(sleeps[0], sleeps[1])
 
-    def test_sleep_uses_time_sleep_not_asyncio(self):
-        """Verify time.sleep is called (not asyncio.sleep)."""
+    def test_backoff_sleeps_on_the_event_loop_not_in_a_worker(self):
+        """The backoff is asyncio.sleep between submissions. A time.sleep here would run
+        inside the resolve worker and park it for the whole backoff."""
         sleeps = []
 
         def fn(*a, **k):
             raise DownloadError("ERROR: HTTP Error 429")
 
-        with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
+        with patch.object(audio_player.time, "sleep",
+                          side_effect=AssertionError("backoff blocked a thread")):
             with self.assertRaises(DownloadError):
-                _retry_with_backoff(fn, "q", "c", False, None, max_attempts=2, base_delay=5.0, jitter=0.0)
+                _run_retry(fn, sleeps, max_attempts=2, base_delay=5.0, jitter=0.0)
 
         self.assertEqual(len(sleeps), 1)
         self.assertAlmostEqual(sleeps[0], 5.0, places=5)
+
+    def test_each_attempt_is_a_fresh_submission(self):
+        """Retrying re-submits — it does not re-await one finished attempt."""
+        submissions = []
+
+        async def submit():
+            submissions.append(len(submissions))
+            if len(submissions) < 3:
+                raise DownloadError("ERROR: HTTP Error 503")
+            return "ok"
+
+        async def fake_sleep(seconds):
+            pass
+
+        with patch.object(audio_player.asyncio, "sleep", fake_sleep):
+            out = asyncio.run(_retry_with_backoff(submit, max_attempts=3))
+        self.assertEqual(out, "ok")
+        self.assertEqual(submissions, [0, 1, 2])
 
     def test_log_line_printed_on_retry(self):
         """Verify [retry] log line is printed for each retried attempt."""
@@ -321,15 +353,14 @@ class TestRetryWithBackoff(unittest.TestCase):
             raise DownloadError("HTTP Error 429: Too Many Requests")
 
         printed = []
-        with patch.object(audio_player.time, "sleep", lambda s: None):
-            import builtins
-            orig_print = builtins.print
-            builtins.print = lambda *a, **k: printed.append(" ".join(str(x) for x in a))
-            try:
-                with self.assertRaises(DownloadError):
-                    _retry_with_backoff(fn, "q", "c", False, None, max_attempts=3, base_delay=5.0, jitter=0.25)
-            finally:
-                builtins.print = orig_print
+        import builtins
+        orig_print = builtins.print
+        builtins.print = lambda *a, **k: printed.append(" ".join(str(x) for x in a))
+        try:
+            with self.assertRaises(DownloadError):
+                _run_retry(fn, [], max_attempts=3, base_delay=5.0, jitter=0.25)
+        finally:
+            builtins.print = orig_print
 
         retry_lines = [l for l in printed if l.startswith("[retry]")]
         # Two sleeps between 3 attempts → two [retry] log lines
@@ -340,24 +371,24 @@ class TestRetryWithBackoff(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# get_audio_url_with_retry wrapper
+# resolve_audio (the retrying async front door to get_audio_url)
 # ---------------------------------------------------------------------------
 
-class TestGetAudioUrlWithRetry(unittest.TestCase):
+class TestResolveAudio(unittest.TestCase):
 
     def test_signature_matches_get_audio_url(self):
-        """Wrapper must accept the same positional/keyword args as get_audio_url."""
+        """Takes get_audio_url's arguments, plus the keyword-only lane class."""
         import inspect
-        w_sig = inspect.signature(get_audio_url_with_retry)
-        params = list(w_sig.parameters.keys())
-        self.assertEqual(params, ["query", "client", "debug", "cookies_file"])
+        params = inspect.signature(resolve_audio).parameters
+        self.assertEqual(list(params)[:4], ["query", "client", "debug", "cookies_file"])
+        self.assertEqual(params["background"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIs(params["background"].default, False)
 
     def test_success_returns_dict_unchanged(self):
         fake_result = {"title": "Song", "url": "https://example.com/audio.m4a",
                        "thumbnail": "", "webpage_url": "", "is_audio_only": True}
         with patch("audio_player.get_audio_url", return_value=fake_result) as mock_fn:
-            with patch.object(audio_player.time, "sleep", lambda s: None):
-                result = get_audio_url_with_retry("test query", "web")
+            result = _run_resolve("test query", "web")
         self.assertEqual(result, fake_result)
         mock_fn.assert_called_once()
 
@@ -369,9 +400,8 @@ class TestGetAudioUrlWithRetry(unittest.TestCase):
             raise DownloadError("ERROR: Video unavailable")
 
         with patch("audio_player.get_audio_url", side_effect=fake_get_audio_url):
-            with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
-                with self.assertRaises(DownloadError):
-                    get_audio_url_with_retry("test query", "web")
+            with self.assertRaises(DownloadError):
+                _run_resolve("test query", "web", sleeps=sleeps)
 
         self.assertEqual(len(sleeps), 0)
 
@@ -385,26 +415,25 @@ class TestGetAudioUrlWithRetry(unittest.TestCase):
             raise DownloadError("ERROR: HTTP Error 429: Too Many Requests")
 
         with patch("audio_player.get_audio_url", side_effect=fake_get_audio_url):
-            with patch.object(audio_player.time, "sleep", side_effect=sleeps.append):
-                with self.assertRaises(DownloadError):
-                    get_audio_url_with_retry("test query", "web")
+            with self.assertRaises(DownloadError):
+                _run_resolve("test query", "web", sleeps=sleeps)
 
         self.assertEqual(len(calls), 3)
         self.assertEqual(len(sleeps), 2)
 
     def test_calls_retry_with_correct_params(self):
-        """Wrapper must pass max_attempts=3, base_delay=5.0, jitter=0.25."""
+        """Must pass max_attempts=3, base_delay=5.0, jitter=0.25."""
         call_kwargs = {}
 
-        def fake_retry(fn, *args, max_attempts, base_delay, jitter, **kwargs):
+        async def fake_retry(submit, *, max_attempts, base_delay, jitter, **kwargs):
             call_kwargs["max_attempts"] = max_attempts
             call_kwargs["base_delay"] = base_delay
             call_kwargs["jitter"] = jitter
             return {"title": "t", "url": "u", "thumbnail": "",
                     "webpage_url": "", "is_audio_only": True}
 
-        with patch("audio_player._retry_with_backoff", side_effect=fake_retry):
-            get_audio_url_with_retry("q", "web")
+        with patch("audio_player._retry_with_backoff", fake_retry):
+            asyncio.run(resolve_audio("q", "web"))
 
         self.assertEqual(call_kwargs["max_attempts"], 3)
         self.assertEqual(call_kwargs["base_delay"], 5.0)
@@ -427,13 +456,13 @@ class TestCallSite(unittest.TestCase):
         with open(_AUDIO_PLAYER_PATH, encoding="utf-8") as fh:
             return fh.read()
 
-    def test_play_uses_get_audio_url_with_retry(self):
+    def test_play_uses_resolve_audio(self):
         # Collapse all whitespace so multi-line formatting of the call doesn't matter.
-        # Executor-agnostic: the point is WHICH function is handed off (the retrying
-        # wrapper), not which pool runs it.
+        import inspect
+        play_src = "".join(inspect.getsource(audio_player.AudioPlayer._start_playback).split())  # play()'s body
+        self.assertIn("awaitresolve_audio(url_or_query,", play_src,
+                      "AudioPlayer.play() must resolve through resolve_audio (retry + lane)")
         src = "".join(self._read_source().split())
-        self.assertIn("get_audio_url_with_retry,", src,
-                      "AudioPlayer.play() must use get_audio_url_with_retry, not get_audio_url")
         for pool in ("None", "_RESOLVE_EXECUTOR", "_STREAM_EXECUTOR"):
             self.assertNotIn(f"run_in_executor({pool},get_audio_url,", src,
                              "Old call site with bare get_audio_url must be removed")

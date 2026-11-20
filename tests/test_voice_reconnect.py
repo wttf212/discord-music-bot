@@ -254,6 +254,7 @@ class _Ctx:
 
     def __init__(self, bot):
         self.bot = bot
+        self.interaction = None   # what commands.Context has for a prefix command
         self.guild = SimpleNamespace(id=1, voice_client=None)
         self.channel = SimpleNamespace(id=_CTX_CHANNEL_ID)
         self.author = SimpleNamespace(id=42)
@@ -727,7 +728,10 @@ class TestManualAdvanceRecovery(unittest.TestCase):
                 self.assertFalse(any("skipping track" in m.lower() for m in sent),
                                   f"{handler}: false 'skipping' message on a requeue, got {sent}")
 
-    def test_dead_track_with_healthy_voice_does_not_requeue_or_rearm(self):
+    def test_dead_track_with_healthy_voice_is_skipped_and_rearms(self):
+        """Never requeued, so it is never retried. The chain is re-armed, though: the
+        advance had cancelled it, and leaving it off stopped auto-play on the dead
+        track (tests/test_manual_dead_track.py runs that chain)."""
         from yt_dlp.utils import DownloadError
         for handler in self.HANDLERS:
             with self.subTest(handler=handler):
@@ -744,9 +748,419 @@ class TestManualAdvanceRecovery(unittest.TestCase):
 
                 self.assertNotIn(track, gs.queue.list(),
                                   f"{handler}: a genuinely dead track must not be requeued")
-                commands._start_auto_next.assert_not_called()
+                commands._start_auto_next.assert_called_once()
+                self.assertEqual(commands._start_auto_next.call_args.args[1],
+                                  self._expected_channel_id(handler),
+                                  f"{handler}: re-armed on the wrong channel")
                 self.assertEqual(sum("skipping track" in m.lower() for m in sent), 1,
                                   f"{handler}: {sent}")
+
+
+def _block_errors():
+    """What a manual play() raises while YouTube is refusing this server: the bot check and
+    the rate limit as yt-dlp words them (the full strings are in tests/test_youtube_block.py),
+    and the shared cooldown's own instant refusal, which sends no request at all."""
+    from yt_dlp.utils import DownloadError
+    return {
+        "bot check": DownloadError(
+            "ERROR: [youtube] abc123: Sign in to confirm you’re not a bot. "
+            "Use --cookies-from-browser or --cookies for the authentication."),
+        "rate limit": DownloadError(
+            "ERROR: [youtube] abc123: This content isn't available, try again later. The "
+            "current session has been rate-limited by YouTube for up to an hour."),
+        "shared cooldown": audio_player.YouTubeBlockedError(60.0),
+        "another guild's probe": audio_player.YouTubeBlockedError(20.0, probing=True),
+    }
+
+
+class TestManualAdvanceDuringABlock(unittest.TestCase):
+    """YouTube refusing this server is no fault of the track a manual advance popped. With
+    voice healthy, `_recover_manual_advance` used to let it go anyway ("Skipping track:
+    YouTube is refusing requests…"): one track lost per impatient ◄/►/!!skip/!!skipto, and
+    the auto-next chain that was waiting the block out cancelled and never re-armed. The
+    track must go back to the front and the chain must be re-armed; the chain already knows
+    how to wait a block out (requeue, _wait_out_block, the breaker).
+    """
+
+    HANDLERS = ("prev", "next", "skip", "skipto")
+
+    def setUp(self):
+        self._patches = [
+            patch.object(commands, "check_channel", side_effect=self._true),
+            patch.object(commands, "_check_vote", return_value=(True, "")),
+            patch.object(commands, "_on_cooldown", return_value=False),
+            patch.object(commands, "build_player_view", return_value=None),
+            patch.object(commands, "_get_requester_name", return_value="someone"),
+            patch.object(commands, "send_new_np", side_effect=self._noop),
+            patch.object(commands, "update_np_stopped", side_effect=self._noop),
+            patch.object(commands, "_schedule_prefetch", return_value=None),
+            patch.object(commands, "_schedule_autoplay_topup", return_value=None),
+            patch.object(commands, "_start_auto_next", MagicMock()),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    async def _true(ctx):
+        return True
+
+    @staticmethod
+    async def _noop(*a, **k):
+        return None
+
+    def test_a_block_keeps_the_track_and_rearms_the_chain(self):
+        for handler in self.HANDLERS:
+            for name, error in _block_errors().items():
+                with self.subTest(handler=handler, error=name):
+                    commands._start_auto_next.reset_mock()
+                    vc = _VC(connected=True)
+                    player = _Player(vc, error=error)
+                    gs = _GS(player)
+                    track = TestManualAdvanceRecovery._seed_one(handler, gs)
+                    gs.auto_next_gen = 7
+                    bot = _Bot(gs, _Guild(vc))
+
+                    sent = asyncio.run(_invoke(handler, bot, gs, position=1))
+
+                    self.assertEqual(len(gs.queue), 1, f"{handler}: track must be back in the queue")
+                    self.assertIs(gs.queue.list()[0], track, f"{handler}: same track object, head of queue")
+                    self.assertIsNone(gs.queue.current, f"{handler}: it never played, so it is not current")
+                    commands._start_auto_next.assert_called_once()
+                    self.assertEqual(commands._start_auto_next.call_args.args[1],
+                                      TestManualAdvanceRecovery._expected_channel_id(handler),
+                                      f"{handler}: re-armed on the wrong channel")
+                    self.assertFalse(any("skipping track" in m.lower() for m in sent),
+                                      f"{handler}: nothing was skipped, got {sent}")
+
+    def test_prev_puts_the_history_track_back_ahead_of_the_one_it_interrupted(self):
+        """previous() has already pushed `current` back to the head of the queue, so only the
+        history track it returned is requeued: in front of that one, with no second copy."""
+        for interrupted in (True, False):   # False: the chain had requeued its track already
+            with self.subTest(interrupted=interrupted):
+                commands._start_auto_next.reset_mock()
+                vc = _VC(connected=True)
+                player = _Player(vc, error=audio_player.YouTubeBlockedError(60.0))
+                gs = _GS(player)
+                older = Track(query="h0", title="h0", requested_by="u")
+                prev = Track(query="p", title="p", requested_by="u")
+                gs.queue._history.extend([older, prev])
+                upcoming = Track(query="q0", title="q0", requested_by="u")
+                gs.queue.add(upcoming)
+                playing = Track(query="c", title="c", requested_by="u") if interrupted else None
+                gs.queue.current = playing
+                bot = _Bot(gs, _Guild(vc))
+
+                asyncio.run(_invoke("prev", bot, gs))
+
+                expected = [prev, playing, upcoming] if interrupted else [prev, upcoming]
+                queued = gs.queue.list()
+                self.assertEqual(len(queued), len(expected), f"no copy lost or doubled: {queued}")
+                for got, want in zip(queued, expected):
+                    self.assertIs(got, want)
+                self.assertIsNone(gs.queue.current)
+                self.assertEqual(len(gs.queue._history), 1)
+                self.assertIs(gs.queue._history[0], older, "only the track ◄ went back to leaves history")
+                commands._start_auto_next.assert_called_once()
+
+    def test_impatient_clicks_lose_nothing(self):
+        """The block holds, so the user clicks again, and again. Only the track that was
+        playing at the first click is skipped (the user asked for that); every track a click
+        popped is back where it was."""
+        for handler in ("next", "skip", "skipto"):
+            with self.subTest(handler=handler):
+                commands._start_auto_next.reset_mock()
+                vc = _VC(connected=True)
+                player = _Player(vc, error=audio_player.YouTubeBlockedError(60.0))
+                gs = _GS(player)
+                playing = Track(query="c", title="c", requested_by="u")
+                gs.queue.current = playing
+                tracks = [Track(query=f"q{i}", title=f"q{i}", requested_by="u") for i in range(3)]
+                for t in tracks:
+                    gs.queue.add(t)
+                bot = _Bot(gs, _Guild(vc))
+
+                for _ in range(3):
+                    asyncio.run(_invoke(handler, bot, gs, position=1))
+
+                queued = gs.queue.list()
+                self.assertEqual(len(queued), len(tracks), f"{handler}: {queued}")
+                for got, want in zip(queued, tracks):
+                    self.assertIs(got, want)
+                self.assertEqual(len(gs.queue._history), 1)
+                self.assertIs(gs.queue._history[0], playing)
+                self.assertIsNone(gs.queue.current)
+                self.assertEqual(commands._start_auto_next.call_count, 3,
+                                  f"{handler}: every click must hand back to the chain")
+
+    def test_dead_tracks_with_healthy_voice_are_still_skipped(self):
+        """The age gate and a private video share "Sign in" wording with the bot check, but
+        they are facts about one video: requeueing one would retry it forever. The chain is
+        re-armed without it, as after any dead track (tests/test_manual_dead_track.py)."""
+        from yt_dlp.utils import DownloadError
+        dead = {
+            "age-gated": DownloadError(
+                "ERROR: [youtube] abc123: Sign in to confirm your age. This video may be "
+                "inappropriate for some users."),
+            "private": DownloadError(
+                "ERROR: [youtube] abc123: Private video. Sign in if you've been granted "
+                "access to this video."),
+        }
+        for handler in self.HANDLERS:
+            for name, error in dead.items():
+                with self.subTest(handler=handler, error=name):
+                    commands._start_auto_next.reset_mock()
+                    vc = _VC(connected=True)
+                    player = _Player(vc, error=error)
+                    gs = _GS(player)
+                    track = TestManualAdvanceRecovery._seed_one(handler, gs)
+                    bot = _Bot(gs, _Guild(vc))
+
+                    sent = asyncio.run(_invoke(handler, bot, gs, position=1))
+
+                    self.assertNotIn(track, gs.queue.list(), f"{handler}: a dead track must not be requeued")
+                    commands._start_auto_next.assert_called_once()
+                    self.assertEqual(sum("skipping track" in m.lower() for m in sent), 1,
+                                      f"{handler}: {sent}")
+
+
+class _Spin(BaseException):
+    """Raised by the scripted player once a chain has clearly lost control. A BaseException,
+    so _auto_next's own `except Exception` cannot swallow it as one more failed track."""
+
+
+class _ScriptedPlayer(_Player):
+    """play() raises the scripted errors in turn, then plays normally."""
+
+    def __init__(self, vc, *errors):
+        super().__init__(vc)
+        self._script = list(errors)
+        self.attempts = []
+
+    async def play(self, query, resolved_info, resolved_at):
+        self.attempts.append(query)
+        if len(self.attempts) > 20:
+            raise _Spin(f"auto-next is spinning: {len(self.attempts)} play() calls")
+        if self._script:
+            raise self._script.pop(0)
+        return await super().play(query, resolved_info, resolved_at)
+
+
+async def _invoke_then_drain(handler, bot, gs, **kwargs):
+    """_invoke, then let the auto-next chain the handler armed (if any) run to the end."""
+    sent = await _invoke(handler, bot, gs, **kwargs)
+    if gs.auto_next_task is not None:
+        await gs.auto_next_task
+    return sent
+
+
+class TestManualAdvanceHandsABlockToTheChain(unittest.TestCase):
+    """End to end with the real _start_auto_next and _auto_next: the chain a blocked manual
+    advance re-arms waits the block out, then plays the very track the click popped. The
+    channel hears once that nothing was skipped, and never "Skipping track"."""
+
+    HANDLERS = ("prev", "next", "skip", "skipto")
+
+    def setUp(self):
+        self.waits = []
+
+        async def _record_wait(gs, generation, delay):
+            self.waits.append(delay)
+            return True
+
+        self._patches = [
+            patch.object(commands, "check_channel", side_effect=self._true),
+            patch.object(commands, "_check_vote", return_value=(True, "")),
+            patch.object(commands, "_on_cooldown", return_value=False),
+            patch.object(commands, "build_player_view", return_value=None),
+            patch.object(commands, "_get_requester_name", return_value="someone"),
+            patch.object(commands, "send_new_np", side_effect=self._noop),
+            patch.object(commands, "update_np_stopped", side_effect=self._noop),
+            patch.object(commands, "_schedule_prefetch", return_value=None),
+            patch.object(commands, "_schedule_autoplay_topup", return_value=None),
+            patch.object(commands, "_wait_out_block", _record_wait),
+            patch.object(commands, "youtube_block_remaining", return_value=0.0),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    async def _true(ctx):
+        return True
+
+    @staticmethod
+    async def _noop(*a, **k):
+        return None
+
+    def test_the_chain_waits_the_block_out_and_plays_the_same_track(self):
+        for handler in self.HANDLERS:
+            with self.subTest(handler=handler):
+                self.waits.clear()
+                vc = _VC(connected=True)
+                block = audio_player.YouTubeBlockedError(60.0)
+                # The click's own attempt and the chain's first try are refused; after the
+                # wait YouTube answers again.
+                player = _ScriptedPlayer(vc, block, block)
+                gs = _GS(player)
+                first = TestManualAdvanceRecovery._seed_one(handler, gs)
+                gs.queue.add(Track(query="after", title="after", requested_by="u"))
+                bot = _Bot(gs, _Guild(vc))
+
+                sent = asyncio.run(_invoke_then_drain(handler, bot, gs, position=1))
+                said = sent + bot._channel.sent
+
+                self.assertEqual(player.attempts, [first.query] * 3 + ["after"])
+                self.assertEqual(player.play_calls, [first.query, "after"])
+                self.assertEqual(len(self.waits), 1, "one wait, then the block has lifted")
+                self.assertGreaterEqual(self.waits[0], commands._SYSTEMIC_RETRY_FLOOR)
+                self.assertEqual(len(said), 1, f"{handler}: one heads-up, got {said}")
+                self.assertIn("nothing was skipped", said[0].lower())
+                self.assertEqual(len(gs.queue), 0)
+
+
+def _run_loadall(bot, n=3):
+    """!!loadall with a ready pending playlist of n tracks (queries u0, u1, ...). Returns
+    every string it sent."""
+    bot.pending_playlists = {str(_CTX_CHANNEL_ID): {
+        "tracks": [{"url": f"u{i}", "title": f"u{i}"} for i in range(n)]}}
+    ctx = _Ctx(bot)
+    asyncio.run(commands.MusicCog.loadall.callback(SimpleNamespace(bot=bot), ctx))
+    return ctx.sent
+
+
+class _ChainWitness(_Player):
+    """play() notes the auto-next chain's task and generation at the moment it runs."""
+
+    def __init__(self, vc):
+        super().__init__(vc)
+        self.gs = None
+        self.seen = []
+
+    async def play(self, query, resolved_info, resolved_at):
+        self.seen.append((self.gs.auto_next_task, self.gs.auto_next_gen))
+        return await super().play(query, resolved_info, resolved_at)
+
+
+class TestLoadallPlaybackStart(unittest.TestCase):
+    """!!loadall starts playback when nothing is playing. It popped a track and called
+    play() with the auto-next chain still armed, breaking the disarm invariant (a chain
+    that wakes mid-setup starts a second play()). On any failure it posted "Skipping
+    track" and lost the track: during a YouTube block, or when voice dropped mid-play.
+    """
+
+    def setUp(self):
+        self._patches = [
+            patch.object(commands, "check_channel", side_effect=self._true),
+            patch.object(commands, "build_player_view", return_value=None),
+            patch.object(commands, "send_new_np", side_effect=self._noop),
+            patch.object(commands, "_schedule_prefetch", return_value=None),
+            patch.object(commands, "_start_auto_next", MagicMock()),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    async def _true(ctx):
+        return True
+
+    @staticmethod
+    async def _noop(*a, **k):
+        return None
+
+    @staticmethod
+    def _queued(gs):
+        return [t.query for t in gs.queue.list()]
+
+    def test_an_armed_chain_is_disarmed_before_play(self):
+        vc = _VC(connected=True)
+        player = _ChainWitness(vc)
+        gs = _GS(player)
+        player.gs = gs
+        armed = MagicMock()
+        armed.done.return_value = False
+        gs.auto_next_task = armed
+        gs.auto_next_gen = 7
+        bot = _Bot(gs, _Guild(vc))
+
+        _run_loadall(bot)
+
+        armed.cancel.assert_called_once()
+        self.assertEqual(player.seen, [(None, 8)], "play() ran with the old chain still armed")
+        self.assertEqual(player.play_calls, ["u0"])
+        commands._start_auto_next.assert_called_once()
+
+    def test_a_block_keeps_the_track_and_rearms_the_chain(self):
+        for name, error in _block_errors().items():
+            with self.subTest(error=name):
+                commands._start_auto_next.reset_mock()
+                vc = _VC(connected=True)
+                gs = _GS(_Player(vc, error=error))
+                bot = _Bot(gs, _Guild(vc))
+
+                sent = _run_loadall(bot)
+
+                self.assertEqual(self._queued(gs), ["u0", "u1", "u2"], "the first track goes back in front")
+                self.assertIsNone(gs.queue.current)
+                commands._start_auto_next.assert_called_once()
+                self.assertEqual(commands._start_auto_next.call_args.args[1], _CTX_CHANNEL_ID)
+                self.assertFalse(any("skipping track" in m.lower() for m in sent), sent)
+
+    def test_a_voice_drop_during_play_keeps_the_track_and_rearms_the_chain(self):
+        vc = _VC(connected=True)
+
+        def go_down(n):
+            if n >= 2:   # 1 = the check before play(), 2 = the recovery's re-check
+                vc._connected = False
+        vc.on_check = go_down
+        gs = _GS(_Player(vc, error=RuntimeError("Not connected to a voice channel")))
+        bot = _Bot(gs, _Guild(vc))
+
+        sent = _run_loadall(bot)
+
+        self.assertEqual(self._queued(gs), ["u0", "u1", "u2"])
+        self.assertIsNone(gs.queue.current)
+        commands._start_auto_next.assert_called_once()
+        self.assertFalse(any("skipping track" in m.lower() for m in sent), sent)
+
+    def test_voice_down_before_play_queues_the_tracks_and_leaves_the_chain_alone(self):
+        """A chain waiting a voice drop out plays the new tracks itself once voice is back.
+        Disarming it to start playback here would cancel that wait, so nothing is popped or
+        cancelled: the manual skips refuse for the same reason."""
+        vc = _VC(connected=False)
+        player = _Player(vc)
+        gs = _GS(player)
+        waiting = MagicMock()
+        waiting.done.return_value = False
+        gs.auto_next_task = waiting
+        gs.auto_next_gen = 7
+        bot = _Bot(gs, _Guild(vc))
+
+        sent = _run_loadall(bot)
+
+        self.assertEqual(self._queued(gs), ["u0", "u1", "u2"])
+        self.assertIsNone(gs.queue.current)
+        waiting.cancel.assert_not_called()
+        self.assertIs(gs.auto_next_task, waiting)
+        self.assertEqual(gs.auto_next_gen, 7)
+        commands._start_auto_next.assert_not_called()
+        self.assertFalse(any("skipping track" in m.lower() for m in sent), sent)
+        self.assertEqual(sum("voice" in m.lower() for m in sent), 1, sent)
+
+    def test_a_dead_track_with_healthy_voice_is_still_skipped(self):
+        from yt_dlp.utils import DownloadError
+        vc = _VC(connected=True)
+        error = DownloadError("ERROR: [youtube] abc123: Sign in to confirm your age. "
+                              "This video may be inappropriate for some users.")
+        gs = _GS(_Player(vc, error=error))
+        bot = _Bot(gs, _Guild(vc))
+
+        sent = _run_loadall(bot)
+
+        self.assertEqual(self._queued(gs), ["u1", "u2"], "a dead track must not be requeued")
+        commands._start_auto_next.assert_called_once()   # re-armed without it
+        self.assertEqual(sum("skipping track" in m.lower() for m in sent), 1, sent)
 
 
 class TestVoiceDebugLogging(unittest.TestCase):
