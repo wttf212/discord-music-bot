@@ -117,11 +117,49 @@ class TestCorruptFileTolerance(SettingsTestCase):
             f.write("{not json")
         self.assertEqual(self.gs.load_settings(), {})
 
-    def test_settings_recoverable_after_corruption(self):
-        with open(self.path, "w", encoding="utf-8") as f:
-            f.write("{truncated")
+    def test_a_setter_never_overwrites_a_corrupt_file(self):
+        """This used to rewrite the file from {}: the setter worked, and every other
+        guild's settings were destroyed. A file that won't parse may be half-way
+        through a hand edit, or one brace short of fine, so it is left for a human.
+        Reads keep falling back to defaults meanwhile (the test above)."""
+        corrupt = b'{"1": {"bitrate": 128}, "2": {"allowed_channel": "55"'
+        with open(self.path, "wb") as f:
+            f.write(corrupt)
+        with self.assertRaises(ValueError):   # json.JSONDecodeError
+            self.gs.set_bitrate("1", 256)
+        with open(self.path, "rb") as f:
+            self.assertEqual(f.read(), corrupt)
+
+
+class TestFailedReadNeverWipesTheFile(SettingsTestCase):
+    """load_settings() reads an unreadable file as {}, and setters used to save back
+    whatever it returned. One failed read let the next setter, in any guild, replace
+    the whole file with that one guild's entry."""
+
+    BEFORE = {"1": {"bitrate": 128}, "2": {"allowed_channel": "55", "admins": ["7"]}}
+
+    def test_a_failed_read_does_not_wipe_the_other_guilds(self):
+        """Transient, e.g. another process holding the file open on Windows."""
+        self.gs.save_settings(self.BEFORE)
+        real_open = open
+        failures = [PermissionError(13, "The process cannot access the file")]
+
+        def flaky_open(path, mode="r", *args, **kwargs):
+            if "r" in mode and failures:
+                raise failures.pop()
+            return real_open(path, mode, *args, **kwargs)
+
+        with patch.object(self.gs, "open", flaky_open, create=True):
+            with self.assertRaises(OSError):
+                self.gs.set_bitrate("1", 256)
+        self.assertEqual(self.gs.load_settings(), self.BEFORE)
+        self.gs.set_bitrate("1", 256)   # the file reads again: the change lands normally
+        self.assertEqual(self.gs.load_settings(), {**self.BEFORE, "1": {"bitrate": 256}})
+
+    def test_a_missing_file_still_starts_empty(self):
+        self.assertFalse(os.path.exists(self.path))
         self.gs.set_bitrate("1", 256)
-        self.assertEqual(self.gs.get_bitrate("1"), 256)
+        self.assertEqual(self.gs.load_settings(), {"1": {"bitrate": 256}})
 
 
 if __name__ == "__main__":

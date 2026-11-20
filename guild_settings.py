@@ -20,7 +20,13 @@ _settings_lock = threading.RLock()
 _REPLACE_TIMEOUT = 2.0
 
 
-def load_settings() -> dict:
+def load_settings(strict: bool = False) -> dict:
+    """All guilds' settings; {} when there is no file yet.
+
+    A file that exists but can't be read or parsed also reads as {}, so the bot runs
+    on defaults instead of failing every command. `strict` raises instead: a caller
+    that saves back what it loaded must never take an unreadable file for an empty one.
+    """
     if not os.path.isfile(SETTINGS_FILE):
         return {}
     with _settings_lock:
@@ -28,8 +34,9 @@ def load_settings() -> dict:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError) as e:
-            # A corrupt file must not take the bot down on every settings read.
             print(f"[guild_settings] Could not read {SETTINGS_FILE}: {e}")
+            if strict:
+                raise
             return {}
 
 
@@ -80,9 +87,14 @@ def _guild_entry(guild_id: str):
     load -> mutate -> save, so two setters for DIFFERENT guilds interleaving there
     would have the later save write back a stale snapshot and silently drop the
     earlier guild's change.
+
+    The read is strict for the same reason. Saving the {} a failed read falls back
+    to would replace every guild's settings with this one guild's. Raising leaves
+    the file as it is: a transient failure clears on the next try, and a corrupt
+    file waits for a human.
     """
     with _settings_lock:
-        settings = load_settings()
+        settings = load_settings(strict=True)
         entry = settings.setdefault(guild_id, {})
         yield entry
         save_settings(settings)
