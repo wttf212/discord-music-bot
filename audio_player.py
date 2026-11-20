@@ -1166,13 +1166,26 @@ class _CurlStreamReader:
         return self._returncode if self._finished.is_set() else None
 
     def terminate(self):
+        # Never close stdout on the caller's thread: stop_playback() calls this on the
+        # event loop. discord.py's popen-stdin-writer thread can be parked in
+        # stdout.read(8192) holding the BufferedReader lock, and with the CDN stalled and
+        # under 8 KiB in the pipe that read only returns once libcurl's low-speed abort
+        # (~30 s) ends the pump. close() waits on the same lock, so closing inline froze
+        # every guild for that long. _closed stops the pump writing anything more; the
+        # close itself runs on a daemon thread.
+        if self._closed.is_set():
+            return
         self._closed.set()
+        threading.Thread(target=self._close_stdout, daemon=True,
+                         name="curl-cdn-reader-close").start()
+
+    kill = terminate
+
+    def _close_stdout(self):
         try:
             self.stdout.close()   # unblocks a pump thread parked in os.write
         except Exception:
             pass
-
-    kill = terminate
 
     def wait(self, timeout=None):
         if not self._finished.wait(timeout):
