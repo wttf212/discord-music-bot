@@ -629,6 +629,9 @@ async def resolve_audio(query: str, client: str, debug: bool = False,
       (3 attempts, base 5s, ±25% jitter), sleeping on the event loop between attempts.
       Surfaces video-unavailable / sign-in / age-restricted / geo-blocked errors
       immediately — retrying those accelerates IP bans.
+    * A YouTube block (is_systemic_resolve_error) is not retried either. Every attempt
+      meets the shared cooldown inside get_audio_url (_resolve_gated), so during a
+      block a cache miss fails at once with YouTubeBlockedError and sends no request.
     """
     cached = _resolve_cache_get(query)
     if cached is not None:
