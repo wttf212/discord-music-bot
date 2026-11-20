@@ -641,19 +641,22 @@ class TestChildProcessPriority(unittest.TestCase):
 
     def test_docker_runs_deno_through_a_nice_wrapper_found_first_on_path(self):
         src = self._read("Dockerfile")
-        self.assertIn("nice -n 10", src)
-        self.assertIn('/bin/deno "$@"', src)
-        wrapper_path = next(line for line in src.splitlines()
-                            if line.startswith("ENV PATH=") and "/opt/nice-bin" in line)
-        self.assertTrue(wrapper_path.startswith('ENV PATH="/opt/nice-bin:'),
+        self.assertTrue("exec nice -n 10 %s/bin/deno" in src and '"$DENO_INSTALL"' in src,
+                        "no wrapper exec'ing the real deno at nice 10")
+        self.assertTrue('/bin/deno "$@"' in src, "the wrapper must pass deno's arguments on")
+        path_lines = [line for line in src.splitlines()
+                      if line.startswith("ENV PATH=") and "/opt/nice-bin" in line]
+        self.assertEqual(len(path_lines), 1, "no ENV PATH line puts the wrapper on PATH")
+        self.assertTrue(path_lines[0].startswith('ENV PATH="/opt/nice-bin:'),
                         "the wrapper must come before the real deno on PATH")
-        self.assertLess(src.index("deno.land/install.sh"), src.index(wrapper_path),
+        self.assertLess(src.index("deno.land/install.sh"), src.index(path_lines[0]),
                         "PATH must be extended after Deno's own ENV PATH line")
 
     def test_bgutil_server_starts_below_normal_priority_on_linux(self):
         src = self._read("main.py")
-        self.assertIn("os.nice(10)", src)
-        self.assertIn('preexec_fn=_lower_priority if os.name == "posix" else None', src)
+        self.assertTrue("os.nice(10)" in src, "bgutil's preexec_fn must lower its priority")
+        self.assertTrue('preexec_fn=_lower_priority if os.name == "posix" else None' in src,
+                        "the bgutil server must start through the preexec_fn on POSIX")
 
 
 if __name__ == "__main__":
