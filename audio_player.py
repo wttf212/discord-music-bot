@@ -291,6 +291,8 @@ def is_permanent_resolve_error(exc: BaseException) -> bool:
     A YouTube block is never this, though it is not retryable either: it is a verdict on
     this server, and the next track would fail the same way (is_systemic_resolve_error).
     """
+    if isinstance(exc, StreamFailedError):
+        return False  # its text can quote a "Forbidden" from the CDN; see the class
     return not _is_retryable_ytdlp_error(exc) and not is_systemic_resolve_error(exc)
 
 
@@ -963,6 +965,13 @@ class _StreamStartError(RuntimeError):
     """The in-process reader could not open the stream; caller falls back."""
 
 
+class StreamFailedError(RuntimeError):
+    """A freshly resolved track's stream gave no audio at all: it never opened, or ended
+    before the first frame. That proves nothing about the track (a CDN refusing every
+    fresh URL looks exactly like this), so it is a counted failure, never a dead track,
+    whatever the stream's stderr happened to say."""
+
+
 class _CurlStreamReader:
     """Streams a progressive CDN URL into a pipe FFmpeg can read.
 
@@ -1556,7 +1565,8 @@ class AudioPlayer:
         ``prefetched_info`` is an optional get_audio_url() result resolved earlier
         (background prefetch or enqueue). When still fresh it is reused instead of
         resolving again, collapsing the transition resolve to an instant handoff;
-        a stale/revoked cached URL transparently falls back to a fresh resolve.
+        a stale/revoked cached URL transparently falls back to a fresh resolve. A stream
+        that gives no audio even from a fresh resolve raises StreamFailedError.
 
         Architecture: an in-process curl_cffi reader (or, for sources it does not cover,
         the yt-dlp subprocess) pipes audio bytes to FFmpeg's stdin (pipe=True).
@@ -1646,7 +1656,7 @@ class AudioPlayer:
                     if self._debug:
                         print("[debug][player] Cached stream URL failed immediately — re-resolving fresh")
                     continue
-                raise RuntimeError(
+                raise StreamFailedError(
                     f"audio stream failed to open ({proc.poll()}) before playback started: {stderr[:500]}"
                 )
 
@@ -1672,12 +1682,15 @@ class AudioPlayer:
                 threading.Thread(target=_drain_stderr, args=(proc, "[yt-dlp-pipe]"), daemon=True).start()
 
             # Block in the executor until FFmpeg produces its first PCM frame. An empty
-            # frame from a cached URL means the stream produced no audio (stale/revoked) —
-            # tear down and re-resolve fresh. A fresh resolve is accepted as-is.
+            # frame means the stream produced no audio. From a cached URL that is
+            # stale/revoked — tear down and re-resolve fresh. From a fresh resolve it is a
+            # failure: accepting it "played" the track for 0 s and reset auto-next's
+            # breaker, so a CDN refusing every fresh URL walked the whole queue.
             frame = await loop.run_in_executor(_STREAM_EXECUTOR, src.read)
-            if not frame and used_cache:
+            if not frame:
                 if self._debug:
-                    print("[debug][player] Cached stream URL produced no audio — re-resolving fresh")
+                    print("[debug][player] Stream produced no audio — "
+                          + ("re-resolving fresh" if used_cache else "failing the play"))
                 try:
                     proc.terminate()
                 except Exception:
@@ -1690,6 +1703,8 @@ class AudioPlayer:
                 self._ytdlp_proc = None
                 candidate = None
                 invalidate_resolve_cache(url_or_query)
+                if not used_cache:
+                    raise StreamFailedError("The audio stream ended before producing any audio")
                 continue
 
             source = src
