@@ -1659,6 +1659,19 @@ class AudioPlayer:
             return self._guild_bitrates.get(guild_id, self._default_bitrate)
         return self._default_bitrate
 
+    def _encoder_settings(self) -> dict:
+        """Opus settings for VoiceClient.play(), which builds a NEW encoder from them for
+        every PCM source. Tuning voice_client.encoder before play() is thrown away.
+
+        discord.py's defaults (FEC on, 15% expected loss, signal 'auto') spend ~15% of
+        the bitrate on error correction and don't optimise for music. With FEC off,
+        discord.py leaves the expected loss at libopus's 0%.
+        """
+        guild_id = self._voice_client.guild.id if hasattr(self._voice_client, "guild") else None
+        # opus.Encoder raises ValueError outside 16-512 kbps; !bitrate accepts 1-512.
+        kbps = min(512, max(16, self.get_bitrate_for_guild(guild_id) // 1000))
+        return {"bitrate": kbps, "fec": False, "bandwidth": "full", "signal_type": "music"}
+
     def get_eq_for_guild(self, guild_id: int | None) -> tuple[int, int]:
         """Return (bass_db, treble_db) for this guild, defaulting to (0, 0) = flat."""
         if guild_id is None:
@@ -1874,26 +1887,11 @@ class AudioPlayer:
         built.append(source)
         await loop.run_in_executor(_STREAM_EXECUTOR, source.prefill)
 
-        # Configure Opus encoder before play() so first frames use music settings.
-        # discord.py defaults: fec=True, expected_packet_loss=0.15, signal_type='auto'
-        # These defaults waste ~15% of bitrate on error correction and don't optimise for music.
-        encoder = getattr(self._voice_client, 'encoder', None)
-        if encoder:
-            try:
-                guild_id = self._voice_client.guild.id if hasattr(self._voice_client, 'guild') else None
-                bitrate_bps = self.get_bitrate_for_guild(guild_id)
-                encoder.set_signal_type('music')
-                encoder.set_fec(False)
-                encoder.set_expected_packet_loss_percent(0.01)
-                encoder.set_bitrate(bitrate_bps // 1000)
-                encoder.set_bandwidth('full')
-                if self._debug:
-                    print(f"[debug][player] Opus encoder: signal=music, bitrate={bitrate_bps // 1000}kbps, FEC=off, PLP=0%, bandwidth=full")
-            except Exception as e:
-                if self._debug:
-                    print(f"[debug][player] Could not configure opus encoder: {e}")
+        encoder_settings = self._encoder_settings()
+        if self._debug:
+            print(f"[debug][player] Opus encoder: signal=music, bitrate={encoder_settings['bitrate']}kbps, FEC=off, PLP=0%, bandwidth=full")
 
-        self._voice_client.play(source, after=after_playback)
+        self._voice_client.play(source, after=after_playback, **encoder_settings)
 
         if self._debug:
             print(f"[debug][player] Playback started for: {title}")
@@ -2015,20 +2013,6 @@ class AudioPlayer:
             self.current_track_title = None
             loop.call_soon_threadsafe(self._playback_done.set)
 
-        # Configure Opus encoder before play() so first frames use music settings.
-        encoder = getattr(self._voice_client, "encoder", None)
-        if encoder:
-            try:
-                guild_id = self._voice_client.guild.id if hasattr(self._voice_client, "guild") else None
-                bitrate_bps = self.get_bitrate_for_guild(guild_id)
-                encoder.set_signal_type("music")
-                encoder.set_fec(False)
-                encoder.set_expected_packet_loss_percent(0.01)
-                encoder.set_bitrate(bitrate_bps // 1000)
-                encoder.set_bandwidth("full")
-            except Exception:
-                pass
-
         # Prime with one frame so the audio thread's first read() is instant.
         # Reduced probesize means FFmpeg produces the first frame within ~100ms,
         # so a 3-second timeout is conservative. Falls back gracefully on slow stations.
@@ -2042,7 +2026,7 @@ class AudioPlayer:
         except asyncio.TimeoutError:
             pass
 
-        self._voice_client.play(source, after=after_playback)
+        self._voice_client.play(source, after=after_playback, **self._encoder_settings())
 
         if self._debug:
             print(f"[debug][player] Radio playback started: {title}")

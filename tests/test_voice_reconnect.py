@@ -254,6 +254,7 @@ class _Ctx:
 
     def __init__(self, bot):
         self.bot = bot
+        self.interaction = None   # what commands.Context has for a prefix command
         self.guild = SimpleNamespace(id=1, voice_client=None)
         self.channel = SimpleNamespace(id=_CTX_CHANNEL_ID)
         self.author = SimpleNamespace(id=42)
@@ -727,7 +728,10 @@ class TestManualAdvanceRecovery(unittest.TestCase):
                 self.assertFalse(any("skipping track" in m.lower() for m in sent),
                                   f"{handler}: false 'skipping' message on a requeue, got {sent}")
 
-    def test_dead_track_with_healthy_voice_does_not_requeue_or_rearm(self):
+    def test_dead_track_with_healthy_voice_is_skipped_and_rearms(self):
+        """Never requeued, so it is never retried. The chain is re-armed, though: the
+        advance had cancelled it, and leaving it off stopped auto-play on the dead
+        track (tests/test_manual_dead_track.py runs that chain)."""
         from yt_dlp.utils import DownloadError
         for handler in self.HANDLERS:
             with self.subTest(handler=handler):
@@ -744,7 +748,10 @@ class TestManualAdvanceRecovery(unittest.TestCase):
 
                 self.assertNotIn(track, gs.queue.list(),
                                   f"{handler}: a genuinely dead track must not be requeued")
-                commands._start_auto_next.assert_not_called()
+                commands._start_auto_next.assert_called_once()
+                self.assertEqual(commands._start_auto_next.call_args.args[1],
+                                  self._expected_channel_id(handler),
+                                  f"{handler}: re-armed on the wrong channel")
                 self.assertEqual(sum("skipping track" in m.lower() for m in sent), 1,
                                   f"{handler}: {sent}")
 

@@ -57,6 +57,7 @@ class GuildState:
     autoplay_pool: list = field(default_factory=list)   # cached related-track URLs to draw from
     autoplay_history: set = field(default_factory=set)  # played URLs, to avoid repeats
     np_message_id: int | None = None
+    np_views: list = field(default_factory=list)  # views on that card: commands._release_np_views
     current_text_channel_id: int | None = None
     fairness_pct: int = 50
     prev_votes: set = field(default_factory=set)

@@ -1759,6 +1759,12 @@ async def check_channel(ctx: commands.Context) -> bool:
     if str(ctx.channel.id) == allowed:
         return True
 
+    # A slash command has no message to delete, and unless its interaction is
+    # answered Discord shows "The application did not respond".
+    if ctx.interaction:
+        await _respond(ctx.interaction, f"Please use commands in <#{allowed}>.")
+        return False
+
     # Wrong channel: delete and notify
     try:
         await ctx.message.delete()
@@ -1782,6 +1788,27 @@ async def _do_update_np_embed(bot, channel, msg_id, view):
         await channel.get_partial_message(msg_id).edit(view=view)
     except Exception as e:
         print(f"[commands] Failed to update NP card: {e}")
+        return
+    gs = bot.get_guild_state(channel.guild.id)
+    if gs.np_message_id == msg_id:
+        gs.np_views.append(view)
+    else:
+        view.stop()  # the card was replaced while this edit was in flight
+
+
+def _release_np_views(gs):
+    """Stop every view on a Now-Playing card that is being replaced or deleted.
+
+    PlayerView never times out, and discord.py's ViewStore keeps a view until it is
+    stopped: deleting the message doesn't drop it, so every card ever sent stayed in
+    memory. Each in-place edit stores another view on the same card, and they're all
+    stopped together here. Never stop one while its card is live: the store
+    unregisters by custom_id, which would take the newer view's buttons with it.
+    """
+    views, gs.np_views = gs.np_views, []
+    for view in views:
+        view.stop()
+
 
 async def update_np_embed(bot, channel_id: int, view: "PlayerView"):
     """Edit the existing NP message card in-place (no new message)."""
@@ -1808,6 +1835,7 @@ async def _clear_np(bot, channel_id: int):
     gs = bot.get_guild_state(channel.guild.id)
     msg_id = gs.np_message_id
     gs.np_message_id = None
+    _release_np_views(gs)
     if msg_id:
         await _safe_delete(channel.get_partial_message(msg_id))
 
@@ -2079,10 +2107,12 @@ async def send_new_np(bot, channel_id: int, view: "PlayerView"):
     old_msg_id = gs.np_message_id
     if old_msg_id:
         asyncio.create_task(_safe_delete(channel.get_partial_message(old_msg_id)))
+    _release_np_views(gs)
 
     try:
         new_msg = await channel.send(view=view)
         gs.np_message_id = new_msg.id
+        gs.np_views.append(view)
     except Exception as e:
         print(f"[commands] Failed to send NP message: {e}")
 
@@ -2890,6 +2920,8 @@ class MusicCog(commands.Cog):
             return
         if not ctx.guild:
             return
+        if ctx.interaction:
+            await _ack(ctx.interaction)  # geocoding + weather refresh outlast the 3 s token
         if not await self._check_admin(ctx):
             return
         gid = str(ctx.guild.id)
@@ -3004,6 +3036,8 @@ class MusicCog(commands.Cog):
             return
         if not ctx.guild:
             return
+        if ctx.interaction:
+            await _ack(ctx.interaction)  # a cold resolve outlasts the 3 s token
         if position is None:
             await ctx.send(f"Usage: `{self.bot.command_prefix}skipto <position>`")
             return
@@ -3028,20 +3062,23 @@ class MusicCog(commands.Cog):
             return
         try:
             info = await gs.player.play(next_track.query, next_track.resolved_info, next_track.resolved_at)
-            next_track.title = info["title"]
-            next_track.thumbnail = info.get("thumbnail", "")
-            next_track.url = info.get("webpage_url", "")
-            view = build_player_view(self.bot, next_track.title,
-                                     thumbnail=next_track.thumbnail, url=next_track.url,
-                                     requester_name=_get_requester_name(self.bot, next_track.requested_by, ctx.guild),
-                                     queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
-            await ctx.send(f"Jumped to **{next_track.title}**.", delete_after=3)
-            await send_new_np(self.bot, channel_id, view)
-            _start_auto_next(self.bot, channel_id, ctx.guild.id)
         except Exception as e:
             print(f"[commands] Manual advance failed (guild {ctx.guild.id}): {e}")
             if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track, e):
                 await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+            return
+        # Armed before any reply: a reply that fails (a dead interaction token) must
+        # not leave auto-play off after this track.
+        _start_auto_next(self.bot, channel_id, ctx.guild.id)
+        next_track.title = info["title"]
+        next_track.thumbnail = info.get("thumbnail", "")
+        next_track.url = info.get("webpage_url", "")
+        view = build_player_view(self.bot, next_track.title,
+                                 thumbnail=next_track.thumbnail, url=next_track.url,
+                                 requester_name=_get_requester_name(self.bot, next_track.requested_by, ctx.guild),
+                                 queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
+        await ctx.send(f"Jumped to **{next_track.title}**.", delete_after=3)
+        await send_new_np(self.bot, channel_id, view)
 
     @commands.hybrid_command(name="clear", description="Clear the upcoming queue (keeps the current track)")
     async def clear(self, ctx: commands.Context):
@@ -3447,21 +3484,33 @@ def _live_voice_client(bot, gs, guild_id):
 
 
 def _recover_manual_advance(bot, gs, guild_id, channel_id, track, error) -> bool:
-    """A manual advance's play() failed through no fault of the track: voice died
-    *during* it, or YouTube is refusing this server (is_systemic_resolve_error, the
-    shared cooldown's instant refusal included). Put the track back and hand control
-    to the auto-next chain, which knows how to wait either one out and tells the
-    channel why. Its breaker still bounds the retries during a block.
+    """A manual advance's play() failed after the advance had cancelled the auto-next
+    chain. Hand control to a fresh chain, or auto-play stops on the failed track.
 
-    False for any other failure while voice is fine — a genuinely dead track must keep
-    its existing skip-and-move-on behaviour; requeueing a permanently broken track and
-    re-arming the chain would retry it forever.
+    The failure was no fault of the track: voice died *during* the play(), or YouTube
+    is refusing this server (is_systemic_resolve_error, the shared cooldown's instant
+    refusal included). Put the track back; the chain knows how to wait either one out
+    and tells the channel why. Its breaker still bounds the retries during a block.
+    True: nothing was skipped.
+
+    Otherwise the track itself failed. It is not put back (a permanently broken track
+    would be retried forever), and the chain moves on from it as it does from a track
+    that fails under it. A dead one (is_permanent_resolve_error) never comes back:
+    loop "off" files it into history, and a loop drops it from its rotation here, as
+    _auto_next does, or next() would hand it straight back. False: the caller reports
+    the skip. A newer advance (or a stop) that moved on while this play() ran owns the
+    chain, so nothing is touched then: arming one too would run two play()s.
     """
     if _live_voice_client(bot, gs, guild_id) is None or is_systemic_resolve_error(error):
         if track is not None:
             gs.queue.requeue_front(track)
         _start_auto_next(bot, channel_id, guild_id)
         return True
+    if gs.queue.current is not track:
+        return False
+    if is_permanent_resolve_error(error) and gs.queue.loop_mode != "off":
+        gs.queue.current = None
+    _start_auto_next(bot, channel_id, guild_id)
     return False
 
 
