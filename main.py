@@ -25,11 +25,22 @@ _bgutil_path = os.path.join(_base_dir, _bgutil_name)
 if not os.path.isfile(_bgutil_path):
     _bgutil_path = shutil.which(_bgutil_name)  # fallback: check PATH
 _bgutil_proc = None
+
+
+def _lower_priority():
+    """preexec_fn: start the child at nice 10, so its CPU bursts (minting a PO token for
+    every resolve) yield to discord.py's audio sender thread on a small host instead of
+    competing with it. Deno gets the same treatment from a wrapper in the Dockerfile."""
+    os.nice(10)
+
+
 if _bgutil_path:
     try:
         _bgutil_proc = subprocess.Popen(
             [_bgutil_path, "server", "--host", "127.0.0.1"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            # Runs before any thread exists (module import), so preexec_fn is safe here.
+            preexec_fn=_lower_priority if os.name == "posix" else None,
         )
         print(f"[main] bgutil-pot server started (PID {_bgutil_proc.pid})")
     except Exception as e:

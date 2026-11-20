@@ -12,11 +12,11 @@ from discord.ext import commands
 from discord import app_commands
 from track_queue import Track
 from audio_player import (
-    is_playlist_url, extract_playlist_info, get_audio_url_with_retry,
+    is_playlist_url, extract_playlist_info, resolve_audio, enumerate_playlist,
     is_stream_info_fresh, get_related_tracks, _youtube_video_id,
     warm_stream_url, _can_stream_in_process, is_permanent_resolve_error,
     is_systemic_resolve_error, youtube_block_remaining, YouTubeBlockedError, _fmt_wait,
-    _RESOLVE_EXECUTOR, _STREAM_EXECUTOR,
+    _RESOLVE_LANE, _PLAYLIST_LANE, _STREAM_EXECUTOR,
 )
 from spotify import is_spotify_url, resolve_spotify, SpotifyError
 import weather
@@ -804,7 +804,6 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
     voice_channel = ctx.author.voice.channel
     user_id = str(ctx.author.id)
     channel_id = ctx.channel.id
-    loop = asyncio.get_event_loop()
 
     url = result["url"]
     r_title = result.get("title") or url
@@ -839,11 +838,10 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
 
     # Start-playback path: overlap the URL resolve with the voice connect.
     yt_cfg = bot.config.get("youtube", {})
-    resolve_fut = loop.run_in_executor(
-        _RESOLVE_EXECUTOR, get_audio_url_with_retry, url,
-        yt_cfg.get("client", "web"), bot.config.get("debug", False),
+    resolve_fut = asyncio.create_task(resolve_audio(
+        url, yt_cfg.get("client", "web"), bot.config.get("debug", False),
         yt_cfg.get("cookies_file") or None,
-    )
+    ))
 
     if not voice_client or not voice_client.is_connected():
         if voice_client:  # stale client — force-disconnect before reconnecting
@@ -1719,6 +1717,8 @@ def _discard_future(fut):
     """Retrieve and swallow a future's result/exception so a discarded in-flight
     resolve (e.g. after a failed voice connect) doesn't log 'never retrieved'."""
     def _swallow(f):
+        if f.cancelled():
+            return      # result() would raise CancelledError into the loop's handler
         try:
             f.result()
         except Exception:
@@ -1727,6 +1727,14 @@ def _discard_future(fut):
         fut.add_done_callback(_swallow)
     except Exception:
         pass
+
+
+def _abandon_enumeration(fut):
+    """Drop a playlist enumeration nobody will read (superseded or expired offer, failed
+    voice connect or first track). Cancelling stops its worker before the next page
+    request; merely discarding it let a 2000-track enumeration page YouTube for ~20 s."""
+    fut.cancel()
+    _discard_future(fut)
 
 
 # Per-(guild, user, action) button cooldowns. Stops machine-gunning the card
@@ -1914,8 +1922,12 @@ async def _prefetch_next_track(bot, guild_id):
             # The floor is enforced on EVERY iteration, not just before the loop: a run
             # of dead tracks would otherwise fire back-to-back resolves and punch
             # straight through the rate limit that exists to protect the IP.
-            wait = _PREFETCH_MIN_INTERVAL - (time.monotonic() - _last_prefetch_monotonic)
-            if wait > 0:
+            # And it is RE-CHECKED after every sleep: guilds that hit the floor together
+            # compute the same wait and wake together, so a single check let them all
+            # fire at once. The claim below follows the check with no await in between,
+            # so exactly one waker takes each slot and the rest sleep again.
+            while (wait := _PREFETCH_MIN_INTERVAL
+                    - (time.monotonic() - _last_prefetch_monotonic)) > 0:
                 if debug:
                     print(f"[debug][prefetch] throttled — deferring {wait:.1f}s")
                 await asyncio.sleep(wait)
@@ -1936,10 +1948,8 @@ async def _prefetch_next_track(bot, guild_id):
                 return
             _last_prefetch_monotonic = time.monotonic()
             try:
-                info = await asyncio.get_event_loop().run_in_executor(
-                    _RESOLVE_EXECUTOR, get_audio_url_with_retry,
-                    track.query, yt_client, False, cookies_file
-                )
+                info = await resolve_audio(track.query, yt_client, False, cookies_file,
+                                           background=True)
                 break
             except Exception as e:
                 # Removed / private / geo-blocked: it can never play, so take it out now
@@ -1998,9 +2008,7 @@ async def _autoplay_pick(bot, guild_id, seed):
         if not gs.autoplay_pool:
             yt_client = bot.config.get("youtube", {}).get("client", "web")
             seed_url = seed.url or seed.query
-            related = await asyncio.get_event_loop().run_in_executor(
-                _RESOLVE_EXECUTOR, get_related_tracks, seed_url, yt_client, 25
-            )
+            related = await _PLAYLIST_LANE.run(get_related_tracks, seed_url, yt_client, 25)
             gs.autoplay_pool = [t for t in related if t.get("url") and t["url"] not in gs.autoplay_history]
         while gs.autoplay_pool:
             cand = gs.autoplay_pool.pop(0)
@@ -2052,10 +2060,8 @@ async def _resolve_track_info(bot, channel_id: int, track: Track):
     try:
         yt_client = bot.config.get("youtube", {}).get("client", "web")
         cookies_file = bot.config.get("youtube", {}).get("cookies_file") or None
-        info = await asyncio.get_event_loop().run_in_executor(
-            _RESOLVE_EXECUTOR, get_audio_url_with_retry,
-            track.query, yt_client, False, cookies_file
-        )
+        info = await resolve_audio(track.query, yt_client, False, cookies_file,
+                                   background=True)
         track.title = info["title"]
         track.thumbnail = info.get("thumbnail", "")
         track.url = info.get("webpage_url", "")
@@ -2284,7 +2290,6 @@ class MusicCog(commands.Cog):
         # Playlist detection: play first track, offer to add the rest
         # ---------------------------------------------------------------
         if is_playlist_url(query):
-            loop = asyncio.get_event_loop()
             yt_client = self.bot.config.get("youtube", {}).get("client", "web")
             channel_id = ctx.channel.id
             user_id = str(ctx.author.id)
@@ -2300,8 +2305,8 @@ class MusicCog(commands.Cog):
                 old = self.bot.pending_playlists.get(str(channel_id))
                 if old is not None and old.get("future") is not None:
                     # A second playlist offer for this channel superseded an
-                    # in-flight enumeration — drop its future so it isn't orphaned.
-                    _discard_future(old["future"])
+                    # in-flight enumeration — stop it rather than let it page on.
+                    _abandon_enumeration(old["future"])
 
                 entry = {
                     "query": query, "user_id": user_id, "guild_id": guild_id,
@@ -2315,7 +2320,7 @@ class MusicCog(commands.Cog):
                     if self.bot.pending_playlists.get(str(channel_id)) is entry:
                         self.bot.pending_playlists.pop(str(channel_id), None)
                         if entry.get("future"):
-                            _discard_future(entry["future"])
+                            _abandon_enumeration(entry["future"])
                         current = gs.queue.current
                         if current:
                             try:
@@ -2340,6 +2345,10 @@ class MusicCog(commands.Cog):
                 try:
                     full_info = await full_fut
                     action, extra, remaining = _resolve_offer_outcome(full_info, playlist_title)
+                except asyncio.CancelledError:
+                    if asyncio.current_task().cancelling():
+                        raise       # this command itself is being cancelled
+                    return          # enumeration abandoned: the replacement owns the card
                 except Exception as e:
                     print(f"[commands] Playlist enumeration failed after start: {e}")
                     action, extra, remaining = "error", _error_offer_text(playlist_title), []
@@ -2366,7 +2375,7 @@ class MusicCog(commands.Cog):
                 # instead of blocking on a full "Fetching playlist info…" enumeration.
                 status_msg = await ctx.send("Loading playlist…")
                 try:
-                    first_info = await loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client, 1)
+                    first_info = await _RESOLVE_LANE.run(extract_playlist_info, query, yt_client, 1)
                 except Exception as e:
                     await status_msg.edit(content=f"Error fetching playlist: {e}")
                     return
@@ -2383,7 +2392,7 @@ class MusicCog(commands.Cog):
                 _schedule_prefetch(self.bot, ctx.guild.id)
                 asyncio.create_task(_safe_delete(status_msg))
 
-                full_fut = loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client)
+                full_fut = asyncio.create_task(enumerate_playlist(query, yt_client))
                 entry = _make_offer(full_fut, playlist_title)
 
                 current = gs.queue.current
@@ -2402,7 +2411,7 @@ class MusicCog(commands.Cog):
             # returns, non-blocking, before voice-join).
             status_msg = await ctx.send("Loading playlist…")
             try:
-                first_info = await loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client, 1)
+                first_info = await _RESOLVE_LANE.run(extract_playlist_info, query, yt_client, 1)
             except Exception as e:
                 await status_msg.edit(content=f"Error fetching playlist: {e}")
                 return
@@ -2413,7 +2422,7 @@ class MusicCog(commands.Cog):
             playlist_title = first_info["title"]
             first_track_info = first_tracks[0]
 
-            full_fut = loop.run_in_executor(_RESOLVE_EXECUTOR, extract_playlist_info, query, yt_client)
+            full_fut = asyncio.create_task(enumerate_playlist(query, yt_client))
 
             # Join voice if not already connected
             if not voice_client or not voice_client.is_connected():
@@ -2434,7 +2443,7 @@ class MusicCog(commands.Cog):
                     if saved_bass != 0 or saved_treble != 0:
                         await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
                 except Exception as e:
-                    _discard_future(full_fut)
+                    _abandon_enumeration(full_fut)
                     await status_msg.edit(content=f"Failed to join voice channel: {e}")
                     return
 
@@ -2452,7 +2461,7 @@ class MusicCog(commands.Cog):
                 gs.queue.current = Track(query=first_track_info["url"], title=title,
                                          requested_by=user_id, thumbnail=track_thumbnail, url=track_url)
             except Exception as e:
-                _discard_future(full_fut)
+                _abandon_enumeration(full_fut)
                 await status_msg.edit(content=f"Error playing first track: {e}")
                 return
 
@@ -2476,7 +2485,6 @@ class MusicCog(commands.Cog):
         # ---------------------------------------------------------------
         user_id = str(ctx.author.id)
         channel_id = ctx.channel.id
-        loop = asyncio.get_event_loop()
 
         voice_client = ctx.guild.voice_client
         voice_actually_playing = (
@@ -2517,11 +2525,10 @@ class MusicCog(commands.Cog):
         # Start-playback path: overlap the URL resolve with the voice connect
         # (they are independent — connect needs no resolved URL, resolve needs no voice).
         yt_cfg = self.bot.config.get("youtube", {})
-        resolve_fut = loop.run_in_executor(
-            _RESOLVE_EXECUTOR, get_audio_url_with_retry, query,
-            yt_cfg.get("client", "web"), self.bot.config.get("debug", False),
+        resolve_fut = asyncio.create_task(resolve_audio(
+            query, yt_cfg.get("client", "web"), self.bot.config.get("debug", False),
             yt_cfg.get("cookies_file") or None,
-        )
+        ))
 
         if not voice_client or not voice_client.is_connected():
             if voice_client:  # stale client — force-disconnect before reconnecting

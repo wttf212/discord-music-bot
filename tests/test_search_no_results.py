@@ -10,6 +10,7 @@ These pin the three behaviours that replaced it: a descriptive error, non-retrya
 classification, and a single "Artist - Title" -> "Title" fallback search.
 No network: YoutubeDL is faked throughout.
 """
+import asyncio
 import os
 import sys
 import unittest
@@ -123,13 +124,14 @@ class TestNonRetryable(unittest.TestCase):
     def test_retry_wrapper_does_not_sleep_and_calls_once(self):
         calls = []
 
-        def boom():
+        async def boom():
             calls.append(1)
             raise _no_results_error("some query")
 
-        with patch.object(audio_player.time, "sleep") as slept:
+        # The backoff is an asyncio.sleep between submissions (see _retry_with_backoff).
+        with patch.object(audio_player.asyncio, "sleep") as slept:
             with self.assertRaises(RuntimeError):
-                _retry_with_backoff(boom, max_attempts=3, base_delay=5.0)
+                asyncio.run(_retry_with_backoff(boom, max_attempts=3, base_delay=5.0))
         self.assertEqual(len(calls), 1, "a zero-result search must not be retried")
         slept.assert_not_called()
 

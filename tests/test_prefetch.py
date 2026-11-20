@@ -38,6 +38,14 @@ def _stale_info():
     }
 
 
+def _time_passes(seconds):
+    """What a fake asyncio.sleep must do now that the floor is re-checked after every
+    sleep: let the floor's clock advance. Moving the last claim back by `seconds` is
+    the same as moving time.monotonic() forward, without patching the clock the event
+    loop itself runs on."""
+    commands._last_prefetch_monotonic -= seconds
+
+
 class _GS:
     def __init__(self):
         self.queue = TrackQueue()
@@ -70,7 +78,7 @@ class TestPrefetch(unittest.TestCase):
         bot = _Bot()
         bot._gs.queue.add(Track(query="q1", title="q1", requested_by="u1"))
         bot._gs.queue.add(Track(query="q2", title="q2", requested_by="u2"))
-        with patch.object(commands, "get_audio_url_with_retry", return_value=_fresh_info()) as m:
+        with patch.object(commands, "resolve_audio", return_value=_fresh_info()) as m:
             self._run(commands._prefetch_next_track(bot, 1))
         nxt = bot._gs.queue.list()[0]
         self.assertIsNotNone(nxt.resolved_info)
@@ -85,7 +93,7 @@ class TestPrefetch(unittest.TestCase):
         t.resolved_info = _fresh_info()
         t.resolved_at = time.time()
         bot._gs.queue.add(t)
-        with patch.object(commands, "get_audio_url_with_retry", return_value=_fresh_info()) as m:
+        with patch.object(commands, "resolve_audio", return_value=_fresh_info()) as m:
             self._run(commands._prefetch_next_track(bot, 1))
         self.assertEqual(m.call_count, 0)  # already fresh — no refetch
 
@@ -103,9 +111,10 @@ class TestPrefetch(unittest.TestCase):
 
         async def fake_sleep(seconds):
             slept.append(seconds)
+            _time_passes(seconds)
 
         # Stale results so skip-if-fresh never triggers — isolates the throttle.
-        with patch.object(commands, "get_audio_url_with_retry", return_value=_stale_info()) as m, \
+        with patch.object(commands, "resolve_audio", return_value=_stale_info()) as m, \
              patch("asyncio.sleep", fake_sleep):
             self._run(commands._prefetch_next_track(bot, 1))
             self._run(commands._prefetch_next_track(bot, 1))
@@ -124,8 +133,9 @@ class TestPrefetch(unittest.TestCase):
 
         async def fake_sleep(seconds):
             waited.append(seconds)
+            _time_passes(seconds)
 
-        with patch.object(commands, "get_audio_url_with_retry", return_value=_stale_info()), \
+        with patch.object(commands, "resolve_audio", return_value=_stale_info()), \
              patch("asyncio.sleep", fake_sleep):
             self._run(commands._prefetch_next_track(bot, 1))
         floor = commands._PREFETCH_MIN_INTERVAL
@@ -141,10 +151,11 @@ class TestPrefetch(unittest.TestCase):
         commands._last_prefetch_monotonic = time.monotonic()  # force a deferral
 
         async def fake_sleep(seconds):
+            _time_passes(seconds)
             bot._gs.queue.clear()
             bot._gs.queue.add(Track(query="actual-next", title="a", requested_by="u1"))
 
-        with patch.object(commands, "get_audio_url_with_retry", return_value=_stale_info()) as m, \
+        with patch.object(commands, "resolve_audio", return_value=_stale_info()) as m, \
              patch("asyncio.sleep", fake_sleep):
             self._run(commands._prefetch_next_track(bot, 1))
         self.assertEqual(m.call_args[0][0], "actual-next")
@@ -152,13 +163,13 @@ class TestPrefetch(unittest.TestCase):
     def test_radio_track_not_prefetched(self):
         bot = _Bot()
         bot._gs.queue.add(Track(query="stn", title="Station", requested_by="u1", is_radio=True))
-        with patch.object(commands, "get_audio_url_with_retry", return_value=_fresh_info()) as m:
+        with patch.object(commands, "resolve_audio", return_value=_fresh_info()) as m:
             self._run(commands._prefetch_next_track(bot, 1))
         self.assertEqual(m.call_count, 0)
 
     def test_empty_queue_noop(self):
         bot = _Bot()
-        with patch.object(commands, "get_audio_url_with_retry", return_value=_fresh_info()) as m:
+        with patch.object(commands, "resolve_audio", return_value=_fresh_info()) as m:
             self._run(commands._prefetch_next_track(bot, 1))
         self.assertEqual(m.call_count, 0)
 
