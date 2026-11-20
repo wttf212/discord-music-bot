@@ -171,7 +171,7 @@ _NON_RETRYABLE_SUBSTRINGS = (
     "private video",
     "this video has been removed",
     "this video is not available",
-    "not available in your country",
+    "available in your country",   # YouTube's own: "...has not made this video available in your country"
     "geo restricted",
     "geo-blocked",
     "members-only",
@@ -215,6 +215,32 @@ _FAST_RETRY_SUBSTRINGS = (
     "temporary failure in name resolution",
 )
 
+# YouTube refusing THIS SERVER (its IP or its session) rather than one video. Every other
+# track fails the same way until the flag decays, so these must neither be retried inside
+# a resolve (each retry is one more request to an IP YouTube has already flagged) nor be
+# skipped as a dead track: skipping empties the queue in seconds, and under loop or
+# autoplay never stops. Checked before the per-track list, because some of these carry
+# per-track wording too ("Sign in to confirm", "Video unavailable").
+_SYSTEMIC_SUBSTRINGS = (
+    "not a bot",                 # "Sign in to confirm you’re not a bot". YouTube's apostrophe is
+                                 # curly, and "sign in to confirm" alone is also the age gate.
+    "rate-limited by youtube",   # yt-dlp's rewrite of the reason below
+    "try again later",           # "This content isn't available, try again later"
+    "being blocked by youtube",  # "All player responses are invalid. Your IP is likely being blocked by Youtube"
+    "captcha",                   # "YouTube is requiring a captcha challenge before playback"
+)
+
+
+def is_systemic_resolve_error(exc: BaseException) -> bool:
+    """True when YouTube is refusing this server rather than this track: the bot check,
+    the rate limit, an IP block (see _SYSTEMIC_SUBSTRINGS)."""
+    msg = str(exc).lower()
+    if any(s in msg for s in _SYSTEMIC_SUBSTRINGS):
+        return True
+    # A YouTube 403/401 refuses the request, not the video: an unavailable video comes back
+    # as a 200 whose playability status says so. Another site's 403 stays per-track.
+    return "[youtube" in msg and ("http error 403" in msg or "http error 401" in msg)
+
 
 def _retry_base_delay(exc: BaseException, base_delay: float, fast_delay: float) -> float:
     """Pick the backoff base for this error: fast for transient connection/timeout
@@ -231,7 +257,8 @@ def _is_retryable_ytdlp_error(exc: BaseException) -> bool:
     """Classify a yt-dlp (or connection-layer) exception as retryable or not.
 
     Returns False for permanent policy errors that retrying would accelerate
-    IP bans on (video unavailable, sign-in required, age-restricted, geo-blocked).
+    IP bans on (video unavailable, sign-in required, age-restricted, geo-blocked),
+    and for YouTube refusing this server outright (is_systemic_resolve_error).
     Returns True for transient network/rate-limit errors and all ambiguous cases
     (conservative: prefer retry over silent drop for unrecognised errors).
     """
@@ -241,6 +268,8 @@ def _is_retryable_ytdlp_error(exc: BaseException) -> bool:
 
     # String-based classification (case-insensitive substring match)
     msg = str(exc).lower()
+    if is_systemic_resolve_error(exc):
+        return False
     if any(s in msg for s in _NON_RETRYABLE_SUBSTRINGS):
         return False
     if any(s in msg for s in _RETRYABLE_SUBSTRINGS):
@@ -255,8 +284,11 @@ def is_permanent_resolve_error(exc: BaseException) -> bool:
 
     Lets the prefetch drop such a track from the queue instead of leaving it to fail at
     playback, where it costs a failed play plus a cold start for whatever follows.
+
+    A YouTube block is never this, though it is not retryable either: it is a verdict on
+    this server, and the next track would fail the same way (is_systemic_resolve_error).
     """
-    return not _is_retryable_ytdlp_error(exc)
+    return not _is_retryable_ytdlp_error(exc) and not is_systemic_resolve_error(exc)
 
 
 def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.0,
