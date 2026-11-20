@@ -623,6 +623,13 @@ async def _play_radio_selected(bot, ctx: commands.Context, station: dict,
             )
             return
 
+    # Disarm the armed auto-next chain before stopping playback (see prev/next button
+    # pattern): the stop sets _playback_done, and a live chain would start a competing play().
+    if gs.auto_next_task and not gs.auto_next_task.done():
+        gs.auto_next_task.cancel()
+        gs.auto_next_task = None
+    gs.auto_next_gen += 1
+
     # Stop current playback if any
     if gs.player.is_playing:
         gs.player.stop_playback()
