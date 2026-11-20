@@ -895,8 +895,8 @@ class TestManualAdvanceDuringABlock(unittest.TestCase):
 
     def test_dead_tracks_with_healthy_voice_are_still_skipped(self):
         """The age gate and a private video share "Sign in" wording with the bot check, but
-        they are facts about one video: requeueing one and re-arming the chain would retry
-        it forever."""
+        they are facts about one video: requeueing one would retry it forever. The chain is
+        re-armed without it, as after any dead track (tests/test_manual_dead_track.py)."""
         from yt_dlp.utils import DownloadError
         dead = {
             "age-gated": DownloadError(
@@ -919,7 +919,7 @@ class TestManualAdvanceDuringABlock(unittest.TestCase):
                     sent = asyncio.run(_invoke(handler, bot, gs, position=1))
 
                     self.assertNotIn(track, gs.queue.list(), f"{handler}: a dead track must not be requeued")
-                    commands._start_auto_next.assert_not_called()
+                    commands._start_auto_next.assert_called_once()
                     self.assertEqual(sum("skipping track" in m.lower() for m in sent), 1,
                                       f"{handler}: {sent}")
 
@@ -1159,7 +1159,7 @@ class TestLoadallPlaybackStart(unittest.TestCase):
         sent = _run_loadall(bot)
 
         self.assertEqual(self._queued(gs), ["u1", "u2"], "a dead track must not be requeued")
-        commands._start_auto_next.assert_not_called()
+        commands._start_auto_next.assert_called_once()   # re-armed without it
         self.assertEqual(sum("skipping track" in m.lower() for m in sent), 1, sent)
 
 
