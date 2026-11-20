@@ -2895,9 +2895,31 @@ class MusicCog(commands.Cog):
 
         status = await ctx.send(f"Loading **{title}**…")
         first = sp_tracks[0]
+        # Resolve track 1 before the disarm, as the single-track path does: a track that
+        # can't be found, or a YouTube block, then fails here and leaves auto-play alone.
+        yt_cfg = self.bot.config.get("youtube", {})
         try:
-            played = await gs.player.play(first["query"])
+            info = await resolve_audio(
+                first["query"], yt_cfg.get("client", "web"), self.bot.config.get("debug", False),
+                yt_cfg.get("cookies_file") or None,
+            )
         except Exception as e:
+            await status.edit(content=f"Error playing first track: {_friendly_ytdlp_error(e)}")
+            return
+        resolved_at = time.time()
+        # Disarm the armed auto-next chain before play() (see prev/next button pattern above).
+        if gs.auto_next_task and not gs.auto_next_task.done():
+            gs.auto_next_task.cancel()
+            gs.auto_next_task = None
+        gs.auto_next_gen += 1
+        try:
+            played = await gs.player.play(first["query"], info, resolved_at)
+        except Exception as e:
+            # A voice drop (or a block met re-resolving a stale URL) is no fault of the
+            # track: re-arm auto-play, as a refused playlist start does.
+            if (is_systemic_resolve_error(e)
+                    or _live_voice_client(self.bot, gs, ctx.guild.id) is None):
+                _start_auto_next(self.bot, channel_id, ctx.guild.id)
             await status.edit(content=f"Error playing first track: {_friendly_ytdlp_error(e)}")
             return
         gs.queue.current = Track(query=first["query"], title=played["title"], requested_by=user_id,

@@ -112,12 +112,18 @@ class _Bot:
 
     async def record(self, content=None, **kwargs):
         self.sent.append(content)
-        return _Msg()
+        return _Msg(self.sent)
 
 
 class _Msg:
-    async def edit(self, **kwargs):
-        pass
+    """A sent message; edits to its text land in the same list as the sends."""
+
+    def __init__(self, sent=None):
+        self._sent = sent if sent is not None else []
+
+    async def edit(self, content=None, **kwargs):
+        if content is not None:
+            self._sent.append(content)
 
     async def delete(self):
         pass
@@ -183,8 +189,8 @@ class TestRadioStart(_Patched):
         self.assertTrue(gs.queue.current.is_radio)
 
 
-class _RefusedPlayer:
-    """Nothing audible; every play() fails with `error`."""
+class _FailingPlayer:
+    """Nothing audible; play() fails with `error`, if there is one."""
 
     def __init__(self, error):
         self._voice_client = _VC()
@@ -193,7 +199,9 @@ class _RefusedPlayer:
         self.error = error
 
     async def play(self, query, resolved_info=None, resolved_at=0.0):
-        raise self.error
+        if self.error is not None:
+            raise self.error
+        return {"title": query, "thumbnail": "", "webpage_url": ""}
 
     def stop_playback(self):
         pass
@@ -202,7 +210,7 @@ class _RefusedPlayer:
 def _waiting_guild(error):
     """Auto-play is waiting a block or a voice drop out: its chain is armed and the track it
     put back is at the head of the queue."""
-    gs = SimpleNamespace(queue=TrackQueue(), player=_RefusedPlayer(error), auto_next_gen=5,
+    gs = SimpleNamespace(queue=TrackQueue(), player=_FailingPlayer(error), auto_next_gen=5,
                          auto_next_task=MagicMock(), autoplay=False, current_text_channel_id=None)
     gs.auto_next_task.done.return_value = False
     gs.queue.requeue_front(Track(query="kept", title="kept", requested_by="u"))
@@ -263,6 +271,65 @@ class TestPlaylistStart(_StartHarness):
         gs, chain, sent = self._run(self._play_playlist, REMOVED, object())
         self.start_auto_next.assert_not_called()
         self.assertEqual([t.query for t in gs.queue.list()], ["kept"])
+
+
+SPOTIFY = {"title": "SP", "tracks": [{"query": "S1", "title": "S1"}, {"query": "S2", "title": "S2"}]}
+RESOLVED = {"title": "S1", "webpage_url": "",
+            "url": "https://r1.googlevideo.com/videoplayback?id=x&expire=99999999999"}
+
+
+def _spotify_start(resolve_error=None):
+    """A start that runs _queue_spotify for SPOTIFY; track 1's resolve raises `resolve_error`."""
+    async def start(bot, ctx, gs):
+        resolve = AsyncMock(side_effect=resolve_error, return_value=dict(RESOLVED))
+        with patch.object(commands, "resolve_audio", resolve):
+            await commands.MusicCog._queue_spotify(SimpleNamespace(bot=bot), ctx, gs, SPOTIFY)
+    return start
+
+
+class TestSpotifyStart(_Patched):
+    """A multi-track Spotify link with nothing audible plays its first track by hand."""
+
+    def test_starting_the_first_track_disarms_the_chain(self):
+        async def scenario():
+            bot, gs, player = _armed_guild()
+            await asyncio.sleep(0)                      # the chain is waiting on "A"
+            await _spotify_start()(bot, _ctx(bot), gs)
+            await _settle(gs)
+            return gs, player
+
+        gs, player = asyncio.run(scenario())
+        self.assertEqual(player.log, ["play:S1"],
+                         "the armed chain started a second play() during the Spotify start")
+        self.assertEqual([t.query for t in gs.queue.list()], ["B", "S2"])
+
+
+class TestSpotifyStartRefused(_StartHarness):
+    """Track 1 is resolved before the disarm, as the single-track path does, so a track that
+    can't be found or a YouTube block leaves a waiting chain alone. A refusal during play(),
+    after the disarm, re-arms it as a refused playlist start does."""
+
+    def _assert_chain_kept(self, chain):
+        self.assertFalse(chain.cancel.called and not self.start_auto_next.called,
+                         "the chain waiting the refusal out was cancelled and never re-armed")
+
+    def test_a_refused_first_track_keeps_auto_play(self):
+        """Refused at the resolve, before anything is touched, or during play()."""
+        cases = {f"{name} during play()": (None, error, voice)
+                 for name, (error, voice) in REFUSALS.items()}
+        cases["block at the resolve"] = (audio_player.YouTubeBlockedError(60.0), None, object())
+        for name, (resolve_error, play_error, voice_after) in cases.items():
+            with self.subTest(name):
+                gs, chain, sent = self._run(_spotify_start(resolve_error), play_error, voice_after)
+                self._assert_chain_kept(chain)
+                self.assertEqual([t.query for t in gs.queue.list()], ["kept"])
+
+    def test_a_first_track_that_cannot_be_found_touches_nothing(self):
+        gs, chain, sent = self._run(_spotify_start(REMOVED), None, object())
+        chain.cancel.assert_not_called()
+        self.start_auto_next.assert_not_called()
+        self.assertEqual([t.query for t in gs.queue.list()], ["kept"])
+        self.assertTrue(any("error playing first track" in (m or "").lower() for m in sent), sent)
 
 
 if __name__ == "__main__":
