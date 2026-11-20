@@ -2469,6 +2469,12 @@ class MusicCog(commands.Cog):
                                          requested_by=user_id, thumbnail=track_thumbnail, url=track_url)
             except Exception as e:
                 _abandon_enumeration(full_fut)
+                # Track 1 resolves inside play(), after the disarm. A YouTube block or a voice
+                # drop is no fault of the playlist, and the chain cancelled above may have been
+                # waiting one out with a track it kept: re-arm it, as a manual skip does.
+                if (is_systemic_resolve_error(e)
+                        or _live_voice_client(self.bot, gs, ctx.guild.id) is None):
+                    _start_auto_next(self.bot, channel_id, ctx.guild.id)
                 await status_msg.edit(content=f"Error playing first track: {e}")
                 return
 

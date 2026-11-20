@@ -16,14 +16,31 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import discord
+from yt_dlp.utils import DownloadError
+
+import audio_player
 import commands
 from track_queue import Track, TrackQueue
 
 CHANNEL_ID = 10
+PLAYLIST = "https://www.youtube.com/playlist?list=PLxxxxxxxxxxxxxxxx"
+FIRST = "https://www.youtube.com/watch?v=fffffffffff"
+
+# What a start can meet while auto-play waits a YouTube block or a voice drop out, and the
+# voice state the handler finds afterwards (None: the socket is down).
+REFUSALS = {
+    "shared cooldown": (audio_player.YouTubeBlockedError(60.0), object()),
+    "bot check": (DownloadError("ERROR: [youtube] abc123: Sign in to confirm you’re not a bot."),
+                  object()),
+    "voice drop": (discord.ClientException("Not connected to voice."), None),
+}
+REMOVED = DownloadError("ERROR: [youtube] abc123: Video unavailable. "
+                        "This video has been removed by the uploader")
 
 
 class _VC:
@@ -164,6 +181,88 @@ class TestRadioStart(_Patched):
                          "the armed chain started a second play() during the station's start")
         self.assertEqual([t.query for t in gs.queue.list()], ["B"])
         self.assertTrue(gs.queue.current.is_radio)
+
+
+class _RefusedPlayer:
+    """Nothing audible; every play() fails with `error`."""
+
+    def __init__(self, error):
+        self._voice_client = _VC()
+        self.is_playing = False
+        self.is_paused = False
+        self.error = error
+
+    async def play(self, query, resolved_info=None, resolved_at=0.0):
+        raise self.error
+
+    def stop_playback(self):
+        pass
+
+
+def _waiting_guild(error):
+    """Auto-play is waiting a block or a voice drop out: its chain is armed and the track it
+    put back is at the head of the queue."""
+    gs = SimpleNamespace(queue=TrackQueue(), player=_RefusedPlayer(error), auto_next_gen=5,
+                         auto_next_task=MagicMock(), autoplay=False, current_text_channel_id=None)
+    gs.auto_next_task.done.return_value = False
+    gs.queue.requeue_front(Track(query="kept", title="kept", requested_by="u"))
+    return gs
+
+
+class _StartHarness(_Patched):
+    """Runs a start path against _waiting_guild with _start_auto_next recorded."""
+
+    def setUp(self):
+        super().setUp()
+        self.start_auto_next = MagicMock()
+        for p in (patch.object(commands, "check_channel", AsyncMock(return_value=True)),
+                  patch.object(commands, "_start_auto_next", self.start_auto_next)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _run(self, start, error, voice_after):
+        """`start(bot, ctx, gs)` is awaited; returns (gs, the chain it found, what it sent)."""
+        self.start_auto_next.reset_mock()
+        gs = _waiting_guild(error)
+        chain = gs.auto_next_task
+        bot = _Bot(gs)
+        bot.pending_playlists = {}
+        bot.command_prefix = "!!"
+        ctx = _ctx(bot)
+        ctx.author.voice.channel = ctx.guild.voice_client.channel
+        with patch.object(commands, "_live_voice_client", return_value=voice_after):
+            asyncio.run(start(bot, ctx, gs))
+        return gs, chain, bot.sent
+
+
+class TestPlaylistStart(_StartHarness):
+    """!!play <playlist> with nothing audible resolves track 1 inside play(), after the
+    disarm. A YouTube block refusing it, or voice dropping during it, cancelled the chain that
+    was waiting one out and never re-armed it, so the track that chain kept never played."""
+
+    @staticmethod
+    async def _play_playlist(bot, ctx, gs):
+        async def never_finishes(query, client):
+            await asyncio.sleep(3600)
+
+        with patch.object(commands, "extract_playlist_info",
+                          return_value={"title": "P", "tracks": [{"url": FIRST, "title": "f"}]}), \
+                patch.object(commands, "enumerate_playlist", never_finishes):
+            await commands.MusicCog.play.callback(SimpleNamespace(bot=bot), ctx, query=PLAYLIST)
+
+    def test_a_refused_first_track_rearms_auto_play(self):
+        for name, (error, voice_after) in REFUSALS.items():
+            with self.subTest(name):
+                gs, chain, sent = self._run(self._play_playlist, error, voice_after)
+                chain.cancel.assert_called_once()          # disarmed before play(), as before
+                self.start_auto_next.assert_called_once()
+                self.assertEqual(self.start_auto_next.call_args.args[1:], (CHANNEL_ID, 1))
+                self.assertEqual([t.query for t in gs.queue.list()], ["kept"])
+
+    def test_a_dead_first_track_is_reported_as_before(self):
+        gs, chain, sent = self._run(self._play_playlist, REMOVED, object())
+        self.start_auto_next.assert_not_called()
+        self.assertEqual([t.query for t in gs.queue.list()], ["kept"])
 
 
 if __name__ == "__main__":
