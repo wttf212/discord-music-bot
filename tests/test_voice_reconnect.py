@@ -1012,6 +1012,150 @@ class TestManualAdvanceHandsABlockToTheChain(unittest.TestCase):
                 self.assertEqual(len(gs.queue), 0)
 
 
+def _run_loadall(bot, n=3):
+    """!!loadall with a ready pending playlist of n tracks (queries u0, u1, ...). Returns
+    every string it sent."""
+    bot.pending_playlists = {str(_CTX_CHANNEL_ID): {
+        "tracks": [{"url": f"u{i}", "title": f"u{i}"} for i in range(n)]}}
+    ctx = _Ctx(bot)
+    asyncio.run(commands.MusicCog.loadall.callback(SimpleNamespace(bot=bot), ctx))
+    return ctx.sent
+
+
+class _ChainWitness(_Player):
+    """play() notes the auto-next chain's task and generation at the moment it runs."""
+
+    def __init__(self, vc):
+        super().__init__(vc)
+        self.gs = None
+        self.seen = []
+
+    async def play(self, query, resolved_info, resolved_at):
+        self.seen.append((self.gs.auto_next_task, self.gs.auto_next_gen))
+        return await super().play(query, resolved_info, resolved_at)
+
+
+class TestLoadallPlaybackStart(unittest.TestCase):
+    """!!loadall starts playback when nothing is playing. It popped a track and called
+    play() with the auto-next chain still armed, breaking the disarm invariant (a chain
+    that wakes mid-setup starts a second play()). On any failure it posted "Skipping
+    track" and lost the track: during a YouTube block, or when voice dropped mid-play.
+    """
+
+    def setUp(self):
+        self._patches = [
+            patch.object(commands, "check_channel", side_effect=self._true),
+            patch.object(commands, "build_player_view", return_value=None),
+            patch.object(commands, "send_new_np", side_effect=self._noop),
+            patch.object(commands, "_schedule_prefetch", return_value=None),
+            patch.object(commands, "_start_auto_next", MagicMock()),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    async def _true(ctx):
+        return True
+
+    @staticmethod
+    async def _noop(*a, **k):
+        return None
+
+    @staticmethod
+    def _queued(gs):
+        return [t.query for t in gs.queue.list()]
+
+    def test_an_armed_chain_is_disarmed_before_play(self):
+        vc = _VC(connected=True)
+        player = _ChainWitness(vc)
+        gs = _GS(player)
+        player.gs = gs
+        armed = MagicMock()
+        armed.done.return_value = False
+        gs.auto_next_task = armed
+        gs.auto_next_gen = 7
+        bot = _Bot(gs, _Guild(vc))
+
+        _run_loadall(bot)
+
+        armed.cancel.assert_called_once()
+        self.assertEqual(player.seen, [(None, 8)], "play() ran with the old chain still armed")
+        self.assertEqual(player.play_calls, ["u0"])
+        commands._start_auto_next.assert_called_once()
+
+    def test_a_block_keeps_the_track_and_rearms_the_chain(self):
+        for name, error in _block_errors().items():
+            with self.subTest(error=name):
+                commands._start_auto_next.reset_mock()
+                vc = _VC(connected=True)
+                gs = _GS(_Player(vc, error=error))
+                bot = _Bot(gs, _Guild(vc))
+
+                sent = _run_loadall(bot)
+
+                self.assertEqual(self._queued(gs), ["u0", "u1", "u2"], "the first track goes back in front")
+                self.assertIsNone(gs.queue.current)
+                commands._start_auto_next.assert_called_once()
+                self.assertEqual(commands._start_auto_next.call_args.args[1], _CTX_CHANNEL_ID)
+                self.assertFalse(any("skipping track" in m.lower() for m in sent), sent)
+
+    def test_a_voice_drop_during_play_keeps_the_track_and_rearms_the_chain(self):
+        vc = _VC(connected=True)
+
+        def go_down(n):
+            if n >= 2:   # 1 = the check before play(), 2 = the recovery's re-check
+                vc._connected = False
+        vc.on_check = go_down
+        gs = _GS(_Player(vc, error=RuntimeError("Not connected to a voice channel")))
+        bot = _Bot(gs, _Guild(vc))
+
+        sent = _run_loadall(bot)
+
+        self.assertEqual(self._queued(gs), ["u0", "u1", "u2"])
+        self.assertIsNone(gs.queue.current)
+        commands._start_auto_next.assert_called_once()
+        self.assertFalse(any("skipping track" in m.lower() for m in sent), sent)
+
+    def test_voice_down_before_play_queues_the_tracks_and_leaves_the_chain_alone(self):
+        """A chain waiting a voice drop out plays the new tracks itself once voice is back.
+        Disarming it to start playback here would cancel that wait, so nothing is popped or
+        cancelled: the manual skips refuse for the same reason."""
+        vc = _VC(connected=False)
+        player = _Player(vc)
+        gs = _GS(player)
+        waiting = MagicMock()
+        waiting.done.return_value = False
+        gs.auto_next_task = waiting
+        gs.auto_next_gen = 7
+        bot = _Bot(gs, _Guild(vc))
+
+        sent = _run_loadall(bot)
+
+        self.assertEqual(self._queued(gs), ["u0", "u1", "u2"])
+        self.assertIsNone(gs.queue.current)
+        waiting.cancel.assert_not_called()
+        self.assertIs(gs.auto_next_task, waiting)
+        self.assertEqual(gs.auto_next_gen, 7)
+        commands._start_auto_next.assert_not_called()
+        self.assertFalse(any("skipping track" in m.lower() for m in sent), sent)
+        self.assertEqual(sum("voice" in m.lower() for m in sent), 1, sent)
+
+    def test_a_dead_track_with_healthy_voice_is_still_skipped(self):
+        from yt_dlp.utils import DownloadError
+        vc = _VC(connected=True)
+        error = DownloadError("ERROR: [youtube] abc123: Sign in to confirm your age. "
+                              "This video may be inappropriate for some users.")
+        gs = _GS(_Player(vc, error=error))
+        bot = _Bot(gs, _Guild(vc))
+
+        sent = _run_loadall(bot)
+
+        self.assertEqual(self._queued(gs), ["u1", "u2"], "a dead track must not be requeued")
+        commands._start_auto_next.assert_not_called()
+        self.assertEqual(sum("skipping track" in m.lower() for m in sent), 1, sent)
+
+
 class TestVoiceDebugLogging(unittest.TestCase):
     """Fix 3(b): discord.voice_state and discord.player must log at DEBUG so the
     decisive lines from a socket drop are visible; discord.gateway must not, or
