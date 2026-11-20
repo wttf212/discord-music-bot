@@ -1869,6 +1869,9 @@ class AudioPlayer:
         # part-way (task cancelled by a skip, voice dropped, voice_client.play() raising)
         # tears down what it made instead of leaking FFmpeg and its threads for good.
         built: list = []
+        # _start_playback bumps the generation before its first await; a newer
+        # play()/play_radio() bumps it again and owns the playback state from then on.
+        gen = self._playback_gen + 1
         try:
             return await self._start_playback(url_or_query, prefetched_info,
                                               prefetched_at, built)
@@ -1876,6 +1879,15 @@ class AudioPlayer:
             if self._ytdlp_proc in built:
                 self._ytdlp_proc = None
             _discard_pipeline(*built)
+            # The start flags its track as playing and clears _playback_done before the
+            # prefill and voice_client.play(). Left so, wait_for_playback() never returns
+            # and auto-next stalls on a track that never started.
+            if self._playback_gen == gen:
+                self.is_playing = False
+                self.current_track_title = None
+                self.current_artist = ""
+                self.current_duration = None
+                self._playback_done.set()
             raise
 
     async def _start_playback(self, url_or_query: str, prefetched_info: dict | None,
