@@ -20,7 +20,7 @@ import sys
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -200,13 +200,15 @@ class TestBlocksAreNotRetriedInPlace(unittest.TestCase):
             with self.subTest(name):
                 calls = []
 
-                def fn(*a, **k):
+                async def submit():
                     calls.append(1)
                     raise exc
 
-                with patch.object(audio_player.time, "sleep") as sleep:
+                # The backoff is an asyncio.sleep between submissions (see _retry_with_backoff).
+                with patch.object(audio_player.asyncio, "sleep") as sleep:
                     with self.assertRaises(DownloadError):
-                        audio_player._retry_with_backoff(fn, max_attempts=3, base_delay=5.0)
+                        asyncio.run(audio_player._retry_with_backoff(
+                            submit, max_attempts=3, base_delay=5.0))
                 self.assertEqual(len(calls), 1)
                 sleep.assert_not_called()
 
@@ -257,10 +259,26 @@ class TestSharedCooldown(_CleanBlockState):
         self._trip()
         resolver = MagicMock(return_value=_info())
         with patch.object(audio_player, "_resolve_audio_url", resolver), \
-                patch.object(audio_player.time, "sleep") as sleep:
+                patch.object(audio_player.asyncio, "sleep") as sleep:
             with self.assertRaises(audio_player.YouTubeBlockedError):
-                audio_player.get_audio_url_with_retry(self.URL_B, "web_embedded")
+                asyncio.run(audio_player.resolve_audio(self.URL_B, "web_embedded"))
         resolver.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_a_refusal_through_resolve_audio_is_sent_once_and_holds_everyone_off(self):
+        """The playback path: resolve_audio's lane submission meets the refusal in a
+        worker. It must not back off and resubmit, and the block must still be shared."""
+        resolver = MagicMock(side_effect=BOT_CHECK)
+        with patch.object(audio_player, "_resolve_audio_url", resolver), \
+                patch.object(audio_player.asyncio, "sleep") as sleep:
+            with self.assertRaises(DownloadError):
+                asyncio.run(audio_player.resolve_audio(self.URL_A, "web_embedded"))
+            resolver.assert_called_once()
+            self.assertGreater(_remaining(), 0)
+            with self.assertRaises(audio_player.YouTubeBlockedError):
+                asyncio.run(audio_player.resolve_audio(self.URL_B, "web_embedded",
+                                                       background=True))
+        resolver.assert_called_once()
         sleep.assert_not_called()
 
     def test_other_sites_are_not_held_off(self):
@@ -728,7 +746,10 @@ class TestPrefetchKeepsTracksThroughABlock(unittest.TestCase):
 
     @staticmethod
     async def _no_sleep(seconds):
-        return None
+        # The prefetch floor is re-checked after every sleep, so let its clock advance:
+        # moving the last claim back is the same as time passing. Otherwise every subtest
+        # after the first busy-spins on the floor for the whole 3 s in real time.
+        commands._last_prefetch_monotonic -= seconds
 
     def _prefetch(self, exc):
         bot = _PrefetchBot()
@@ -741,7 +762,7 @@ class TestPrefetchKeepsTracksThroughABlock(unittest.TestCase):
             calls.append(query)
             raise exc
 
-        with patch.object(commands, "get_audio_url_with_retry", side_effect=resolve):
+        with patch.object(commands, "resolve_audio", side_effect=resolve):
             asyncio.run(commands._prefetch_next_track(bot, 1))
         return bot._gs.queue.list(), tracks, calls
 
@@ -844,11 +865,11 @@ class TestStreamWithNoAudio(_CleanBlockState):
             procs.append(proc() if proc else _FakeProc())
             return procs[-1]
 
-        resolve = MagicMock(return_value=_info())
+        resolve = AsyncMock(return_value=_info())
         vc = _PlayVC()
         error = None
         with patch.object(audio_player, "_find_ffmpeg", return_value="ffmpeg"), \
-                patch.object(audio_player, "get_audio_url_with_retry", resolve), \
+                patch.object(audio_player, "resolve_audio", resolve), \
                 patch.object(audio_player, "_open_audio_stream", side_effect=open_stream), \
                 patch("discord.FFmpegPCMAudio", side_effect=ffmpeg):
             player = audio_player.AudioPlayer(self.CONFIG)
