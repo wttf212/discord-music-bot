@@ -1414,6 +1414,54 @@ class _BufferedAudioSource(discord.AudioSource):
             pass
 
 
+def _discard_pipeline(*parts) -> None:
+    """Tear down stream pipeline pieces that never reached the voice client.
+
+    An abandoned start otherwise runs forever: FFmpeg blocks writing PCM nobody reads,
+    discord.py's stdin-writer thread blocks behind it and keeps the source alive (so
+    AudioSource.__del__ never runs), the jitter buffer's fill thread spins on its full
+    queue, and an unowned stream reader parks in os.write. The teardown runs on a daemon
+    thread: FFmpegPCMAudio.cleanup() can block in communicate(), a reap waits up to 2 s.
+    """
+    if not parts:
+        return
+
+    def _teardown():
+        for part in reversed(parts):   # consumers first: jitter buffer, FFmpeg, stream
+            try:
+                if isinstance(part, discord.AudioSource):
+                    part.cleanup()
+                else:
+                    part.terminate()
+                    _reap_process(part)
+            except Exception:
+                pass
+
+    threading.Thread(target=_teardown, daemon=True, name="pipeline-discard").start()
+
+
+def _discard_late_result(fut) -> None:
+    """Done-callback: discard what an executor built for a play() that was cancelled."""
+    if not fut.cancelled() and fut.exception() is None:
+        _discard_pipeline(fut.result())
+
+
+async def _adopt(built: list, fut):
+    """Await an executor call that builds a pipeline piece, and record the piece.
+
+    Cancelling the awaiting task does not stop the executor call, and asyncio drops
+    whatever it returns, so a stream reader or FFmpeg built that way would run with no
+    owner. Shielded, the result stays reachable and is discarded once it lands.
+    """
+    try:
+        part = await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        fut.add_done_callback(_discard_late_result)
+        raise
+    built.append(part)
+    return part
+
+
 class AudioPlayer:
     """Audio player using discord.py VoiceClient + FFmpegPCMAudio.
 
@@ -1486,6 +1534,22 @@ class AudioPlayer:
         FFmpeg only decodes — it never makes HTTP requests to YouTube CDN.
         This bypasses the HTTP 403 that YouTube returns to FFmpeg's TLS fingerprint.
         """
+        # Every pipeline piece the start builds goes in `built`, so a start abandoned
+        # part-way (task cancelled by a skip, voice dropped, voice_client.play() raising)
+        # tears down what it made instead of leaking FFmpeg and its threads for good.
+        built: list = []
+        try:
+            return await self._start_playback(url_or_query, prefetched_info,
+                                              prefetched_at, built)
+        except BaseException:
+            if self._ytdlp_proc in built:
+                self._ytdlp_proc = None
+            _discard_pipeline(*built)
+            raise
+
+    async def _start_playback(self, url_or_query: str, prefetched_info: dict | None,
+                              prefetched_at: float, built: list) -> dict:
+        """play()'s body; appends each pipeline piece to ``built`` as it is created."""
         import discord
 
         if self._debug:
@@ -1550,10 +1614,10 @@ class AudioPlayer:
                     url_or_query, yt["client"], self._debug, cookies_file
                 )
 
-            proc = await loop.run_in_executor(
+            proc = await _adopt(built, loop.run_in_executor(
                 _STREAM_EXECUTOR, _open_audio_stream, url_or_query, yt["client"],
                 cookies_file, info, self._debug
-            )
+            ))
             self._ytdlp_proc = proc  # track immediately so a concurrent stop reaps it
 
             # The stream may fail to open at all (invalid/expired URL). A cached URL that
@@ -1577,7 +1641,7 @@ class AudioPlayer:
             # (~10-80 ms on Windows with AV) and would otherwise stall every guild.
             # FFmpeg still reads only from the yt-dlp stdout pipe (pipe=True).
             proc_stdout = proc.stdout
-            src = await loop.run_in_executor(
+            src = await _adopt(built, loop.run_in_executor(
                 _STREAM_EXECUTOR,
                 lambda: discord.FFmpegPCMAudio(
                     proc_stdout,
@@ -1586,7 +1650,7 @@ class AudioPlayer:
                     options=ffmpeg_options,
                     stderr=subprocess.PIPE,
                 ),
-            )
+            ))
 
             # Drain stderr before priming so a full pipe can't deadlock read().
             # The in-process reader has no stderr (no child process) — nothing to drain.
@@ -1648,6 +1712,7 @@ class AudioPlayer:
         # The already-read first_frame is emitted first; a short prefill builds a
         # small cushion before playback starts.
         source = _BufferedAudioSource(source, first_frame=first_frame)
+        built.append(source)
         await loop.run_in_executor(_STREAM_EXECUTOR, source.prefill)
 
         # Configure Opus encoder before play() so first frames use music settings.
