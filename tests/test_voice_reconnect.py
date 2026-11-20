@@ -254,6 +254,7 @@ class _Ctx:
 
     def __init__(self, bot):
         self.bot = bot
+        self.interaction = None   # what commands.Context has for a prefix command
         self.guild = SimpleNamespace(id=1, voice_client=None)
         self.channel = SimpleNamespace(id=_CTX_CHANNEL_ID)
         self.author = SimpleNamespace(id=42)

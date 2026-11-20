@@ -1757,6 +1757,12 @@ async def check_channel(ctx: commands.Context) -> bool:
     if str(ctx.channel.id) == allowed:
         return True
 
+    # A slash command has no message to delete, and unless its interaction is
+    # answered Discord shows "The application did not respond".
+    if ctx.interaction:
+        await _respond(ctx.interaction, f"Please use commands in <#{allowed}>.")
+        return False
+
     # Wrong channel: delete and notify
     try:
         await ctx.message.delete()
@@ -2888,6 +2894,8 @@ class MusicCog(commands.Cog):
             return
         if not ctx.guild:
             return
+        if ctx.interaction:
+            await _ack(ctx.interaction)  # geocoding + weather refresh outlast the 3 s token
         if not await self._check_admin(ctx):
             return
         gid = str(ctx.guild.id)
@@ -3002,6 +3010,8 @@ class MusicCog(commands.Cog):
             return
         if not ctx.guild:
             return
+        if ctx.interaction:
+            await _ack(ctx.interaction)  # a cold resolve outlasts the 3 s token
         if position is None:
             await ctx.send(f"Usage: `{self.bot.command_prefix}skipto <position>`")
             return
@@ -3026,20 +3036,23 @@ class MusicCog(commands.Cog):
             return
         try:
             info = await gs.player.play(next_track.query, next_track.resolved_info, next_track.resolved_at)
-            next_track.title = info["title"]
-            next_track.thumbnail = info.get("thumbnail", "")
-            next_track.url = info.get("webpage_url", "")
-            view = build_player_view(self.bot, next_track.title,
-                                     thumbnail=next_track.thumbnail, url=next_track.url,
-                                     requester_name=_get_requester_name(self.bot, next_track.requested_by, ctx.guild),
-                                     queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
-            await ctx.send(f"Jumped to **{next_track.title}**.", delete_after=3)
-            await send_new_np(self.bot, channel_id, view)
-            _start_auto_next(self.bot, channel_id, ctx.guild.id)
         except Exception as e:
             print(f"[commands] Manual advance failed (guild {ctx.guild.id}): {e}")
             if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track):
                 await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+            return
+        # Armed before any reply: a reply that fails (a dead interaction token) must
+        # not leave auto-play off after this track.
+        _start_auto_next(self.bot, channel_id, ctx.guild.id)
+        next_track.title = info["title"]
+        next_track.thumbnail = info.get("thumbnail", "")
+        next_track.url = info.get("webpage_url", "")
+        view = build_player_view(self.bot, next_track.title,
+                                 thumbnail=next_track.thumbnail, url=next_track.url,
+                                 requester_name=_get_requester_name(self.bot, next_track.requested_by, ctx.guild),
+                                 queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
+        await ctx.send(f"Jumped to **{next_track.title}**.", delete_after=3)
+        await send_new_np(self.bot, channel_id, view)
 
     @commands.hybrid_command(name="clear", description="Clear the upcoming queue (keeps the current track)")
     async def clear(self, ctx: commands.Context):
