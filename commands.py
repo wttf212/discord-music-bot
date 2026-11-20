@@ -1,6 +1,7 @@
 import asyncio
 import http.client
 import json
+import random
 import re
 import time
 import urllib.parse
@@ -14,6 +15,7 @@ from audio_player import (
     is_playlist_url, extract_playlist_info, get_audio_url_with_retry,
     is_stream_info_fresh, get_related_tracks, _youtube_video_id,
     warm_stream_url, _can_stream_in_process, is_permanent_resolve_error,
+    is_systemic_resolve_error, youtube_block_remaining, YouTubeBlockedError, _fmt_wait,
     _RESOLVE_EXECUTOR, _STREAM_EXECUTOR,
 )
 from spotify import is_spotify_url, resolve_spotify, SpotifyError
@@ -3520,6 +3522,28 @@ async def _wait_for_voice_recovery(bot, gs, guild_id, generation, voice_channel=
     return False
 
 
+# YouTube refusing this server (the bot check, its rate limit, an IP block) is not the
+# track's fault, so auto-next keeps the track and waits instead of skipping it. Each wait
+# covers what is left of the cooldown every guild shares (audio_player._youtube_gate), never
+# less than the floor, plus jitter so guilds whose waits end together don't all ask at once.
+# The breaker still ends the chain after three refusals in a row, with the queue intact.
+_SYSTEMIC_RETRY_FLOOR = 30.0    # seconds; minimum gap between a chain's failed resolves
+_SYSTEMIC_RETRY_JITTER = 10.0   # seconds of spread on top
+_BLOCK_WAIT_POLL = 1.0          # seconds between checks that this chain is still current
+
+
+async def _wait_out_block(gs, generation, delay: float) -> bool:
+    """Sleep through a YouTube block. False if a newer chain (!!stop, a fresh !!play)
+    superseded this one meanwhile; the caller must then exit without a word."""
+    deadline = time.monotonic() + delay
+    while gs.auto_next_gen == generation:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        await asyncio.sleep(min(remaining, _BLOCK_WAIT_POLL))
+    return False
+
+
 def _start_auto_next(bot, channel_id, guild_id):
     """Cancel any existing auto-next chain for this guild and start a fresh one."""
     gs = bot.get_guild_state(guild_id)
@@ -3540,6 +3564,7 @@ async def _auto_next(bot, channel_id, guild_id, generation):
     gs = bot.get_guild_state(guild_id)
     consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 3
+    announced_block = False  # told the channel about the current YouTube block yet?
     try:
         while True:
             # If a newer auto-next was started for this guild, this one is a zombie — exit
@@ -3574,6 +3599,7 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 next_track.thumbnail = info.get("thumbnail", "")
                 next_track.url = info.get("webpage_url", "")
                 consecutive_errors = 0  # reset on success
+                announced_block = False
                 view = build_player_view(bot, title,
                                         thumbnail=next_track.thumbnail,
                                         url=next_track.url,
@@ -3616,6 +3642,34 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 if is_permanent_resolve_error(e):
                     if channel:
                         await channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+                    continue
+                # YouTube refusing this server is no fault of the track's, and the next one
+                # would be refused the same way: skipping emptied the queue in seconds, and
+                # under loop or autoplay never stopped. Keep the track, count the strike and
+                # wait out the cooldown every guild shares.
+                if is_systemic_resolve_error(e):
+                    gs.queue.requeue_front(next_track)
+                    print(f"[commands] YouTube is refusing this server (guild {guild_id}): {e}")
+                    # Another guild's probe is already asking YouTube; its answer is ours too.
+                    if not (isinstance(e, YouTubeBlockedError) and e.probing):
+                        consecutive_errors += 1
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                        wait = youtube_block_remaining()
+                        if channel:
+                            await channel.send(
+                                "YouTube is still refusing requests from this server — stopping "
+                                "auto-play. The queue is still here; try again "
+                                + (f"in {_fmt_wait(wait)}." if wait else "later."))
+                        break
+                    delay = (max(_SYSTEMIC_RETRY_FLOOR, youtube_block_remaining())
+                             + random.uniform(0, _SYSTEMIC_RETRY_JITTER))
+                    if channel and not announced_block:
+                        announced_block = True
+                        await channel.send(
+                            f"YouTube is refusing requests from this server right now — pausing "
+                            f"auto-play and trying again in {_fmt_wait(delay)}. Nothing was skipped.")
+                    if not await _wait_out_block(gs, generation, delay):
+                        return  # superseded by !!stop / a new !!play while we waited
                     continue
                 consecutive_errors += 1
                 if channel:
