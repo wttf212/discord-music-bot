@@ -63,8 +63,11 @@ class _LaneTest(unittest.TestCase):
         self.ran = []
         self.addCleanup(self.hold.set)   # never leave a worker parked
 
-    def lane(self, workers, background_slots):
-        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="test-lane")
+    def lane(self, workers, background_slots, spare_workers=0):
+        """spare_workers > 0 gives the pool more threads than the lane has slots, so a
+        test sees what the LANE admits instead of the pool's own serialisation."""
+        pool = ThreadPoolExecutor(max_workers=workers + spare_workers,
+                                  thread_name_prefix="test-lane")
         self.addCleanup(pool.shutdown, wait=False)
         return _Lane(pool, workers, background_slots)
 
@@ -132,7 +135,7 @@ class TestLaneAdmission(_LaneTest):
         """A cancelled await does not stop a running thread. Releasing its slot early
         would let the lane oversubscribe the pool, and queueing inside the pool is
         exactly the FIFO the lane exists to replace."""
-        lane = self.lane(workers=1, background_slots=1)
+        lane = self.lane(workers=1, background_slots=1, spare_workers=1)
 
         async def scenario():
             abandoned = asyncio.create_task(lane.run(self.job, "abandoned", True))
@@ -482,71 +485,93 @@ class TestSupersededPlaylistOffer(unittest.TestCase):
     PL1 = "https://www.youtube.com/playlist?list=PLfirst"
     PL2 = "https://www.youtube.com/playlist?list=PLsecond"
 
-    def test_second_playlist_cancels_the_first_enumeration(self):
-        started = {self.PL1: threading.Event(), self.PL2: threading.Event()}
-        release = {self.PL1: threading.Event(), self.PL2: threading.Event()}
-        cancelled = []
-        self.addCleanup(lambda: [e.set() for e in release.values()])
-
-        def fake_extract(query, client, limit=2000, cancel=None):
-            if limit == 1:
-                return {"title": query[-7:], "tracks": [
-                    {"url": "https://www.youtube.com/watch?v=first", "title": "first"}]}
-            started[query].set()
-            for _ in range(500):
-                if cancel is not None and cancel.is_set():
-                    cancelled.append(query)
-                    raise DownloadCancelled("superseded")
-                if release[query].wait(0.01):
-                    return {"title": query[-7:], "tracks": [
-                        {"url": f"https://www.youtube.com/watch?v={i}", "title": str(i)}
-                        for i in range(3)]}
-            raise AssertionError("enumeration never released")
+    def setUp(self):
+        self.started = {self.PL1: threading.Event(), self.PL2: threading.Event()}
+        self.release = {self.PL1: threading.Event(), self.PL2: threading.Event()}
+        self.cancelled = []
+        self.addCleanup(lambda: [e.set() for e in self.release.values()])
 
         voice_channel = SimpleNamespace(id=55)
         vc = SimpleNamespace(channel=voice_channel, is_connected=lambda: True,
                              is_playing=lambda: True)
-        gs = SimpleNamespace(
-            queue=TrackQueue(),
-            player=SimpleNamespace(is_playing=True),
-        )
+        gs = SimpleNamespace(queue=TrackQueue(), player=SimpleNamespace(is_playing=True))
         gs.queue.current = Track(query="now", title="Now Playing", requested_by="u0")
-        bot = SimpleNamespace(config={"youtube": {"client": "web"}},
-                              pending_playlists={}, command_prefix="!",
-                              get_guild_state=lambda gid: gs)
+        self.bot = SimpleNamespace(config={"youtube": {"client": "web"}},
+                                   pending_playlists={}, command_prefix="!",
+                                   get_guild_state=lambda gid: gs)
         status = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
-        ctx = SimpleNamespace(
+        self.ctx = SimpleNamespace(
             author=SimpleNamespace(id=7, voice=SimpleNamespace(channel=voice_channel)),
             guild=SimpleNamespace(id=1, voice_client=vc),
             channel=SimpleNamespace(id=99), interaction=None,
             send=AsyncMock(return_value=status),
         )
-        cog = commands.MusicCog(bot)
+        self.cog = commands.MusicCog(self.bot)
 
+        for p in (patch.object(commands, "check_channel", AsyncMock(return_value=True)),
+                  patch.object(commands, "extract_playlist_info", self._fake_extract),
+                  patch.object(audio_player, "extract_playlist_info", self._fake_extract),
+                  patch.object(commands, "_schedule_prefetch", lambda *a: None),
+                  patch.object(commands, "build_player_view", MagicMock()),
+                  patch.object(commands, "update_np_embed", AsyncMock())):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _fake_extract(self, query, client, limit=2000, cancel=None):
+        """limit=1 answers at once; a full enumeration pages until released or cancelled."""
+        if limit == 1:
+            return {"title": query[-7:], "tracks": [
+                {"url": "https://www.youtube.com/watch?v=first", "title": "first"}]}
+        self.started[query].set()
+        for _ in range(500):
+            if cancel is not None and cancel.is_set():
+                self.cancelled.append(query)
+                raise DownloadCancelled("superseded")
+            if self.release[query].wait(0.01):
+                return {"title": query[-7:], "tracks": [
+                    {"url": f"https://www.youtube.com/watch?v={i}", "title": str(i)}
+                    for i in range(3)]}
+        raise AssertionError("enumeration never released")
+
+    def _play(self, query):
+        return asyncio.create_task(
+            commands.MusicCog.play.callback(self.cog, self.ctx, query=query))
+
+    async def _enumerating(self, query):
+        await asyncio.get_running_loop().run_in_executor(None, self.started[query].wait, 2)
+
+    def test_second_playlist_cancels_the_first_enumeration(self):
         async def scenario():
-            first = asyncio.create_task(
-                commands.MusicCog.play.callback(cog, ctx, query=self.PL1))
-            await asyncio.get_running_loop().run_in_executor(None, started[self.PL1].wait, 2)
-            second = asyncio.create_task(
-                commands.MusicCog.play.callback(cog, ctx, query=self.PL2))
+            first = self._play(self.PL1)
+            await self._enumerating(self.PL1)
+            second = self._play(self.PL2)
             await asyncio.wait_for(first, 3)      # ends quietly, no exception
-            await _until(lambda: cancelled)       # the first worker stopped paging
-            await asyncio.get_running_loop().run_in_executor(None, started[self.PL2].wait, 2)
-            release[self.PL2].set()
+            await _until(lambda: self.cancelled)  # the first worker stopped paging
+            await self._enumerating(self.PL2)
+            self.release[self.PL2].set()
             await asyncio.wait_for(second, 3)
 
-        with patch.object(commands, "check_channel", AsyncMock(return_value=True)), \
-             patch.object(commands, "extract_playlist_info", fake_extract), \
-             patch.object(audio_player, "extract_playlist_info", fake_extract), \
-             patch.object(commands, "_schedule_prefetch", lambda *a: None), \
-             patch.object(commands, "build_player_view", MagicMock()), \
-             patch.object(commands, "update_np_embed", AsyncMock()):
-            asyncio.run(scenario())
+        asyncio.run(scenario())
 
-        self.assertEqual(cancelled, [self.PL1], "the superseded enumeration kept paging")
-        pending = bot.pending_playlists["99"]
+        self.assertEqual(self.cancelled, [self.PL1], "the superseded enumeration kept paging")
+        pending = self.bot.pending_playlists["99"]
         self.assertEqual(pending["query"], self.PL2)
         self.assertEqual(len(pending["tracks"]), 2)
+
+    def test_cancelling_the_command_itself_still_propagates(self):
+        """Only an abandoned enumeration is swallowed. When the !play task is the one
+        being cancelled (shutdown), it must end cancelled — and asyncio cancels the
+        enumeration it awaits, so the worker stops paging too."""
+        async def scenario():
+            first = self._play(self.PL1)
+            await self._enumerating(self.PL1)
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            await _until(lambda: self.cancelled)
+
+        asyncio.run(scenario())
+        self.assertEqual(self.cancelled, [self.PL1])
 
     def test_abandon_paths_cancel_rather_than_just_discard(self):
         """Voice-connect failure, a failed first track and offer expiry all leave an

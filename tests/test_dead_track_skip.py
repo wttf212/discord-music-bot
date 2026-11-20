@@ -105,6 +105,9 @@ class TestPrefetchDropsDeadTracks(unittest.TestCase):
 
         async def _no_sleep(seconds):
             self.waits.append(seconds)
+            # The floor is re-checked after the sleep, so let its clock advance:
+            # moving the last claim back is the same as time passing.
+            commands._last_prefetch_monotonic -= seconds
 
         self._sleep = patch("asyncio.sleep", _no_sleep)
         self._sleep.start()
@@ -122,7 +125,7 @@ class TestPrefetchDropsDeadTracks(unittest.TestCase):
                 raise REMOVED
             return _fresh_info("Good Song")
 
-        with patch.object(commands, "get_audio_url_with_retry", side_effect=resolve):
+        with patch.object(commands, "resolve_audio", side_effect=resolve):
             asyncio.run(commands._prefetch_next_track(bot, 1))
 
         self.assertEqual([t.query for t in bot._gs.queue.list()], ["good"],
@@ -135,7 +138,7 @@ class TestPrefetchDropsDeadTracks(unittest.TestCase):
         bot = _Bot()
         t = Track(query="q", title="Song", requested_by="u1")
         bot._gs.queue.add(t)
-        with patch.object(commands, "get_audio_url_with_retry", side_effect=RATE_LIMITED):
+        with patch.object(commands, "resolve_audio", side_effect=RATE_LIMITED):
             asyncio.run(commands._prefetch_next_track(bot, 1))
         self.assertEqual(len(bot._gs.queue.list()), 1)
         self.assertIsNone(t.resolved_info)
@@ -151,7 +154,7 @@ class TestPrefetchDropsDeadTracks(unittest.TestCase):
             calls.append(query)
             raise REMOVED
 
-        with patch.object(commands, "get_audio_url_with_retry", side_effect=resolve):
+        with patch.object(commands, "resolve_audio", side_effect=resolve):
             asyncio.run(commands._prefetch_next_track(bot, 1))
 
         self.assertEqual(len(calls), commands._PREFETCH_MAX_DEAD_SKIPS + 1)
@@ -164,7 +167,7 @@ class TestPrefetchDropsDeadTracks(unittest.TestCase):
     def test_all_dead_then_empty_queue_is_handled(self):
         bot = _Bot()
         bot._gs.queue.add(Track(query="dead", title="d", requested_by="u1"))
-        with patch.object(commands, "get_audio_url_with_retry", side_effect=REMOVED):
+        with patch.object(commands, "resolve_audio", side_effect=REMOVED):
             asyncio.run(commands._prefetch_next_track(bot, 1))
         self.assertEqual(len(bot._gs.queue.list()), 0)
 
@@ -172,7 +175,7 @@ class TestPrefetchDropsDeadTracks(unittest.TestCase):
         bot = _Bot()
         t = Track(query="q", title="Song", requested_by="u1")
         bot._gs.queue.add(t)
-        with patch.object(commands, "get_audio_url_with_retry",
+        with patch.object(commands, "resolve_audio",
                           return_value=_fresh_info()) as m:
             asyncio.run(commands._prefetch_next_track(bot, 1))
         self.assertEqual(m.call_count, 1)

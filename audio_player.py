@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import functools
 import queue
 import random
 import shutil
@@ -9,14 +10,14 @@ import sys
 import os
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from urllib.error import URLError
 from urllib.parse import urlparse, parse_qs
 
 from concurrent.futures import ThreadPoolExecutor
 
 import discord
-from yt_dlp.utils import DownloadError
+from yt_dlp.utils import DownloadCancelled, DownloadError
 
 # Audio work runs on dedicated pools, NOT asyncio's default executor.
 #
@@ -33,11 +34,126 @@ from yt_dlp.utils import DownloadError
 #   STREAM is pure waiting — settle backoffs, 1-byte warm probes, FFmpeg spawn,
 #     subprocess reaping. Threads here are blocked, not busy, so the pool can be wide
 #     and must not be throttled by core count.
+# A third pool, PLAYLIST, takes playlist enumeration and autoplay Mix refills: flat
+# metadata (no Deno), but one 2000-track enumeration pages YouTube for ~20 s, and in the
+# resolve pool that held a worker a user's !play needed for the whole time.
+#
+# Work reaches RESOLVE and PLAYLIST only through a _Lane (below), never by submitting to
+# the pool directly: a bare pool is one FIFO queue shared by every guild.
 _CPU_COUNT = os.cpu_count() or 2
+_RESOLVE_WORKERS = max(4, min(8, _CPU_COUNT))   # also the cap on concurrent Deno solves
 _RESOLVE_EXECUTOR = ThreadPoolExecutor(
-    max_workers=max(4, min(8, _CPU_COUNT)), thread_name_prefix="yt-resolve")
+    max_workers=_RESOLVE_WORKERS, thread_name_prefix="yt-resolve")
 _STREAM_EXECUTOR = ThreadPoolExecutor(
     max_workers=32, thread_name_prefix="audio-stream")
+_PLAYLIST_WORKERS = 3
+_PLAYLIST_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_PLAYLIST_WORKERS, thread_name_prefix="yt-playlist")
+
+
+class _Lane:
+    """Admission to a worker pool: user-facing work first, background work capped.
+
+    A bare ThreadPoolExecutor is one FIFO queue, so a guild's cold !play waited behind
+    whatever any guild had submitted first — prefetches, queue-add lookups, retries.
+    A lane admits at most one job per worker, so nothing ever queues inside the pool;
+    the queueing happens here instead, where it can be ordered:
+      * waiting user-facing jobs are admitted before background ones (FIFO within each);
+      * background jobs may hold at most ``background_slots`` workers, so no amount of
+        background work from any number of guilds can take the last ones.
+
+    A slot is freed when its thread finishes, not when the awaiting task gives up: a
+    cancelled await does not stop a running thread, and freeing the slot early would
+    put two jobs on one worker again.
+
+    State is touched only on the event loop thread (workers hand releases back with
+    call_soon_threadsafe). The bot has one loop; every asyncio.run() in the tests is a
+    new one, so the lane rebinds — and forgets old jobs — when the loop changes.
+    """
+
+    def __init__(self, executor: ThreadPoolExecutor, slots: int, background_slots: int):
+        self._executor = executor
+        self._slots = slots
+        self._background_slots = background_slots
+        self._loop = None
+
+    def _bind(self, loop) -> None:
+        self._loop = loop
+        self._running = 0
+        self._running_background = 0
+        self._waiting = {False: deque(), True: deque()}   # keyed by `background`
+
+    def _has_room(self, background: bool) -> bool:
+        if self._running >= self._slots:
+            return False
+        return not background or self._running_background < self._background_slots
+
+    def _take(self, background: bool) -> None:
+        self._running += 1
+        if background:
+            self._running_background += 1
+
+    def _admit(self) -> None:
+        for background in (False, True):          # user-facing waiters first
+            waiting = self._waiting[background]
+            while waiting and self._has_room(background):
+                waiter = waiting.popleft()
+                if not waiter.done():              # skip waiters cancelled in the queue
+                    self._take(background)
+                    waiter.set_result(None)
+
+    def _release(self, loop, background: bool) -> None:
+        if loop is not self._loop:
+            return          # a job from an earlier event loop; its state is gone
+        self._running -= 1
+        if background:
+            self._running_background -= 1
+        self._admit()
+
+    def _release_from_worker(self, loop, background: bool, _job) -> None:
+        try:
+            loop.call_soon_threadsafe(self._release, loop, background)
+        except RuntimeError:
+            pass            # loop already closed — nothing left to admit
+
+    async def run(self, fn, *args, background: bool = False):
+        """Run fn(*args) on the pool once admitted, and return (or raise) its result."""
+        loop = asyncio.get_running_loop()
+        if loop is not self._loop:
+            self._bind(loop)
+        waiting = self._waiting[background]
+        if waiting or not self._has_room(background) or (background and self._waiting[False]):
+            waiter = loop.create_future()
+            waiting.append(waiter)
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                if waiter.done() and not waiter.cancelled():
+                    self._release(loop, background)    # admitted, then cancelled
+                else:
+                    with contextlib.suppress(ValueError):
+                        waiting.remove(waiter)
+                    self._admit()
+                raise
+        else:
+            self._take(background)
+        try:
+            job = self._executor.submit(fn, *args)
+        except BaseException:
+            self._release(loop, background)
+            raise
+        job.add_done_callback(functools.partial(self._release_from_worker, loop, background))
+        return await asyncio.wrap_future(job, loop=loop)
+
+
+# RESOLVE: user-facing resolves (a cold !play, a skip or track change with no prefetch, a
+# playlist's first track) are admitted first; background ones (prefetch, queue-add
+# lookups) may hold half the workers. The slots are the pool's workers, so the cap on
+# concurrent Deno solves is unchanged.
+_RESOLVE_LANE = _Lane(_RESOLVE_EXECUTOR, _RESOLVE_WORKERS, max(1, _RESOLVE_WORKERS // 2))
+# PLAYLIST: enumerations are background and may hold 2 of the 3 workers, so an autoplay
+# refill — which can sit on a track transition — always finds one free.
+_PLAYLIST_LANE = _Lane(_PLAYLIST_EXECUTOR, _PLAYLIST_WORKERS, _PLAYLIST_WORKERS - 1)
 
 # Set on shutdown. Worker threads park in settle backoffs and retry sleeps for several
 # seconds at a time, and concurrent.futures joins its (non-daemon) workers at
@@ -52,6 +168,7 @@ def shutdown_audio() -> None:
     _shutdown.set()
     _RESOLVE_EXECUTOR.shutdown(wait=False, cancel_futures=True)
     _STREAM_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    _PLAYLIST_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
 # Load bgutil PO token provider plugin for yt-dlp
 _base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -288,11 +405,13 @@ def is_permanent_resolve_error(exc: BaseException) -> bool:
     return not _is_retryable_ytdlp_error(exc)
 
 
-def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.0,
-                        fast_delay: float = 1.5, jitter: float = 0.25, **kwargs):
-    """Retry a synchronous callable with exponential backoff + jitter.
+async def _retry_with_backoff(submit, *, max_attempts: int = 3, base_delay: float = 5.0,
+                              fast_delay: float = 1.5, jitter: float = 0.25):
+    """Await ``submit()`` — one submission per attempt — with exponential backoff + jitter.
 
-    Runs inside the executor thread — uses time.sleep (NOT asyncio.sleep).
+    The backoff is an asyncio.sleep on the event loop between submissions. It used to be
+    a time.sleep inside the resolve worker, which parked that worker for 3.75-12.5 s on
+    every 429/5xx while other guilds' resolves queued behind it.
     Re-raises immediately on non-retryable errors to avoid accelerating IP bans
     when YouTube returns a permanent policy error (video unavailable, sign-in,
     age-restricted, geo-block).
@@ -304,7 +423,7 @@ def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.
     last_exc = None
     for attempt in range(max_attempts):
         try:
-            return fn(*args, **kwargs)
+            return await submit()
         except Exception as exc:
             last_exc = exc
             if not _is_retryable_ytdlp_error(exc):
@@ -324,13 +443,7 @@ def _retry_with_backoff(fn, *args, max_attempts: int = 3, base_delay: float = 5.
                 f"[retry] attempt {attempt + 1}/{max_attempts} failed: "
                 f"{exc_class}: {msg_preview} — sleeping {sleep_seconds:.1f}s"
             )
-            # Deliberately time.sleep, not _shutdown.wait: the retry-tier tests patch
-            # time.sleep to assert the backoff values, and that coverage is worth more
-            # than interrupting a sleep that only happens when a resolve is already
-            # failing. The check above stops FURTHER retries once shutdown starts, and
-            # the sleeps that actually run on every track start (settle, warm-up) are
-            # interruptible.
-            time.sleep(sleep_seconds)
+            await asyncio.sleep(sleep_seconds)
     # Unreachable (loop always either returns or raises), but keep the invariant explicit.
     raise last_exc  # type: ignore[misc]
 
@@ -467,16 +580,27 @@ def _resolver(key: tuple, ydl_opts: dict):
             yield ydl
 
 
-def get_audio_url_with_retry(query: str, client: str, debug: bool = False, cookies_file: str | None = None) -> dict:
-    """Retrying wrapper around get_audio_url (RETRY-01).
+async def resolve_audio(query: str, client: str, debug: bool = False,
+                        cookies_file: str | None = None, *, background: bool = False) -> dict:
+    """Resolve a track for playback: the async front door to get_audio_url (RETRY-01).
 
-    Retries on HTTP 429, 5xx, and connection-layer errors with exponential backoff
-    (3 attempts, base 5s, ±25% jitter). Surfaces video-unavailable / sign-in /
-    age-restricted / geo-blocked errors immediately — retrying those accelerates
-    IP bans.
+    * A still-fresh resolve-cache hit is answered here, before anything is submitted —
+      a replayed or looped track needs no worker, no Deno and no YouTube call.
+    * The resolve runs in _RESOLVE_LANE. Pass ``background=True`` for work nobody is
+      waiting on (prefetch, queue-add lookups) so it can never delay a user's !play.
+    * Retries on HTTP 429, 5xx, and connection-layer errors with exponential backoff
+      (3 attempts, base 5s, ±25% jitter), sleeping on the event loop between attempts.
+      Surfaces video-unavailable / sign-in / age-restricted / geo-blocked errors
+      immediately — retrying those accelerates IP bans.
     """
-    return _retry_with_backoff(
-        get_audio_url, query, client, debug, cookies_file,
+    cached = _resolve_cache_get(query)
+    if cached is not None:
+        if debug:
+            print(f"[debug][yt-dlp] Resolve cache hit: {cached['title']!r}")
+        return cached
+    return await _retry_with_backoff(
+        lambda: _RESOLVE_LANE.run(get_audio_url, query, client, debug, cookies_file,
+                                  background=background),
         max_attempts=3, base_delay=5.0, jitter=0.25,
     )
 
@@ -1233,13 +1357,32 @@ def is_playlist_url(query: str) -> bool:
 MAX_PLAYLIST_TRACKS = 2000  # hard cap on tracks loaded from a single playlist (~20 browse pages, paced)
 
 
-def extract_playlist_info(query: str, client: str, limit: int = MAX_PLAYLIST_TRACKS) -> dict:
+def _stop_requests_when(ydl, cancel: threading.Event | None) -> None:
+    """Make ``ydl`` refuse its next HTTP request once ``cancel`` (or shutdown) is set.
+
+    Every page an extractor fetches goes through YoutubeDL.urlopen, so this is where a
+    paged enumeration stops between pages: DownloadCancelled is raised before the
+    request leaves the box, and yt-dlp passes it straight up through extract_info.
+    """
+    urlopen = ydl.urlopen
+
+    def guarded(req):
+        if _shutdown.is_set() or (cancel is not None and cancel.is_set()):
+            raise DownloadCancelled("playlist enumeration cancelled")
+        return urlopen(req)
+
+    ydl.urlopen = guarded
+
+
+def extract_playlist_info(query: str, client: str, limit: int = MAX_PLAYLIST_TRACKS,
+                          cancel: threading.Event | None = None) -> dict:
     """Extract playlist title and track list using yt-dlp (metadata only, no streams).
 
     Returns {"title": str, "tracks": [{"url": str, "title": str}, ...]},
     capped at ``limit`` entries (default MAX_PLAYLIST_TRACKS). Pass limit=1 to
     fetch just the first track fast (one page) so playback can start before the
-    full enumeration finishes.
+    full enumeration finishes. Setting ``cancel`` (or shutting down) stops it before
+    its next page request with DownloadCancelled.
     """
     limit = max(1, min(limit, MAX_PLAYLIST_TRACKS))
     ydl_opts = {
@@ -1260,6 +1403,7 @@ def extract_playlist_info(query: str, client: str, limit: int = MAX_PLAYLIST_TRA
         ydl_opts["extractor_args"] = {"youtube": yt_args}
 
     with YoutubeDL(ydl_opts) as ydl:
+        _stop_requests_when(ydl, cancel)
         info = ydl.extract_info(query, download=False)
 
     # entries may be a lazy generator; materialize it
@@ -1283,6 +1427,23 @@ def extract_playlist_info(query: str, client: str, limit: int = MAX_PLAYLIST_TRA
         "title": info.get("title", "Unknown Playlist"),
         "tracks": tracks[:limit],
     }
+
+
+async def enumerate_playlist(query: str, client: str) -> dict:
+    """Enumerate a whole playlist (up to MAX_PLAYLIST_TRACKS) in the playlist lane.
+
+    Background work: nobody is waiting on it until they click "Load playlist".
+    Cancelling the awaiting task abandons it — the worker stops before its next page
+    request instead of paging the rest of a 2000-track list for an offer that was
+    superseded or expired.
+    """
+    cancel = threading.Event()
+    try:
+        return await _PLAYLIST_LANE.run(extract_playlist_info, query, client,
+                                        MAX_PLAYLIST_TRACKS, cancel, background=True)
+    except asyncio.CancelledError:
+        cancel.set()
+        raise
 
 
 class _PrimedAudioSource(discord.AudioSource):
@@ -1545,10 +1706,8 @@ class AudioPlayer:
             else:
                 if self._debug:
                     print("[debug][player] Resolving audio URL via in-process yt-dlp")
-                info = await loop.run_in_executor(
-                    _RESOLVE_EXECUTOR, get_audio_url_with_retry,
-                    url_or_query, yt["client"], self._debug, cookies_file
-                )
+                info = await resolve_audio(url_or_query, yt["client"], self._debug,
+                                           cookies_file)
 
             proc = await loop.run_in_executor(
                 _STREAM_EXECUTOR, _open_audio_stream, url_or_query, yt["client"],
