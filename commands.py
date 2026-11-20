@@ -3126,8 +3126,19 @@ class MusicCog(commands.Cog):
 
         # Start playback if nothing is currently playing
         if not gs.player.is_playing:
+            # Not while voice is down: a chain waiting the drop out plays these tracks itself
+            # once voice is back, and the disarm below would cancel that wait (the manual
+            # skips refuse for the same reason).
+            if _live_voice_client(self.bot, gs, ctx.guild.id) is None:
+                await ctx.send("Voice connection is down, so nothing started yet — the tracks are queued.")
+                return
             next_track = gs.queue.next()
             if next_track:
+                # Disarm the armed auto-next chain before play() (see prev/next button pattern above).
+                if gs.auto_next_task and not gs.auto_next_task.done():
+                    gs.auto_next_task.cancel()
+                    gs.auto_next_task = None
+                gs.auto_next_gen += 1
                 try:
                     info = await gs.player.play(next_track.query, next_track.resolved_info, next_track.resolved_at)
                     title = info["title"]
@@ -3143,7 +3154,9 @@ class MusicCog(commands.Cog):
                     await send_new_np(self.bot, channel_id, view)
                     _start_auto_next(self.bot, channel_id, ctx.guild.id)
                 except Exception as e:
-                    await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+                    print(f"[commands] !!loadall playback start failed (guild {ctx.guild.id}): {e}")
+                    if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track, e):
+                        await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
 
     @commands.command(name="bitrate")
     async def bitrate(self, ctx: commands.Context, kbps: str = None):
