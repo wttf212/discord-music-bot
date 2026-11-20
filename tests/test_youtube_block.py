@@ -30,8 +30,6 @@ from audio_player import _is_retryable_ytdlp_error, is_permanent_resolve_error
 from track_queue import Track, TrackQueue
 from yt_dlp.utils import DownloadError
 
-# The new names are looked up at call time, so a missing one fails its own tests rather
-# than the whole module at import.
 def _systemic(exc):
     return audio_player.is_systemic_resolve_error(exc)
 
@@ -135,9 +133,8 @@ class _CleanBlockState(unittest.TestCase):
     unrelated tests that happen to resolve something. Start and end with YouTube answering."""
 
     def setUp(self):
-        if hasattr(audio_player, "_yt_block_until"):
-            _reset_block()
-            self.addCleanup(_reset_block)
+        _reset_block()
+        self.addCleanup(_reset_block)
         audio_player._resolve_cache.clear()
         audio_player._inflight_resolves.clear()
         self.addCleanup(audio_player._resolve_cache.clear)
@@ -446,12 +443,9 @@ class TestAutoNextDuringABlock(unittest.TestCase):
             patch.object(commands, "_schedule_prefetch", return_value=None),
             patch.object(commands, "_schedule_autoplay_topup", return_value=None),
             patch.object(commands, "_autoplay_pick", _record_pick),
+            patch.object(commands, "_wait_out_block", _record_wait),
+            patch.object(commands, "youtube_block_remaining", return_value=0.0),
         ]
-        if hasattr(commands, "_wait_out_block"):
-            patches += [
-                patch.object(commands, "_wait_out_block", _record_wait),
-                patch.object(commands, "youtube_block_remaining", return_value=0.0),
-            ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
