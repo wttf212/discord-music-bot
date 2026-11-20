@@ -90,7 +90,7 @@ class _FakeVoice:
     def is_paused(self):
         return False
 
-    def play(self, source, after=None):
+    def play(self, source, after=None, **encoder_settings):
         if self.play_error:
             raise self.play_error
         self.played = source

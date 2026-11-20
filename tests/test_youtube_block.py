@@ -823,7 +823,7 @@ class _PlayVC:
     def stop(self):
         pass
 
-    def play(self, source, after=None):
+    def play(self, source, after=None, **encoder_settings):
         self.played.append(source)
 
 
