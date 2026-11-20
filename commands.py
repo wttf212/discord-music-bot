@@ -3080,6 +3080,11 @@ class MusicCog(commands.Cog):
             print(f"[commands] Manual advance failed (guild {ctx.guild.id}): {e}")
             if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track, e):
                 await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
+            elif ctx.interaction:
+                # Auto-play tells the channel why it waits; the deferred slash command
+                # ("is thinking…") still needs an answer of its own.
+                await _respond(ctx.interaction, "Couldn't start that track yet — it's back in "
+                                                "the queue, and auto-play will retry it.")
             return
         # Armed before any reply: a reply that fails (a dead interaction token) must
         # not leave auto-play off after this track.

@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import discord
+import audio_player
 import commands
 from track_queue import Track, TrackQueue
 
@@ -87,13 +88,16 @@ class _Ctx:
 
 
 class _Player:
-    def __init__(self, during_play=None):
+    def __init__(self, during_play=None, error=None):
         self.is_playing = False
         self._during_play = during_play
+        self._error = error
 
     async def play(self, query, resolved_info, resolved_at):
         if self._during_play:
             self._during_play()
+        if self._error is not None:
+            raise self._error
         return {"title": query, "thumbnail": "", "webpage_url": ""}
 
     def stop_playback(self):
@@ -165,6 +169,37 @@ class TestSkiptoSlash(_Patched):
         it = _Interaction(expired=True)   # already dead when the command started
         self._skipto(it)
         self.start_auto_next.assert_called_once()
+
+    def test_a_start_handed_back_to_auto_play_still_answers(self):
+        """A YouTube block, or voice dropping during the play(), keeps the track and hands it
+        to auto-play, which tells the channel why it waits. The handler stays quiet for a
+        prefix command, but a deferred slash command shows "is thinking…" until answered."""
+        from yt_dlp.utils import DownloadError
+        refusals = {
+            "shared cooldown": (audio_player.YouTubeBlockedError(60.0), object()),
+            "bot check": (DownloadError("ERROR: [youtube] abc123: Sign in to confirm you’re "
+                                        "not a bot."), object()),
+            "voice drop": (discord.ClientException("Not connected to voice."), None),
+        }
+        for name, (error, voice_after) in refusals.items():
+            for slash in (True, False):
+                with self.subTest(name, slash=slash):
+                    self.start_auto_next.reset_mock()
+                    gs = _guild_state(_Player(error=error))
+                    it = _Interaction() if slash else None
+                    ctx = _Ctx(_Bot(gs), it)
+                    # healthy for the check before the advance, then as play() left it
+                    with patch.object(commands, "_live_voice_client",
+                                      side_effect=[object(), voice_after]):
+                        asyncio.run(commands.MusicCog.skipto.callback(
+                            SimpleNamespace(bot=ctx.bot), ctx, 2))
+                    self.start_auto_next.assert_called_once()
+                    self.assertEqual([t.query for t in gs.queue.list()], ["t2", "t3"])
+                    if slash:
+                        self.assertEqual(len(it.replies), 1, it.replies)
+                        self.assertNotIn("skipping", it.replies[0][0].lower())
+                    else:
+                        self.assertEqual(ctx.channel_sent, [], "the chain tells the channel")
 
 
 class TestSetlocationSlash(_Patched):
