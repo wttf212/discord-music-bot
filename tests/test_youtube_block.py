@@ -421,7 +421,9 @@ class _Bot:
         return self.channel
 
 
-class TestAutoNextDuringABlock(unittest.TestCase):
+class _AutoNextHarness(unittest.TestCase):
+    """Runs the real _auto_next against a fake player. The now-playing card, prefetch,
+    autoplay and the block wait are faked out, and the waits and picks are recorded."""
 
     def setUp(self):
         self.waits = []
@@ -469,6 +471,9 @@ class TestAutoNextDuringABlock(unittest.TestCase):
     @staticmethod
     def _count(sent, needle):
         return sum(needle in m.lower() for m in sent)
+
+
+class TestAutoNextDuringABlock(_AutoNextHarness):
 
     def test_a_block_loses_no_tracks_and_ends_at_the_breaker(self):
         tracks = _tracks(4)
@@ -572,6 +577,98 @@ class TestAutoNextDuringABlock(unittest.TestCase):
         self.assertEqual(len(player.calls), MAX_CONSECUTIVE_ERRORS)
         self.assertEqual(self._count(sent, "too many consecutive errors"), 1)
         self.assertEqual(gs.queue.list(), [tracks[3]])
+
+
+class _DeadTrackPlayer(_ScriptedPlayer):
+    """Fake player for a queue with dead tracks in it. Every play of a dead track fails
+    with the same per-track error, the way YouTube answers a removed or private video every
+    time, and every other track plays. A healthy loop never ends by itself, so once `plays`
+    tracks have played the chain is cancelled, the way !!stop cancels it."""
+
+    def __init__(self, dead, plays=0, error=REMOVED):
+        super().__init__()
+        self.dead, self.plays, self.error = set(dead), plays, error
+        self.played = []
+
+    async def play(self, query, resolved_info, resolved_at):
+        self.calls.append(query)
+        if len(self.calls) > 20:
+            raise _Spin(f"auto-next is spinning: {self.calls}")
+        if query in self.dead:
+            raise self.error
+        self.played.append(query)
+        return {"title": query, "thumbnail": "", "webpage_url": ""}
+
+    async def wait_for_playback(self):
+        if self.plays and len(self.played) >= self.plays:
+            raise asyncio.CancelledError   # !!stop
+
+
+class TestDeadTracksUnderLoop(_AutoNextHarness):
+    """A removed, private, age-gated or geo-blocked track fails the same way every time.
+    Loop "track" used to hand the same dead track straight back to play(), and loop "queue"
+    cycled it round to fail again every lap: one YouTube request and one "Skipping track"
+    message per turn, forever. A loop has to let go of it and move on, still without
+    counting it toward the breaker."""
+
+    @staticmethod
+    def _on_repeat():
+        return Track(query="now", title="now", requested_by="u")
+
+    def test_loop_track_moves_past_a_track_that_died(self):
+        """The track on repeat was taken down mid-loop."""
+        for name, error in PER_TRACK.items():
+            with self.subTest(name):
+                player = _DeadTrackPlayer({"now"}, plays=2, error=error)
+                gs, sent = self._run(player, _tracks(2), loop_mode="track",
+                                     current=self._on_repeat())
+                self.assertEqual(player.calls, ["now", "t0", "t0"],
+                                 "one try at the dead track, then the next one, on repeat")
+                self.assertEqual(self._count(sent, "skipping track"), 1)
+                self.assertEqual([t.query for t in gs.queue.list()], ["t1"])
+
+    def test_a_loop_of_nothing_but_dead_tracks_ends(self):
+        for mode in ("track", "queue"):
+            for shape, queued, current in (("the track on repeat", [], self._on_repeat()),
+                                           ("a queue of them", _tracks(3), None)):
+                with self.subTest(loop=mode, dead=shape):
+                    commands.update_np_stopped.reset_mock()
+                    dead = [t.query for t in ([current] if current else []) + queued]
+                    player = _DeadTrackPlayer(dead)
+                    gs, sent = self._run(player, queued, loop_mode=mode, current=current)
+                    self.assertEqual(player.calls, dead, "each dead track is tried once")
+                    self.assertEqual(self._count(sent, "skipping track"), len(dead))
+                    self.assertEqual(gs.queue.list(), [])
+                    self.assertIsNone(gs.queue.current)
+                    commands.update_np_stopped.assert_awaited_once()
+
+    def test_dead_tracks_never_count_toward_the_breaker(self):
+        """More dead tracks in a row than the breaker allows, then a good one."""
+        for mode in ("track", "queue"):
+            with self.subTest(loop=mode):
+                tracks = _tracks(MAX_CONSECUTIVE_ERRORS + 2)
+                dead = [t.query for t in tracks[:-1]]
+                player = _DeadTrackPlayer(dead, plays=1)
+                gs, sent = self._run(player, tracks, loop_mode=mode)
+                self.assertEqual(player.calls, dead + [tracks[-1].query])
+                self.assertEqual(self._count(sent, "consecutive errors"), 0)
+                self.assertEqual(self.waits, [], "a dead track is no reason to wait")
+
+    def test_loop_queue_drops_a_dead_track_and_keeps_the_rest_cycling(self):
+        player = _DeadTrackPlayer({"t1"}, plays=5)
+        gs, sent = self._run(player, _tracks(3), loop_mode="queue")
+        self.assertEqual(player.played, ["t0", "t2", "t0", "t2", "t0"])
+        self.assertEqual(player.calls.count("t1"), 1, "not retried every lap")
+        self.assertEqual(self._count(sent, "skipping track"), 1)
+        self.assertNotIn("t1", [t.query for t in gs.queue.list()])
+
+    def test_loop_off_still_consumes_a_dead_track_as_before(self):
+        """Loop "off" is untouched: the dead track stays current until next() moves on,
+        so when it was the last one, autoplay still seeds from it."""
+        player = _DeadTrackPlayer({"t0"})
+        gs, sent = self._run(player, _tracks(1), autoplay=True)
+        self.assertEqual(player.calls, ["t0"])
+        self.assertEqual([pick[2].query for pick in self.autoplay_picks], ["t0"])
 
 
 class TestWaitOutBlock(unittest.TestCase):
