@@ -3656,6 +3656,14 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                 # session. The breaker is for systemic failure (network down, blocked
                 # IP), where retrying the whole queue would be pointless and noisy.
                 if is_permanent_resolve_error(e):
+                    # It fails the same way every time, but under a loop next() would hand it
+                    # straight back (loop "track") or cycle it round to fail again next lap
+                    # (loop "queue"): a YouTube request and a message per turn, forever.
+                    # Clearing `current` drops it from the rotation, so next() moves on.
+                    # Loop "off" keeps it, as before: next() files it into history and
+                    # autoplay can still seed from it.
+                    if gs.queue.loop_mode != "off":
+                        gs.queue.current = None
                     if channel:
                         await channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
                     continue
