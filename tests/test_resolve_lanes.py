@@ -343,7 +343,8 @@ class TestBackgroundWorkIsMarkedBackground(unittest.TestCase):
     def test_user_facing_resolves_are_not_background(self):
         import inspect
         sources = {
-            "AudioPlayer.play": inspect.getsource(audio_player.AudioPlayer.play),
+            # play()'s body, which play() wraps to tear down an abandoned start.
+            "AudioPlayer.play": inspect.getsource(audio_player.AudioPlayer._start_playback),
             "!play": inspect.getsource(commands.MusicCog.play.callback),
             "search pick": inspect.getsource(commands._play_selected),
         }

@@ -459,7 +459,7 @@ class TestCallSite(unittest.TestCase):
     def test_play_uses_resolve_audio(self):
         # Collapse all whitespace so multi-line formatting of the call doesn't matter.
         import inspect
-        play_src = "".join(inspect.getsource(audio_player.AudioPlayer.play).split())
+        play_src = "".join(inspect.getsource(audio_player.AudioPlayer._start_playback).split())  # play()'s body
         self.assertIn("awaitresolve_audio(url_or_query,", play_src,
                       "AudioPlayer.play() must resolve through resolve_audio (retry + lane)")
         src = "".join(self._read_source().split())
