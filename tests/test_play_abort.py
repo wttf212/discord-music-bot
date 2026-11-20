@@ -22,7 +22,8 @@ import discord
 import audio_player
 
 FRAME = b"\x00" * audio_player._PCM_FRAME_SIZE
-INFO = {"title": "T", "url": "https://r1.googlevideo.com/videoplayback?id=x",
+# Handed to play() as a fresh prefetch, so no test depends on how resolving works.
+INFO = {"title": "T", "url": "https://r1.googlevideo.com/videoplayback?id=x&expire=99999999999",
         "webpage_url": "https://www.youtube.com/watch?v=x"}
 
 
@@ -129,9 +130,7 @@ class _Harness:
                 super().__init__(*args, **kwargs)
                 harness.buffers.append(self)
 
-        with patch.object(audio_player, "get_audio_url_with_retry",
-                          lambda *a, **k: dict(INFO)), \
-             patch.object(audio_player, "_open_audio_stream", self.open_stream), \
+        with patch.object(audio_player, "_open_audio_stream", self.open_stream), \
              patch.object(discord, "FFmpegPCMAudio", lambda *a, **k: _FakeFFmpeg(harness)), \
              patch.object(audio_player, "_BufferedAudioSource", _RecordingBuffer):
             yield
@@ -147,7 +146,7 @@ class TestAbortedStartLeavesNothingRunning(unittest.TestCase):
         outcome = {}
 
         async def scenario():
-            task = asyncio.ensure_future(player.play("q"))
+            task = asyncio.ensure_future(player.play("q", prefetched_info=dict(INFO)))
             if cancel:
                 parked = await asyncio.get_running_loop().run_in_executor(
                     None, harness.entered.wait, 5)
