@@ -960,17 +960,28 @@ def _resolve_audio_url(query: str, client: str, debug: bool = False,
                 print("[yt-dlp] PO Token: not present in URL")
 
             if not is_audio_only:
+                with_pot = "pot=" in url
+                cause = ("bgutil attestation may be broken (YouTube changed ytAtR)" if with_pot
+                         else f"YouTube is serving the '{client}' client only this format for "
+                              f"this video (no PO token was involved)")
                 print(f"[yt-dlp] WARNING: Combined video+audio format selected "
                       f"(vcodec={vcodec}, format={info.get('format_id')}). "
-                      f"Audio-only streams unavailable — bgutil attestation may be broken "
-                      f"(YouTube changed ytAtR). Audio will still play (video stripped by FFmpeg) "
-                      f"but quality is limited to ~128kbps AAC instead of opus.")
+                      f"Audio-only streams unavailable — {cause}. Audio will still play "
+                      f"(video stripped by FFmpeg) but quality is limited to ~128kbps AAC "
+                      f"instead of opus.")
                 # One-shot re-resolve with the CLI provider forced. The HTTP server needs
                 # ytAtR from the webpage for BotGuard challenge data; when YouTube changes
                 # that it degrades to weak tokens that only unlock format 18. The CLI has
                 # its own Rust PPA implementation and needs no webpage attestation, so it
                 # still unlocks opus. force_cli guards the recursion at depth 1.
-                if not force_cli:
+                # Only when this result carried a PO token: with none in the URL (fetch_pot
+                # "auto" fetches none for web_embedded) the retry asks YouTube the same
+                # question again — ~3 s more before the track starts, for the same format 18.
+                if not force_cli and not with_pot:
+                    print("[yt-dlp] No PO token was used, so a CLI-forced retry can't help — "
+                          "keeping the combined format. If this keeps happening, try another "
+                          "youtube.client in config.yaml.")
+                elif not force_cli:
                     print("[yt-dlp] Retrying once with the bgutil CLI provider forced…")
                     try:
                         retry = get_audio_url(original_query, client, debug, cookies_file,

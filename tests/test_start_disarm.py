@@ -211,7 +211,8 @@ def _waiting_guild(error):
     """Auto-play is waiting a block or a voice drop out: its chain is armed and the track it
     put back is at the head of the queue."""
     gs = SimpleNamespace(queue=TrackQueue(), player=_FailingPlayer(error), auto_next_gen=5,
-                         auto_next_task=MagicMock(), autoplay=False, current_text_channel_id=None)
+                         auto_next_task=MagicMock(), autoplay=False, current_text_channel_id=None,
+                         np_message_id=None)
     gs.auto_next_task.done.return_value = False
     gs.queue.requeue_front(Track(query="kept", title="kept", requested_by="u"))
     return gs
@@ -243,34 +244,57 @@ class _StartHarness(_Patched):
         return gs, chain, bot.sent
 
 
-class TestPlaylistStart(_StartHarness):
-    """!!play <playlist> with nothing audible resolves track 1 inside play(), after the
-    disarm. A YouTube block refusing it, or voice dropping during it, cancelled the chain that
-    was waiting one out and never re-armed it, so the track that chain kept never played."""
-
-    @staticmethod
-    async def _play_playlist(bot, ctx, gs):
+def _playlist_start(resolve_error=None):
+    """!!play <playlist> whose track 1 resolve raises `resolve_error`; the full enumeration
+    never finishes, so nothing here can depend on it."""
+    async def start(bot, ctx, gs):
         async def never_finishes(query, client):
             await asyncio.sleep(3600)
 
+        resolve = AsyncMock(side_effect=resolve_error, return_value=dict(RESOLVED))
         with patch.object(commands, "extract_playlist_info",
                           return_value={"title": "P", "tracks": [{"url": FIRST, "title": "f"}]}), \
-                patch.object(commands, "enumerate_playlist", never_finishes):
-            await commands.MusicCog.play.callback(SimpleNamespace(bot=bot), ctx, query=PLAYLIST)
+                patch.object(commands, "enumerate_playlist", never_finishes), \
+                patch.object(commands, "resolve_audio", resolve):
+            # Every case here ends the start early; a start that went on to await the
+            # never-ending enumeration fails the test instead of hanging it.
+            await asyncio.wait_for(commands.MusicCog.play.callback(
+                SimpleNamespace(bot=bot), ctx, query=PLAYLIST), timeout=5)
+    return start
+
+
+class TestPlaylistStart(_StartHarness):
+    """!!play <playlist> with nothing audible disarms the chain as soon as the voice join
+    returns, while track 1's resolve (started before the join) may still be running. A
+    YouTube block or a voice drop refusing track 1 — at the resolve or during play() — used
+    to leave the chain that was waiting one out cancelled for good, so the track that chain
+    kept never played: it is re-armed instead."""
 
     def test_a_refused_first_track_rearms_auto_play(self):
         for name, (error, voice_after) in REFUSALS.items():
             with self.subTest(name):
-                gs, chain, sent = self._run(self._play_playlist, error, voice_after)
+                gs, chain, sent = self._run(_playlist_start(), error, voice_after)
                 chain.cancel.assert_called_once()          # disarmed before play(), as before
                 self.start_auto_next.assert_called_once()
                 self.assertEqual(self.start_auto_next.call_args.args[1:], (CHANNEL_ID, 1))
                 self.assertEqual([t.query for t in gs.queue.list()], ["kept"])
 
-    def test_a_dead_first_track_is_reported_as_before(self):
-        gs, chain, sent = self._run(self._play_playlist, REMOVED, object())
-        self.start_auto_next.assert_not_called()
+    def test_a_refused_resolve_rearms_auto_play(self):
+        gs, chain, sent = self._run(_playlist_start(audio_player.YouTubeBlockedError(60.0)),
+                                    None, object())
+        chain.cancel.assert_called_once()
+        self.start_auto_next.assert_called_once()
         self.assertEqual([t.query for t in gs.queue.list()], ["kept"])
+
+    def test_a_dead_first_track_is_reported_as_before(self):
+        for name, (resolve_error, play_error) in {"at the resolve": (REMOVED, None),
+                                                  "during play()": (None, REMOVED)}.items():
+            with self.subTest(name):
+                gs, chain, sent = self._run(_playlist_start(resolve_error), play_error, object())
+                self.start_auto_next.assert_not_called()
+                self.assertEqual([t.query for t in gs.queue.list()], ["kept"])
+                self.assertTrue(any("error playing first track" in (m or "").lower()
+                                    for m in sent), sent)
 
 
 SPOTIFY = {"title": "SP", "tracks": [{"query": "S1", "title": "S1"}, {"query": "S2", "title": "S2"}]}
