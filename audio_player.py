@@ -245,12 +245,13 @@ def _youtube_extractor_args(client: str, bgutil_exe: str | None,
     """
     args = {
         # client can be comma-separated, e.g. "web,android_vr"
-        # mweb needs a PLAYER PO token to pass YouTube's bot-check gate (LOGIN_REQUIRED)
-        # and a GVS PO token to unlock stream URLs; "always" makes yt-dlp fetch them
-        # proactively (harmless no-op for token-less clients like android_vr).
+        # "auto": yt-dlp fetches a PO token only where the client's policy needs one, so
+        # mweb/web still get theirs. Do NOT go back to "always": since Nov 2026 googlevideo
+        # answers 403 to web_embedded stream URLs that carry bgutil's token (bgutil can no
+        # longer read YouTube's webpage attestation), while the same URL without one plays.
         "youtube": {
             "player_client": [c.strip() for c in client.split(",")],
-            "fetch_pot": ["always"],
+            "fetch_pot": ["auto"],
         },
     }
     if bgutil_exe:
@@ -1392,7 +1393,7 @@ def _start_ytdlp_stream(
     ]
 
     if is_yt:
-        cmd += ["--extractor-args", f"youtube:player_client={client};fetch_pot=always"]
+        cmd += ["--extractor-args", f"youtube:player_client={client};fetch_pot=auto"]
         if bgutil_exe:
             # Register the CLI provider as a fallback; the registry prefers the warm
             # bgutil HTTP server (see _youtube_extractor_args). Redirecting HTTP to a

@@ -62,7 +62,9 @@ class TestYoutubeExtractorArgs(unittest.TestCase):
     def test_anti_detection_args_preserved(self):
         args = _youtube_extractor_args("web,android_vr", None)
         self.assertEqual(args["youtube"]["player_client"], ["web", "android_vr"])
-        self.assertEqual(args["youtube"]["fetch_pot"], ["always"])
+        # "always" pinned bgutil's token onto every web_embedded URL, which googlevideo
+        # has rejected with 403 since Nov 2026; "auto" only fetches one where needed.
+        self.assertEqual(args["youtube"]["fetch_pot"], ["auto"])
 
 
 class TestResolveCache(unittest.TestCase):

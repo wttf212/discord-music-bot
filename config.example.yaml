@@ -8,11 +8,12 @@ owner_id: "YOUR_DISCORD_USER_ID"
 
 youtube:
   # PO tokens are generated automatically by bgutil-pot (no manual config needed).
-  # 'web_embedded' + bgutil PO tokens (the code sets fetch_pot=always) is the verified
-  # working combo as of July 2026 (round 3): it resolves AND downloads clean (format 251
-  # opus, full speed in-session). 'mweb' + fetch_pot=always clears the sign-in gate but
-  # its stream URLs return HTTP 403 from googlevideo even in the same session — mweb is
-  # unusable for streaming in this cohort.
+  # 'web_embedded' is the verified working client: it resolves AND downloads clean (format
+  # 251 opus, full speed). The code sets fetch_pot=auto, so a PO token is attached only
+  # where a client needs one. Since Nov 2026 googlevideo rejects (HTTP 403) web_embedded
+  # URLs that carry bgutil's token, while the same URLs without one play. 'mweb' (which
+  # does get tokens) clears the sign-in gate, but its stream URLs return HTTP 403 from
+  # googlevideo even in the same session — mweb is unusable for streaming in this cohort.
   # Known limitation: web_embedded only plays embeddable videos (a rare miss for some
   # music). Do NOT use 'android_vr' — YouTube made it login-gated in July 2026 (it now
   # returns "Sign in to confirm you're not a bot" / LOGIN_REQUIRED). 'web' is SABR-only
