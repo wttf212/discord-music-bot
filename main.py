@@ -136,6 +136,10 @@ class MusicBot(commands.Bot):
 
 
 def main():
+    # Production images install the newest yt-dlp at build time, so say which one is running.
+    import yt_dlp
+    print(f"[main] yt-dlp {yt_dlp.version.__version__}")
+
     # --- TLS-01c: curl_cffi startup check ---
     try:
         import curl_cffi
