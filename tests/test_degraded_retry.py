@@ -2,7 +2,7 @@
 result carried a PO token.
 
 The retry exists for weak HTTP-provider tokens that unlock only format 18. With fetch_pot
-"auto", web_embedded resolves carry no token at all, so forcing the CLI provider changes
+"never", web_embedded resolves carry no token at all, so forcing the CLI provider changes
 nothing: the retry asked YouTube the same question again, ~3 s more before the track started,
 and got format 18 again (seen on the first track of a reported playlist start). yt-dlp is faked.
 """

@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -62,9 +63,18 @@ class TestYoutubeExtractorArgs(unittest.TestCase):
     def test_anti_detection_args_preserved(self):
         args = _youtube_extractor_args("web,android_vr", None)
         self.assertEqual(args["youtube"]["player_client"], ["web", "android_vr"])
-        # "always" pinned bgutil's token onto every web_embedded URL, which googlevideo
-        # has rejected with 403 since Nov 2026; "auto" only fetches one where needed.
-        self.assertEqual(args["youtube"]["fetch_pot"], ["auto"])
+        # googlevideo answers 403 to URLs carrying the bundled bgutil build's token, so no
+        # provider may be asked ("never"); "missing_pot" keeps the token-less formats that
+        # yt-dlp would otherwise drop once web_embedded has a token policy.
+        self.assertEqual(args["youtube"]["fetch_pot"], ["never"])
+        self.assertEqual(args["youtube"]["formats"], ["missing_pot"])
+
+    def test_subprocess_command_line_carries_same_values(self):
+        with patch.object(audio_player.subprocess, "Popen") as popen:
+            audio_player._start_ytdlp_stream(WATCH.format("abc12345678"), "web_embedded",
+                                             direct_url=None)
+        cmd = popen.call_args.args[0]
+        self.assertIn("youtube:player_client=web_embedded;fetch_pot=never;formats=missing_pot", cmd)
 
 
 class TestResolveCache(unittest.TestCase):

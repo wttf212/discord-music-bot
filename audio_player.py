@@ -242,16 +242,22 @@ def _youtube_extractor_args(client: str, bgutil_exe: str | None,
     (YouTube changing ytAtR) — the CLI has its own Rust PPA implementation and needs no
     webpage attestation. Do not set it on the normal path: the dead-port probe does not
     fail fast, it costs ~2s per resolve.
+
+    With fetch_pot=never no provider is called, so the provider arguments below only
+    matter again if that changes.
     """
     args = {
         # client can be comma-separated, e.g. "web,android_vr"
-        # "auto": yt-dlp fetches a PO token only where the client's policy needs one, so
-        # mweb/web still get theirs. Do NOT go back to "always": since Nov 2026 googlevideo
-        # answers 403 to web_embedded stream URLs that carry bgutil's token (bgutil can no
-        # longer read YouTube's webpage attestation), while the same URL without one plays.
+        # The bundled bgutil build's tokens are refused by googlevideo (since July 2026
+        # YouTube binds the BotGuard challenge to the page session and that build cannot
+        # supply one): a token in the URL means HTTP 403 at offset 0. "never" asks no
+        # provider at all. "missing_pot" keeps the token-less formats once yt-dlp gives
+        # web_embedded a token policy (PR #18051); without it yt-dlp drops every adaptive
+        # https format. Neither value changes anything on yt-dlp 2026.10.26.
         "youtube": {
             "player_client": [c.strip() for c in client.split(",")],
-            "fetch_pot": ["auto"],
+            "fetch_pot": ["never"],
+            "formats": ["missing_pot"],
         },
     }
     if bgutil_exe:
@@ -1404,7 +1410,8 @@ def _start_ytdlp_stream(
     ]
 
     if is_yt:
-        cmd += ["--extractor-args", f"youtube:player_client={client};fetch_pot=auto"]
+        cmd += ["--extractor-args",
+                f"youtube:player_client={client};fetch_pot=never;formats=missing_pot"]
         if bgutil_exe:
             # Register the CLI provider as a fallback; the registry prefers the warm
             # bgutil HTTP server (see _youtube_extractor_args). Redirecting HTTP to a
