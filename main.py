@@ -50,7 +50,7 @@ else:
 
 import discord
 from discord.ext import commands
-from audio_player import AudioPlayer, shutdown_audio
+from audio_player import AudioPlayer, shutdown_audio, configure_fast_client
 from track_queue import TrackQueue
 
 
@@ -186,6 +186,11 @@ def main():
                 )
             else:
                 print(f"[main] cookies_file found ({int(_age_days)} days old) — cookie auth enabled")
+
+    # Lookups someone is waiting on try youtube.fast_client first, with youtube.client as the
+    # fallback. Off unless set; configure_fast_client says why when it stays off.
+    _yt_cfg = config.get("youtube", {})
+    configure_fast_client(_yt_cfg.get("fast_client"), _yt_cfg.get("client", "web"), _cookies_file)
 
     bot = MusicBot(config)
 

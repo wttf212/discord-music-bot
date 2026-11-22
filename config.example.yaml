@@ -17,6 +17,15 @@ youtube:
   # since August 2026. 'web' is SABR-only and not usable for piped audio.
   client: "web_embedded"
 
+  # Optional: a client tried first for lookups someone is waiting on (the first track, a skip
+  # to a track that was not looked up in advance). visionos gets no pre-roll ad and needs no
+  # JS solve, so a first play starts in about 1.5-2 s instead of about 5 s. Queued tracks
+  # keep using `client`, which is also the automatic fallback whenever the fast client is
+  # refused; repeated refusals pause it for a while. Needs yt-dlp 2026.08.19 or newer and is
+  # ignored when cookies_file is set. YouTube cut off android_vr the same way in August 2026,
+  # so treat this as an optimisation that may stop working. Off unless set.
+  # fast_client: "visionos"
+
   # Optional: path to a Netscape-format cookies file exported from your browser.
   # When set, VISITOR_INFO1_LIVE and SOCS cookies are sent with every yt-dlp request,
   # reducing YouTube bot-detection on residential IPs and unlocking age-restricted content.

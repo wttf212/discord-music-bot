@@ -523,6 +523,11 @@ def is_stream_info_fresh(info: dict | None, resolved_at: float = 0.0,
     if not info or not info.get("url"):
         return False
     now = time.time() if now is None else now
+    # A fast-client URL was measured serving up to 60 min after its lookup; longer reuse is
+    # untested, so the resolve cache and a prefetched result look it up again after that.
+    if (_issued_to_fast_client(info.get("client"))
+            and now - (info.get("minted_at") or 0.0) > _FAST_URL_MAX_AGE):
+        return False
     expiry = _stream_url_expiry(info["url"])
     if expiry is not None:
         return (expiry - now) > STREAM_URL_SAFETY_MARGIN
@@ -606,7 +611,9 @@ def invalidate_resolve_cache(query: str) -> None:
 # guilds, so an instance is never shared while busy: try-lock, and on contention build
 # a throwaway (exactly the old behaviour). Nothing ever blocks, so no guild can queue
 # behind another guild's ~2s resolve.
-_RESOLVER_MAX = 4
+# Room for the four option sets in use (YouTube and other sites on youtube.client, the
+# force_cli retry, the fast client) with two to spare.
+_RESOLVER_MAX = 6
 _resolvers: dict[tuple, tuple] = {}
 _resolvers_guard = threading.Lock()
 
@@ -631,13 +638,16 @@ def _resolver(key: tuple, ydl_opts: dict):
 
 
 async def resolve_audio(query: str, client: str, debug: bool = False,
-                        cookies_file: str | None = None, *, background: bool = False) -> dict:
+                        cookies_file: str | None = None, *, background: bool = False,
+                        fast: bool | None = None) -> dict:
     """Resolve a track for playback: the async front door to get_audio_url (RETRY-01).
 
     * A still-fresh resolve-cache hit is answered here, before anything is submitted —
       a replayed or looped track needs no worker, no Deno and no YouTube call.
     * The resolve runs in _RESOLVE_LANE. Pass ``background=True`` for work nobody is
       waiting on (prefetch, queue-add lookups) so it can never delay a user's !play.
+    * ``fast`` lets the lookup try youtube.fast_client first (_resolve_with_clients). By
+      default only lookups someone is waiting on do, i.e. ``fast = not background``.
     * Retries on HTTP 429, 5xx, and connection-layer errors with exponential backoff
       (3 attempts, base 5s, ±25% jitter), sleeping on the event loop between attempts.
       Surfaces video-unavailable / sign-in / age-restricted / geo-blocked errors
@@ -651,8 +661,9 @@ async def resolve_audio(query: str, client: str, debug: bool = False,
         if debug:
             print(f"[debug][yt-dlp] Resolve cache hit: {cached['title']!r}")
         return cached
+    fast = not background if fast is None else fast
     return await _retry_with_backoff(
-        lambda: _RESOLVE_LANE.run(get_audio_url, query, client, debug, cookies_file,
+        lambda: _RESOLVE_LANE.run(get_audio_url, query, client, debug, cookies_file, fast,
                                   background=background),
         max_attempts=3, base_delay=5.0, jitter=0.25,
     )
@@ -778,14 +789,212 @@ def _youtube_note_outcome(exc: BaseException | None) -> None:
             _yt_block_probing = False
 
 
-def _resolve_gated(query: str, client: str, debug: bool, cookies_file: str | None) -> dict:
-    """_resolve_audio_url, held behind the shared YouTube block. Other sites go straight
+# --- Fast client: tried first for lookups someone is waiting on ---------------------
+#
+# A cold first play on web_embedded waits out YouTube's pre-roll ad: a fresh stream URL
+# answers 403 for 3-4 s, longer for a long or stacked ad. visionos (yt-dlp 2026.08.19+, its
+# own JS-less default) gets no pre-roll ad, needs no JS solve and no PO token, and its opus
+# URL is served on the first request: 20 of 20 playable videos, first decoded audio 1.2-2.0 s
+# after the command (2026-11-22, yt-dlp 2026.10.26). YouTube cut android_vr off the same way
+# in August 2026 (intermittent 403s, nine days later every URL refused), so the fast client
+# is only ever tried first, youtube.client answers inside the same lookup when it is refused,
+# and repeated refusals bench it. Queued tracks are looked up in the background and start
+# instantly anyway, so they keep youtube.client.
+#
+# yt-dlp can answer a fast-client lookup from another client (it appends web_embedded by
+# itself for made-for-kids and age-gated videos), so a decision about a URL goes by the
+# client the URL was issued to (result["client"]), never by the client that was asked.
+_FAST_CLIENT: str | None = None     # yt-dlp's name for it; None = off (configure_fast_client)
+_FAST_CLIENT_C = ""                 # the c= value its stream URLs carry, e.g. VISIONOS
+_FAST_URL_MAX_AGE = 60 * 60         # a fast-client URL was measured serving up to 60 min later
+_FAST_FRESH_REFUSAL = 60.0          # a URL refused this soon after its lookup counts against it
+_FAST_BENCHES = (1800.0, 3600.0, 7200.0, 14400.0, 28800.0)   # per bench in a row
+_fast_client_lock = threading.Lock()
+_fast_client_recent: deque = deque(maxlen=5)   # last attempts, True = worked; 2 failures bench
+_fast_client_benched_until = 0.0    # time.monotonic() before which the fast client is skipped
+_fast_client_benches = 0            # benches since it last worked; picks the next duration
+
+# The video itself is refused, the same way for every client: asking the configured client
+# too would only double a dead track's cost.
+_CLIENT_INDEPENDENT_SUBSTRINGS = (
+    "private video",
+    "removed by the uploader",
+    "this video has been removed",
+    "members-only",
+    "members only",
+    "requires payment",
+    "copyright",
+    "available in your country",
+    "geo restricted",
+    "geo-blocked",
+    "this live event",
+    "no youtube search results",
+)
+# A gate on this video that the configured client may pass, which says nothing against the
+# fast client in general: fall back, but count nothing.
+_VIDEO_GATE_SUBSTRINGS = ("confirm your age", "age-restricted", "age restricted", "inappropriate")
+
+
+def _yt_client_name(name: str) -> str | None:
+    """The c= value yt-dlp's client ``name`` puts on its stream URLs, or None when this
+    yt-dlp has no such client (it would silently use its default clients instead)."""
+    try:
+        from yt_dlp.extractor.youtube._base import INNERTUBE_CLIENTS
+        return INNERTUBE_CLIENTS[name]["INNERTUBE_CONTEXT"]["client"]["clientName"] or None
+    except Exception:
+        return None
+
+
+def configure_fast_client(name: str | None, client: str, cookies_file: str | None) -> str | None:
+    """Set youtube.fast_client up; returns the name when it is on, None when it is off."""
+    global _FAST_CLIENT, _FAST_CLIENT_C, _fast_client_benched_until, _fast_client_benches
+    with _fast_client_lock:
+        _FAST_CLIENT, _FAST_CLIENT_C = None, ""
+        _fast_client_recent.clear()
+        _fast_client_benched_until = 0.0
+        _fast_client_benches = 0
+    name = (name or "").strip().lower()
+    if not name:
+        return None
+    c_value = _yt_client_name(name)
+    if not c_value:
+        why = "this yt-dlp has no client by that name (visionos needs yt-dlp 2026.08.19 or newer)"
+    elif name in {c.strip().lower() for c in (client or "").split(",")}:
+        why = f"it is already in youtube.client ({client})"
+    elif cookies_file:
+        why = f"cookies_file is set (yt-dlp skips {name} for a logged-in session)"
+    else:
+        _FAST_CLIENT, _FAST_CLIENT_C = name, c_value
+        print(f"[yt-dlp] fast_client {name} is on: tried first for lookups someone is waiting "
+              f"on, with {client} as the fallback")
+        return name
+    print(f"[yt-dlp] fast_client {name} is off: {why}")
+    return None
+
+
+def _issued_to_fast_client(stream_client: str | None) -> bool:
+    """True when a stream URL's c= value is the fast client's (always False while it is off)."""
+    return bool(_FAST_CLIENT_C) and stream_client == _FAST_CLIENT_C
+
+
+def _note_fast_attempt(ok: bool, reason: str = "", bench_now: bool = False) -> None:
+    """Record one fast-client attempt. A failure benches the fast client when it is the second
+    among the last five attempts, or at once with ``bench_now``."""
+    global _fast_client_benched_until, _fast_client_benches
+    with _fast_client_lock:
+        now = time.monotonic()
+        if now < _fast_client_benched_until:
+            # Started before the bench landed, so it says nothing the bench did not.
+            return
+        if ok:
+            if _fast_client_benches:
+                print(f"[yt-dlp] {_FAST_CLIENT} is answering again — back in use")
+            _fast_client_benches = 0
+            _fast_client_recent.append(True)
+            return
+        _fast_client_recent.append(False)
+        if not bench_now and _fast_client_recent.count(False) < 2:
+            return
+        bench = _FAST_BENCHES[min(_fast_client_benches, len(_FAST_BENCHES) - 1)]
+        _fast_client_benches += 1
+        _fast_client_benched_until = now + bench
+        _fast_client_recent.clear()
+        span = f"{bench / 3600:g} h" if bench >= 3600 else f"{bench / 60:g} min"
+        print(f"[yt-dlp] Benching {_FAST_CLIENT} for {span} ({reason}) — lookups use the "
+              f"configured client until then ({_fast_client_benches} bench(es) in a row)")
+
+
+def _note_fast_stream_refused(info: dict) -> None:
+    """A fast-client URL was refused on its first window, or opened and gave no audio. Fresh,
+    that counts against the fast client; older, the URL went stale in a cache, which says
+    nothing about the client."""
+    age = time.time() - (info.get("minted_at") or 0.0)
+    if age <= _FAST_FRESH_REFUSAL:
+        print(f"[stream] {_FAST_CLIENT} stream URL refused {age:.0f} s after its lookup — "
+              f"counted against {_FAST_CLIENT}; looking the track up with the configured client")
+        _note_fast_attempt(False, f"a stream URL was refused {age:.0f} s after its lookup")
+    else:
+        print(f"[stream] {_FAST_CLIENT} stream URL refused {age / 60:.0f} min after its lookup — "
+              f"stale, not counted; looking the track up with the configured client")
+
+
+def _fast_client_verdict(exc: BaseException) -> str:
+    """What a failed fast-client lookup calls for: 'raise' (ask nobody else), 'fallback' (ask
+    the configured client), 'fallback-bench' (and bench the fast client if that works) or
+    'fallback-strike' (and count a failed attempt if that works)."""
+    if isinstance(exc, (ConnectionError, TimeoutError, socket.timeout, URLError)):
+        return "raise"      # transient: resolve_audio's backoff retries the whole lookup
+    # Checked before the text lists below, so a refusal of the fast client's session always
+    # falls back and can never reach the shared YouTube block on its own.
+    if is_systemic_resolve_error(exc):
+        return "fallback-bench"
+    msg = str(exc).lower()
+    if any(s in msg for s in ("http error 429", "too many requests", "http error 5")):
+        return "raise"
+    if any(s in msg for s in _FAST_RETRY_SUBSTRINGS + _CLIENT_INDEPENDENT_SUBSTRINGS):
+        return "raise"
+    if any(s in msg for s in _VIDEO_GATE_SUBSTRINGS):
+        return "fallback"
+    return "fallback-strike"        # no usable formats, "not available on this app", anything new
+
+
+def _resolve_with_clients(query: str, client: str, debug: bool, cookies_file: str | None,
+                          fast: bool) -> dict:
+    """_resolve_audio_url, with the fast client asked first when this lookup may use it and
+    ``client`` as the fallback.
+
+    Never while the shared YouTube block has strikes: the probe must be the configured client,
+    or a fast-client success would lift a block that belongs to the configured client.
+    """
+    name, c_value = _FAST_CLIENT, _FAST_CLIENT_C
+    if (not fast or not name or _yt_block_strikes
+            or time.monotonic() < _fast_client_benched_until):
+        return _resolve_audio_url(query, client, debug, cookies_file)
+
+    try:
+        result = _resolve_audio_url(query, name, debug, None)
+    except Exception as e:
+        verdict = _fast_client_verdict(e)
+        if verdict == "raise":
+            raise
+        reason = str(e).strip().splitlines()[0][:160] if str(e).strip() else type(e).__name__
+        print(f"[yt-dlp] {name} refused this lookup ({reason}) — asking {client}")
+        # Its error is the answer when it is refused too: both refused means the address or
+        # the video, which the shared block around this call deals with. Nothing is counted.
+        result = _resolve_audio_url(query, client, debug, cookies_file)
+        if verdict == "fallback-bench":
+            _note_fast_attempt(False, f"refused while {client} works: {reason}", bench_now=True)
+        elif verdict == "fallback-strike":
+            _note_fast_attempt(False, f"refused while {client} works: {reason}")
+        return result
+
+    issued_to = result.get("client")
+    if issued_to and issued_to != c_value:
+        return result       # yt-dlp answered from another client inside the same lookup
+    if issued_to == c_value and result.get("is_audio_only") and _can_stream_in_process(result):
+        _note_fast_attempt(True)
+        return result
+    # Its own answer is a combined format, HLS or a live stream (a manifest URL carries no c=,
+    # so its client reads ""): a path nobody measured. _resolve_audio_url has already cached
+    # it when it is audio-only, and a replay must not get it back from there.
+    invalidate_resolve_cache(result.get("webpage_url") or query)
+    print(f"[yt-dlp] {name} offered no direct audio-only stream for this video — asking {client}")
+    try:
+        return _resolve_audio_url(query, client, debug, cookies_file)
+    except Exception as e:
+        print(f"[yt-dlp] {client} failed too ({str(e).strip()[:120]}) — keeping {name}'s answer")
+        return result
+
+
+def _resolve_gated(query: str, client: str, debug: bool, cookies_file: str | None,
+                   fast: bool = False) -> dict:
+    """The lookup, held behind the shared YouTube block. Other sites go straight
     through: a YouTube block says nothing about them."""
     if not (_is_youtube(query) or not query.startswith(("http://", "https://"))):
         return _resolve_audio_url(query, client, debug, cookies_file)
     _youtube_gate()
     try:
-        result = _resolve_audio_url(query, client, debug, cookies_file)
+        result = _resolve_with_clients(query, client, debug, cookies_file, fast)
     except Exception as e:
         _youtube_note_outcome(e)
         raise
@@ -794,13 +1003,14 @@ def _resolve_gated(query: str, client: str, debug: bool, cookies_file: str | Non
 
 
 def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: str | None = None,
-                  *, force_cli: bool = False) -> dict:
+                  fast: bool = False, *, force_cli: bool = False) -> dict:
     """Resolve a track to a streamable CDN URL + metadata.
 
     Wraps the actual extraction with the two things that keep repeat and concurrent
     plays cheap: the video-id resolve cache, and in-flight de-duplication so two
     callers racing for the same video make one API call between them. A YouTube cache
-    miss also has to get past the shared block (_resolve_gated).
+    miss also has to get past the shared block (_resolve_gated). ``fast`` lets a cache
+    miss try youtube.fast_client first (_resolve_with_clients).
 
     ``force_cli`` forces the bgutil CLI PO token provider and bypasses all three. It is
     set only by the internal one-shot retry after a degraded resolve, which runs inside a
@@ -820,7 +1030,7 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
 
     video_id = _youtube_video_id(query)
     if not video_id:
-        return _resolve_gated(query, client, debug, cookies_file)
+        return _resolve_gated(query, client, debug, cookies_file, fast)
 
     inflight = _claim_resolve(video_id)
     if inflight is not None:
@@ -832,11 +1042,11 @@ def get_audio_url(query: str, client: str, debug: bool = False, cookies_file: st
         if inflight.result is not None:
             return _copy_stream_info(inflight.result)
         # Leader failed or timed out — do it ourselves rather than inherit its failure.
-        return _resolve_gated(query, client, debug, cookies_file)
+        return _resolve_gated(query, client, debug, cookies_file, fast)
 
     result = None
     try:
-        result = _resolve_gated(query, client, debug, cookies_file)
+        result = _resolve_gated(query, client, debug, cookies_file, fast)
         return result
     finally:
         _release_resolve(video_id, result)
@@ -1084,6 +1294,9 @@ _STREAM_CHUNK_BYTES = 10 * 1024 * 1024   # matches the old --http-chunk-size 10M
 # request in the fast case and ~2-4 in the slow one.
 # Cumulative wake times: 2.2 2.5 2.8 3.1 3.4 3.7 4.2 4.7 5.2 5.7s.
 _STREAM_SETTLE_BACKOFF = (2.2, 0.3, 0.3, 0.3, 0.3, 0.3, 0.5, 0.5, 0.5, 0.5)
+# A fast-client URL has no ad wait to sit out (served on the first request in 20 of 20), so
+# its first window gets one quick retry for a blip, and a 403 after that is a refusal.
+_FAST_STREAM_RETRY = (0.3,)
 _STREAM_RESUME_BACKOFF = (0.25, 0.5)     # mid-stream truncation/blip retries
 _STREAM_TIMEOUT = 30
 
@@ -1154,9 +1367,12 @@ def warm_stream_url(url: str, debug: bool = False) -> bool:
         return False
     from curl_cffi import requests as curl_requests
 
+    # A fast-client URL (a prefetch can get one from the resolve cache) has no ad wait to
+    # poll through: one probe says whether it serves.
+    ladder = () if _issued_to_fast_client(_stream_client(url)) else _STREAM_SETTLE_BACKOFF
     session = curl_requests.Session(impersonate="chrome")
     try:
-        for attempt, delay in enumerate((0.0,) + _STREAM_SETTLE_BACKOFF):
+        for attempt, delay in enumerate((0.0,) + ladder):
             if _shutdown.is_set():
                 return False
             if delay and _shutdown.wait(delay):
@@ -1185,6 +1401,11 @@ class _StreamStartError(RuntimeError):
     """The in-process reader could not open the stream; caller falls back."""
 
 
+class _StreamRefusedError(_StreamStartError):
+    """A fast-client URL still answered 401/403 on its first window: refused, not waiting
+    out an ad. play() looks the track up again with the configured client."""
+
+
 class StreamFailedError(RuntimeError):
     """A freshly resolved track's stream gave no audio at all: it never opened, or ended
     before the first frame. That proves nothing about the track (a CDN refusing every
@@ -1204,13 +1425,21 @@ class _CurlStreamReader:
     this in an executor thread). A URL that will not serve therefore shows up as
     ``poll() != None`` right after construction — exactly like a subprocess that exited
     immediately — so play()'s existing stale-cache re-resolve path keeps working.
+
+    ``settle=False`` is for a fast-client URL (no ad wait): the first window gets one quick
+    retry instead of the settle ladder, a 401/403 there raises _StreamRefusedError, and one
+    on a later window benches the fast client. ``minted_at`` is when its lookup returned.
     """
 
-    def __init__(self, url: str, debug: bool = False):
+    def __init__(self, url: str, debug: bool = False, *, settle: bool = True,
+                 minted_at: float = 0.0):
         from curl_cffi import requests as curl_requests
 
         self._url = url
         self._debug = debug
+        self._settle = settle
+        self._minted_at = minted_at
+        self._last_status: int | None = None   # HTTP status of the latest request, None on error
         self._total = _stream_total_bytes(url)
         self._closed = threading.Event()
         self._finished = threading.Event()
@@ -1228,6 +1457,8 @@ class _CurlStreamReader:
             self._returncode = 1
             self._finished.set()
             self._session.close()
+            if not settle and self._last_status in (401, 403):
+                raise _StreamRefusedError(self.error_text)
             raise _StreamStartError(self.error_text or "CDN refused the stream URL")
 
         self._rfd, self._wfd = os.pipe()
@@ -1247,8 +1478,12 @@ class _CurlStreamReader:
             if offset > end:
                 return None
         # The settle-window ladder applies to the FIRST window only: a 403 there means
-        # the edge has not picked the URL up yet. Mid-stream we only retry blips.
-        backoff = _STREAM_SETTLE_BACKOFF if first else _STREAM_RESUME_BACKOFF
+        # the edge has not picked the URL up yet. Mid-stream we only retry blips. A
+        # fast-client URL has no ad wait, so its first window only gets a blip retry.
+        if not first:
+            backoff = _STREAM_RESUME_BACKOFF
+        else:
+            backoff = _STREAM_SETTLE_BACKOFF if self._settle else _FAST_STREAM_RETRY
         for attempt in range(len(backoff) + 1):
             if self._closed.is_set() or _shutdown.is_set():
                 return None
@@ -1256,8 +1491,10 @@ class _CurlStreamReader:
                 resp = self._session.get(_range_url(self._url, offset, end),
                                          stream=True, timeout=_STREAM_TIMEOUT)
             except Exception as e:
+                self._last_status = None
                 self.error_text = f"{type(e).__name__}: {e}"
             else:
+                self._last_status = resp.status_code
                 if resp.status_code in (200, 206):
                     return resp
                 # 403/401 on the first window = URL not live at the edge yet (propagation),
@@ -1309,7 +1546,16 @@ class _CurlStreamReader:
                     return                                    # no progress; stop rather than spin
                 response = self._open_window(offset)
             if response is None and not self._closed.is_set():
-                print(f"[stream] giving up at byte {offset}: {self.error_text}")
+                if not self._settle and self._last_status in (401, 403):
+                    # A fast-client URL refused mid-track is how android_vr's cut-off began
+                    # (August 2026): stop asking that client at once. The track ends as before.
+                    print(f"[stream] {_FAST_CLIENT} URL refused at byte {offset} "
+                          f"({self.error_text}), {time.time() - self._minted_at:.0f} s after "
+                          f"its lookup")
+                    _note_fast_attempt(False, f"a stream URL was refused at byte {offset}",
+                                       bench_now=True)
+                else:
+                    print(f"[stream] giving up at byte {offset}: {self.error_text}")
         except OSError:
             pass  # read end closed (stop/skip) — normal teardown
         except Exception as e:
@@ -1370,7 +1616,14 @@ def _open_audio_stream(query: str, client: str, cookies_file: str | None,
     direct_url = info.get("url") if info else None
     if _can_stream_in_process(info):
         try:
+            if _issued_to_fast_client(info.get("client")):
+                # A refusal propagates: the subprocess would only ask the same refused URL
+                # again, and play() looks the track up with the configured client instead.
+                return _CurlStreamReader(direct_url, debug=debug, settle=False,
+                                         minted_at=info.get("minted_at") or 0.0)
             return _CurlStreamReader(direct_url, debug=debug)
+        except _StreamRefusedError:
+            raise
         except Exception as e:
             print(f"[stream] in-process reader unavailable ({e}) — "
                   f"falling back to the yt-dlp subprocess")
@@ -1983,7 +2236,11 @@ class AudioPlayer:
         info: dict | None = None
         source = None
         first_frame = b""
-        for _attempt in range(2):
+        # Someone is waiting on this lookup, so it may try the fast client, until a fast-client
+        # URL is refused: from then on only the configured client is asked.
+        fast = True
+        # Up to three tries: a stale prefetched URL, the fast client, the configured client.
+        for _attempt in range(3):
             used_cache = candidate is not None
             if used_cache:
                 info = candidate
@@ -1993,12 +2250,21 @@ class AudioPlayer:
                 if self._debug:
                     print("[debug][player] Resolving audio URL via in-process yt-dlp")
                 info = await resolve_audio(url_or_query, yt["client"], self._debug,
-                                           cookies_file)
+                                           cookies_file, fast=fast)
 
-            proc = await _adopt(built, loop.run_in_executor(
-                _STREAM_EXECUTOR, _open_audio_stream, url_or_query, yt["client"],
-                cookies_file, info, self._debug
-            ))
+            try:
+                proc = await _adopt(built, loop.run_in_executor(
+                    _STREAM_EXECUTOR, _open_audio_stream, url_or_query, yt["client"],
+                    cookies_file, info, self._debug
+                ))
+            except _StreamRefusedError:
+                # A fast-client URL answered 401/403 with no ad to wait out. Nothing was
+                # built, and the subprocess was not started on the refused URL.
+                _note_fast_stream_refused(info)
+                candidate = None
+                invalidate_resolve_cache(url_or_query)
+                fast = False
+                continue
             self._ytdlp_proc = proc  # track immediately so a concurrent stop reaps it
 
             # The stream may fail to open at all (invalid/expired URL). A cached URL that
@@ -2043,12 +2309,14 @@ class AudioPlayer:
             # frame means the stream produced no audio. From a cached URL that is
             # stale/revoked — tear down and re-resolve fresh. From a fresh resolve it is a
             # failure: accepting it "played" the track for 0 s and reset auto-next's
-            # breaker, so a CDN refusing every fresh URL walked the whole queue.
+            # breaker, so a CDN refusing every fresh URL walked the whole queue. A fresh
+            # fast-client stream with no audio is handled like a refused one instead.
             frame = await loop.run_in_executor(_STREAM_EXECUTOR, src.read)
             if not frame:
+                refused = not used_cache and _issued_to_fast_client(info.get("client"))
                 if self._debug:
                     print("[debug][player] Stream produced no audio — "
-                          + ("re-resolving fresh" if used_cache else "failing the play"))
+                          + ("re-resolving fresh" if used_cache or refused else "failing the play"))
                 try:
                     proc.terminate()
                 except Exception:
@@ -2061,13 +2329,22 @@ class AudioPlayer:
                 self._ytdlp_proc = None
                 candidate = None
                 invalidate_resolve_cache(url_or_query)
-                if not used_cache:
+                if refused:
+                    _note_fast_stream_refused(info)
+                    fast = False
+                elif not used_cache:
                     raise StreamFailedError("The audio stream ended before producing any audio")
                 continue
 
             source = src
             first_frame = frame
             break
+
+        if source is None:
+            # Every try was refused: a fast-client URL refused, and the lookups after it
+            # handed back fast-client URLs again (another guild's lookup in flight or cached).
+            raise StreamFailedError("audio stream failed to open before playback started: "
+                                    "every stream URL for this track was refused")
 
         title = info["title"]
         thumbnail = info.get("thumbnail", "")

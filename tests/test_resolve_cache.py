@@ -243,8 +243,9 @@ class TestPlayInvalidatesCache(unittest.TestCase):
     def test_play_calls_invalidate_on_cached_failure(self):
         import inspect
         src = inspect.getsource(audio_player.AudioPlayer._start_playback)   # play()'s body
-        self.assertEqual(src.count("invalidate_resolve_cache(url_or_query)"), 2,
-                         "both cached-URL failure branches must invalidate the cache")
+        self.assertEqual(src.count("invalidate_resolve_cache(url_or_query)"), 3,
+                         "both cached-URL failure branches and a refused fast-client URL "
+                         "must invalidate the cache")
 
 
 if __name__ == "__main__":
