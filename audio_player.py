@@ -987,7 +987,7 @@ def _resolve_audio_url(query: str, client: str, debug: bool = False,
                 # its own Rust PPA implementation and needs no webpage attestation, so it
                 # still unlocks opus. force_cli guards the recursion at depth 1.
                 # Only when this result carried a PO token: with none in the URL (fetch_pot
-                # "auto" fetches none for web_embedded) the retry asks YouTube the same
+                # "never" fetches none for any client) the retry asks YouTube the same
                 # question again — ~3 s more before the track starts, for the same format 18.
                 if not force_cli and not with_pot:
                     print("[yt-dlp] No PO token was used, so a CLI-forced retry can't help — "
