@@ -8,6 +8,8 @@ import os
 import sys
 import time
 import unittest
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -169,6 +171,70 @@ class TestResolveCache(unittest.TestCase):
         _resolve_cache_put("newvideo001", _info("newvideo001"))
         self.assertIsNotNone(_resolve_cache_get(WATCH.format("vid00000000")))
         self.assertIsNone(_resolve_cache_get(WATCH.format("vid00000001")))
+
+
+class TestStreamClient(unittest.TestCase):
+
+    def test_reads_the_c_param(self):
+        self.assertEqual(audio_player._stream_client(
+            "https://r1.googlevideo.com/videoplayback?expire=1&c=WEB_EMBEDDED_PLAYER&clen=5"),
+            "WEB_EMBEDDED_PLAYER")
+        self.assertEqual(audio_player._stream_client(
+            "https://r1.googlevideo.com/videoplayback?c=VISIONOS&expire=1"), "VISIONOS")
+
+    def test_absent_param_is_empty(self):
+        self.assertEqual(audio_player._stream_client(
+            "https://r1.googlevideo.com/videoplayback?expire=1&id=abc"), "")
+        self.assertEqual(audio_player._stream_client("https://r1.googlevideo.com/videoplayback"), "")
+        self.assertEqual(audio_player._stream_client(""), "")
+
+    def test_unparsable_value_is_empty(self):
+        self.assertEqual(audio_player._stream_client("http://[bad/videoplayback?c=X"), "")
+        self.assertEqual(audio_player._stream_client(None), "")
+
+
+class TestResolveRecordsClientAndTime(unittest.TestCase):
+    """The result of a lookup says which client the URL came from and when it was minted."""
+
+    def setUp(self):
+        audio_player._resolve_cache.clear()
+
+    tearDown = setUp
+
+    def _resolve(self, url, query=WATCH.format("abc12345678")):
+        info = {"id": "abc12345678", "url": url, "vcodec": "none", "title": "T",
+                "thumbnail": "", "webpage_url": query, "duration": 100}
+
+        @contextmanager
+        def fake_resolver(key, opts):
+            yield SimpleNamespace(extract_info=lambda q, download=False: dict(info))
+
+        with patch.object(audio_player, "_resolver", fake_resolver):
+            return audio_player._resolve_audio_url(query, "web_embedded")
+
+    def test_youtube_lookup_carries_client_and_mint_time(self):
+        before = time.time()
+        out = self._resolve("https://r1.googlevideo.com/videoplayback?expire=99999999999&c=VISIONOS")
+        self.assertEqual(out["client"], "VISIONOS")
+        self.assertLessEqual(before, out["minted_at"])
+        self.assertAlmostEqual(out["minted_at"], time.time(), delta=1)
+
+    def test_url_without_c_gives_empty_client(self):
+        out = self._resolve("https://r1.googlevideo.com/videoplayback?expire=99999999999")
+        self.assertEqual(out["client"], "")
+        self.assertIn("minted_at", out)
+
+    def test_non_youtube_url_gives_empty_client(self):
+        out = self._resolve("https://cf-media.sndcdn.com/track.mp3?Policy=x",
+                            query="https://soundcloud.com/artist/track")
+        self.assertEqual(out["client"], "")
+
+    def test_cache_hit_returns_both_keys_unchanged(self):
+        out = self._resolve("https://r1.googlevideo.com/videoplayback?expire=99999999999&c=VISIONOS")
+        hit = _resolve_cache_get(WATCH.format("abc12345678"))
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["client"], "VISIONOS")
+        self.assertEqual(hit["minted_at"], out["minted_at"])
 
 
 class TestPlayInvalidatesCache(unittest.TestCase):

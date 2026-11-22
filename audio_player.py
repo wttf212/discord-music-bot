@@ -1040,6 +1040,13 @@ def _resolve_audio_url(query: str, client: str, debug: bool = False,
             # may use the in-process CDN reader.
             "protocol": info.get("protocol"),
             "is_live": bool(info.get("is_live")),
+            # Which client YouTube issued this URL to. yt-dlp can answer from another client
+            # than the one requested (it appends web_embedded by itself for made-for-kids and
+            # age-gated videos), so the requested client is not a safe stand-in.
+            "client": _stream_client(info["url"]),
+            # When this lookup returned (wall clock), so a later 403 can be told apart: a URL
+            # refused seconds after it was issued versus one that has gone stale in the cache.
+            "minted_at": time.time(),
         }
         if is_yt:
             # Keyed by the RESOLVED video id, so a text search also warms the cache for a
@@ -1088,6 +1095,14 @@ def _stream_total_bytes(url: str) -> int | None:
         return int(clen) if clen else None
     except (ValueError, TypeError):
         return None
+
+
+def _stream_client(url: str) -> str:
+    """InnerTube client the CDN URL was issued to (its `c=` param, e.g. WEB_EMBEDDED_PLAYER), or ""."""
+    try:
+        return parse_qs(urlparse(url).query).get("c", [""])[0]
+    except (ValueError, TypeError, AttributeError):
+        return ""
 
 
 def _range_url(url: str, start: int, end: int) -> str:
