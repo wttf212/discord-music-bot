@@ -540,6 +540,12 @@ _RESOLVE_CACHE_MAX = 256
 _resolve_cache: "OrderedDict[str, tuple[dict, float]]" = OrderedDict()
 _resolve_cache_lock = threading.Lock()
 
+# YouTube format pick. On yt-dlp 2026.10.21+ a session that gets no adaptive URLs still gets
+# HLS formats 91-96, and "bestaudio/best" then picks the 1080p playlist (96), which the
+# in-process reader cannot take. Order: https audio-only, progressive 18, any other https
+# format, HLS audio-only, then the smallest combined format of at least 360p.
+_YT_FORMAT = "bestaudio[protocol=https]/18/best[protocol=https]/bestaudio/worst[height>=360]/best"
+
 
 def _copy_stream_info(info: dict) -> dict:
     """Copy a resolve result so a caller mutating a cache hit cannot corrupt the cached
@@ -847,8 +853,9 @@ def _resolve_audio_url(query: str, client: str, debug: bool = False,
     """
     original_query = query
     ffmpeg_exe = _find_ffmpeg("ffmpeg")
+    is_yt = _is_youtube(query) or not query.startswith(("http://", "https://"))
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": _YT_FORMAT if is_yt else "bestaudio/best",
         "noplaylist": True,
         "quiet": not debug,
         "no_warnings": not debug,
@@ -857,7 +864,6 @@ def _resolve_audio_url(query: str, client: str, debug: bool = False,
     }
 
     # Only apply YouTube-specific extractor args for YouTube URLs/searches
-    is_yt = _is_youtube(query) or not query.startswith(("http://", "https://"))
     if is_yt:
         ydl_opts["extractor_args"] = _youtube_extractor_args(
             client, _bgutil_executable(), force_cli=force_cli
