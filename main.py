@@ -18,7 +18,11 @@ _deno_dir = os.path.join(os.path.expanduser("~"), ".deno", "bin")
 if os.path.isdir(_deno_dir) and _deno_dir not in os.environ.get("PATH", ""):
     os.environ["PATH"] = _deno_dir + os.pathsep + os.environ.get("PATH", "")
 
-# Start bgutil-pot HTTP server in background (PO token provider; idle while fetch_pot is never)
+# bgutil-pot HTTP server (PO token provider). Not started while lookups ask for no tokens
+# (fetch_pot=never in audio_player.py, because googlevideo refuses the bundled build's tokens):
+# it would only sit idle. The binary and the plugin stay installed; set _START_BGUTIL together
+# with fetch_pot if a provider whose tokens work is ever set up.
+_START_BGUTIL = False
 import subprocess
 import shutil
 _bgutil_name = "bgutil-pot.exe" if sys.platform == "win32" else "bgutil-pot"
@@ -35,7 +39,9 @@ def _lower_priority():
     os.nice(10)
 
 
-if _bgutil_path:
+if not _START_BGUTIL:
+    print("[main] bgutil-pot not started: lookups do not ask for PO tokens")
+elif _bgutil_path:
     try:
         _bgutil_proc = subprocess.Popen(
             [_bgutil_path, "server", "--host", "127.0.0.1"],
@@ -47,7 +53,7 @@ if _bgutil_path:
     except Exception as e:
         print(f"[main] Warning: could not start bgutil-pot server: {e}")
 else:
-    print("[main] bgutil-pot binary not found (lookups do not ask for PO tokens, so nothing is lost)")
+    print("[main] Warning: bgutil-pot binary not found, PO tokens will not be generated")
 
 import discord
 from discord.ext import commands
