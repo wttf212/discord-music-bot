@@ -5,8 +5,9 @@ import sys
 import yaml
 from dataclasses import dataclass, field
 
-# Load bgutil PO token provider plugin for yt-dlp (must be done before yt-dlp is imported)
-# This enables dynamic PO token generation to prevent YouTube IP bans
+# Load bgutil PO token provider plugin for yt-dlp (must be done before yt-dlp is imported).
+# Lookups do not ask for tokens at present (fetch_pot=never in audio_player.py: googlevideo
+# refuses the bundled build's tokens); the plugin stays registered for a provider that works.
 _base_dir = os.path.dirname(os.path.abspath(__file__))
 _plugin_dir = os.path.join(_base_dir, "yt-dlp-plugins", "bgutil-ytdlp-pot-provider")
 if os.path.isdir(_plugin_dir) and _plugin_dir not in sys.path:
@@ -17,7 +18,7 @@ _deno_dir = os.path.join(os.path.expanduser("~"), ".deno", "bin")
 if os.path.isdir(_deno_dir) and _deno_dir not in os.environ.get("PATH", ""):
     os.environ["PATH"] = _deno_dir + os.pathsep + os.environ.get("PATH", "")
 
-# Start bgutil-pot HTTP server in background (PO token provider)
+# Start bgutil-pot HTTP server in background (PO token provider; idle while fetch_pot is never)
 import subprocess
 import shutil
 _bgutil_name = "bgutil-pot.exe" if sys.platform == "win32" else "bgutil-pot"
@@ -28,8 +29,8 @@ _bgutil_proc = None
 
 
 def _lower_priority():
-    """preexec_fn: start the child at nice 10, so its CPU bursts (minting a PO token for
-    every resolve) yield to discord.py's audio sender thread on a small host instead of
+    """preexec_fn: start the child at nice 10, so its CPU bursts (minting PO tokens)
+    yield to discord.py's audio sender thread on a small host instead of
     competing with it. Deno gets the same treatment from a wrapper in the Dockerfile."""
     os.nice(10)
 
@@ -46,7 +47,7 @@ if _bgutil_path:
     except Exception as e:
         print(f"[main] Warning: could not start bgutil-pot server: {e}")
 else:
-    print("[main] Warning: bgutil-pot binary not found, PO tokens will not be generated")
+    print("[main] bgutil-pot binary not found (lookups do not ask for PO tokens, so nothing is lost)")
 
 import discord
 from discord.ext import commands

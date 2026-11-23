@@ -8,8 +8,8 @@ refused, a refusal of the fast client alone never arms the shared YouTube block,
 refusals bench it, and a refused fast-client stream URL makes play() look the track up again
 with the configured client. Queued tracks (background lookups) keep the configured client.
 
-yt-dlp, curl_cffi, FFmpeg and the network are faked; yt-dlp 2026.07.04 has no visionos entry
-in its client table, so the table lookup is patched.
+yt-dlp, curl_cffi, FFmpeg and the network are faked, and the client-table lookup is patched so
+the tests do not depend on the installed yt-dlp.
 """
 import asyncio
 import contextlib
@@ -183,6 +183,8 @@ class TestConfigure(unittest.TestCase):
 
     def test_the_table_helper_reads_yt_dlps_client_table(self):
         self.assertEqual(audio_player._yt_client_name("web_embedded"), WEB)
+        self.assertEqual(audio_player._yt_client_name("visionos"), FAST,
+                         "the c= value the tests assume is the one yt-dlp >= 2026.10.26 uses")
         self.assertIsNone(audio_player._yt_client_name("no_such_client"))
 
 

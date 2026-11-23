@@ -231,20 +231,15 @@ def _youtube_extractor_args(client: str, bgutil_exe: str | None,
                             force_cli: bool = False) -> dict:
     """Build yt-dlp's YouTube extractor args, including PO token provider config.
 
-    The provider registry prefers the bgutil HTTP server (preference 130, started by
-    main.py on 127.0.0.1:4416) and falls back to the CLI (preference 1) on its own when
-    the server is unreachable. Both mint the same token; the server is just warm, so it
-    answers in ~0.4s where spawning the 45 MB binary per video costs seconds.
+    With fetch_pot=never no provider is asked, so the provider arguments below and
+    ``force_cli`` are dormant: they matter again only with a provider whose tokens
+    googlevideo accepts. When asked, the registry prefers the bgutil HTTP server
+    (preference 130, started by main.py on 127.0.0.1:4416) over the CLI (preference 1).
 
     ``force_cli`` redirects the HTTP provider to a dead port so the registry has no
-    choice but the CLI. Used ONLY for the one-shot retry after a degraded (non
-    audio-only) resolve, which is the signature of broken HTTP-provider attestation
-    (YouTube changing ytAtR) — the CLI has its own Rust PPA implementation and needs no
-    webpage attestation. Do not set it on the normal path: the dead-port probe does not
-    fail fast, it costs ~2s per resolve.
-
-    With fetch_pot=never no provider is called, so the provider arguments below only
-    matter again if that changes.
+    choice but the CLI. Used ONLY for the one-shot retry after a combined-format resolve
+    whose URL carried a token. Do not set it on the normal path: the dead-port probe does
+    not fail fast, it costs ~2s per resolve.
     """
     args = {
         # client can be comma-separated, e.g. "web,android_vr"
@@ -253,7 +248,10 @@ def _youtube_extractor_args(client: str, bgutil_exe: str | None,
         # supply one): a token in the URL means HTTP 403 at offset 0. "never" asks no
         # provider at all. "missing_pot" keeps the token-less formats once yt-dlp gives
         # web_embedded a token policy (PR #18051); without it yt-dlp drops every adaptive
-        # https format. Neither value changes anything on yt-dlp 2026.10.26.
+        # https format. For web_embedded neither value changes anything on yt-dlp
+        # 2026.10.26. A client that already has a token policy (mweb, web, web_music) keeps
+        # its https formats without a token, which googlevideo refuses: those clients are
+        # not usable here.
         "youtube": {
             "player_client": [c.strip() for c in client.split(",")],
             "fetch_pot": ["never"],
@@ -611,8 +609,8 @@ def invalidate_resolve_cache(query: str) -> None:
 # guilds, so an instance is never shared while busy: try-lock, and on contention build
 # a throwaway (exactly the old behaviour). Nothing ever blocks, so no guild can queue
 # behind another guild's ~2s resolve.
-# Room for the four option sets in use (YouTube and other sites on youtube.client, the
-# force_cli retry, the fast client) with two to spare.
+# Room for the option sets in use (YouTube and other sites on youtube.client, the fast
+# client) and the force_cli retry, dormant while fetch_pot is "never", with two to spare.
 _RESOLVER_MAX = 6
 _resolvers: dict[tuple, tuple] = {}
 _resolvers_guard = threading.Lock()
@@ -1198,14 +1196,11 @@ def _resolve_audio_url(query: str, client: str, debug: bool = False,
                       f"Audio-only streams unavailable — {cause}. Audio will still play "
                       f"(video stripped by FFmpeg) but quality is limited to ~128kbps AAC "
                       f"instead of opus.")
-                # One-shot re-resolve with the CLI provider forced. The HTTP server needs
-                # ytAtR from the webpage for BotGuard challenge data; when YouTube changes
-                # that it degrades to weak tokens that only unlock format 18. The CLI has
-                # its own Rust PPA implementation and needs no webpage attestation, so it
-                # still unlocks opus. force_cli guards the recursion at depth 1.
-                # Only when this result carried a PO token: with none in the URL (fetch_pot
-                # "never" fetches none for any client) the retry asks YouTube the same
-                # question again — ~3 s more before the track starts, for the same format 18.
+                # One-shot re-resolve with the bgutil CLI provider forced, kept for a provider
+                # whose tokens work; force_cli guards the recursion at depth 1. It runs only
+                # when this result carried a PO token, and fetch_pot "never" fetches none, so
+                # it is dormant: without a token the retry would ask YouTube the same question
+                # again — ~3 s more before the track starts, for the same format 18.
                 if not force_cli and not with_pot:
                     print("[yt-dlp] No PO token was used, so a CLI-forced retry can't help — "
                           "keeping the combined format. If this keeps happening, try another "
@@ -1226,8 +1221,8 @@ def _resolve_audio_url(query: str, client: str, debug: bool = False,
                               "update bgutil-pot or switch client in config.yaml.")
 
             # Report which session cookies the resolve used. They are NOT sent to the
-            # CDN: the stream URL carries a PO token, and adding a Cookie header to a
-            # googlevideo request is an immediate 403 (measured). FFmpeg never makes
+            # CDN: the signed stream URL is its own authorisation, and adding a Cookie
+            # header to a googlevideo request is an immediate 403 (measured). FFmpeg never makes
             # HTTP requests at all — it only reads a pipe. This log exists purely as a
             # diagnostic for cookie auth on the API side (e.g. spotting a missing SOCS,
             # which EU IPs often lack).
@@ -1284,12 +1279,13 @@ def _resolve_audio_url(query: str, client: str, debug: bool = False,
 #   * a rangeless GET is 403 — a range is mandatory;
 #   * `&range=a-b` in the URL returns 200 with an exact Content-Length (this is the
 #     form the web player uses); a `Range:` header returns 206 and also works;
-#   * sending the `Cookie` header is a 403 — the PO token in the URL is the auth;
+#   * sending the `Cookie` header is a 403 — the signed URL is the auth;
 #   * UA / Referer / Origin make no difference, so impersonate supplies the headers;
 #   * `clen=` in the URL equals the real filesize, giving an exact EOF;
-#   * a FRESHLY resolved URL 403s for ~2-3s before the edge will serve it, which the
-#     1.5s subprocess boot used to mask by accident (and sometimes lost the race to,
-#     surfacing as "Error playing track" on a first play).
+#   * a FRESHLY resolved web-client URL 403s until YouTube's pre-roll-ad wait is over
+#     (about 0.8 x the ad's skip offset or length: 3-4 s for one short ad, up to ~16 s for
+#     stacked ads), which the 1.5s subprocess boot used to mask by accident (and sometimes
+#     lost the race to, surfacing as "Error playing track" on a first play).
 _STREAM_CHUNK_BYTES = 10 * 1024 * 1024   # matches the old --http-chunk-size 10M
 
 # Settle-window schedule, measured rather than guessed. Polling 6 fresh URLs every
@@ -1300,6 +1296,8 @@ _STREAM_CHUNK_BYTES = 10 * 1024 * 1024   # matches the old --http-chunk-size 10M
 # out the dead zone and poll across the band where URLs actually go live. Costs 1
 # request in the fast case and ~2-4 in the slow one.
 # Cumulative wake times: 2.2 2.5 2.8 3.1 3.4 3.7 4.2 4.7 5.2 5.7s.
+# The wait is YouTube's pre-roll ad, not edge propagation (found 2026-11-22), so a long or
+# stacked ad can outlast this 5.7 s ceiling; the stream then falls back to the subprocess.
 _STREAM_SETTLE_BACKOFF = (2.2, 0.3, 0.3, 0.3, 0.3, 0.3, 0.5, 0.5, 0.5, 0.5)
 # A fast-client URL has no ad wait to sit out (served on the first request in 20 of 20), so
 # its first window gets one quick retry for a blip, and a 403 after that is a refusal.
@@ -1355,11 +1353,12 @@ def _can_stream_in_process(info: dict | None) -> bool:
 
 
 def warm_stream_url(url: str, debug: bool = False) -> bool:
-    """Poll a freshly resolved CDN URL until the edge will actually serve it.
+    """Poll a freshly resolved CDN URL until YouTube will serve it.
 
-    Run this OFF the critical path — during the previous track — so the ~2.5s settle
-    window is already spent by the time playback starts. Measured: a warmed URL then
-    delivers its first byte in 0.02s instead of costing three retries (~2.8s).
+    Run this OFF the critical path — during the previous track — so a web client's
+    pre-roll-ad wait (3-4 s for one short ad) is already spent by the time playback
+    starts. Measured: a warmed URL then delivers its first byte in 0.02s instead of
+    costing three retries (~2.8s).
 
     Uses a 1-byte range, so a probe transfers nothing. Two things were verified before
     building this: a 1-byte probe reaches "live" at the same moment a full window would
@@ -1455,7 +1454,7 @@ class _CurlStreamReader:
         self.stderr = None       # no child process, nothing to drain
         self.pid = -1
 
-        # No Cookie header (403s a pot-authenticated URL) and no UA override —
+        # No Cookie header (googlevideo answers one with 403) and no UA override —
         # impersonate="chrome" supplies the full browser header set and TLS fingerprint.
         self._session = curl_requests.Session(impersonate="chrome")
 
@@ -1485,7 +1484,7 @@ class _CurlStreamReader:
             if offset > end:
                 return None
         # The settle-window ladder applies to the FIRST window only: a 403 there means
-        # the edge has not picked the URL up yet. Mid-stream we only retry blips. A
+        # YouTube's pre-roll-ad wait is not over yet. Mid-stream we only retry blips. A
         # fast-client URL has no ad wait, so its first window only gets a blip retry.
         if not first:
             backoff = _STREAM_RESUME_BACKOFF
@@ -1504,7 +1503,7 @@ class _CurlStreamReader:
                 self._last_status = resp.status_code
                 if resp.status_code in (200, 206):
                     return resp
-                # 403/401 on the first window = URL not live at the edge yet (propagation),
+                # 403/401 on the first window = the pre-roll-ad wait is not over yet,
                 # NOT a rate-limit — this is the one place a 403 is worth retrying, and
                 # only here. Mid-stream it means the URL expired; give up and let the
                 # caller re-resolve.
@@ -1718,8 +1717,8 @@ def _start_ytdlp_stream(
             )
 
     # COOKIE-01 / per-play re-check (subprocess path) — mirrors get_audio_url logic.
-    # Skip cookie injection when using a direct CDN URL: the PO token embedded in the
-    # URL already authenticates the request; injecting cookies would be redundant.
+    # Skip cookie injection when using a direct CDN URL: the signed URL already
+    # authenticates the request; injecting cookies would be redundant.
     if cookies_file and direct_url is None:
         if not os.path.isfile(cookies_file):
             print(f"[yt-dlp-pipe] Warning: cookies_file '{cookies_file}' not found — running without cookies")
