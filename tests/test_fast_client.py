@@ -371,6 +371,34 @@ class TestVerdicts(_FastClientState):
                 self._lookup(failing)
                 self.assertLessEqual(_bench_left(), 0)
 
+    def _lookup_while_the_block_lands(self, probing):
+        """visionos is refused while another guild's lookup arms the shared block."""
+        clients = _Clients(visionos=BOT_CHECK, web_embedded=_result(WEB))
+
+        def lookup(query, client, *args, **kwargs):
+            if client == "visionos":
+                audio_player._yt_block_strikes = 1
+                audio_player._yt_block_until = time.monotonic() + (30 if probing else 60)
+                audio_player._yt_block_probing = probing
+            return clients(query, client, *args, **kwargs)
+
+        return clients, lambda: self._lookup(lookup)
+
+    def test_no_fallback_once_another_lookup_armed_the_shared_block(self):
+        clients, lookup = self._lookup_while_the_block_lands(probing=False)
+        with self.assertRaises(audio_player.YouTubeBlockedError):
+            lookup()
+        self.assertEqual(clients.asked, ["visionos"], "no request to a just-flagged address")
+        self.assertEqual(audio_player._yt_block_strikes, 1, "the block stays as it was armed")
+        self.assertEqual(list(audio_player._fast_client_recent), [])
+        self.assertLessEqual(_bench_left(), 0)
+
+    def test_during_a_probe_the_fallback_still_answers(self):
+        """Re-raising there would let the fast client's refusal count as a block strike."""
+        clients, lookup = self._lookup_while_the_block_lands(probing=True)
+        self.assertEqual(lookup()["client"], WEB)
+        self.assertEqual(clients.asked, ["visionos", "web_embedded"])
+
     def test_a_refusal_with_a_working_fallback_leaves_the_block_alone(self):
         clients = _Clients(visionos=BOT_CHECK, web_embedded=_result(WEB))
         with patch.object(audio_player, "_resolve_audio_url", clients):
@@ -427,6 +455,45 @@ class TestBench(_FastClientState):
         _quiet(audio_player._note_fast_attempt, True)
         self.assertEqual(audio_player._fast_client_benched_until, until)
         self.assertEqual(audio_player._fast_client_benches, 1)
+
+    def test_it_says_whether_it_recorded_the_attempt(self):
+        self.assertTrue(_quiet(audio_player._note_fast_attempt, True))
+        self.assertTrue(_quiet(audio_player._note_fast_attempt, False, "x", bench_now=True))
+        self.assertFalse(_quiet(audio_player._note_fast_attempt, False, "y"), "benched")
+        self.assertFalse(_quiet(audio_player._note_fast_attempt, True), "benched")
+
+
+class TestRefusalLines(_FastClientState):
+    """What an operator reads when a fast-client stream URL fails before its first frame."""
+
+    def _lines(self, *calls):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for args in calls:
+                audio_player._note_fast_stream_refused(*args)
+        return [line for line in out.getvalue().splitlines() if line.startswith("[stream]")]
+
+    def test_each_line_says_what_happened_and_promises_no_next_step(self):
+        lines = self._lines((_result(FAST),), (_result(FAST), "gave no audio"))
+        self.assertIn("refused", lines[0])
+        self.assertIn("counted against visionos", lines[0])
+        self.assertIn("gave no audio", lines[1])
+        self.assertNotIn("refused", lines[1])
+        self.assertFalse(any("looking the track up" in line for line in lines),
+                         "on the last try there is no further lookup")
+
+    def test_a_refusal_during_a_bench_says_it_was_not_counted(self):
+        _quiet(audio_player._note_fast_attempt, False, "refused", bench_now=True)
+        [line] = self._lines((_result(FAST),))
+        self.assertIn("not counted", line)
+        self.assertNotIn("counted against", line)
+        self.assertEqual(audio_player._fast_client_benches, 1)
+
+    def test_a_stale_url_is_named_stale(self):
+        [line] = self._lines((_result(FAST, minted_ago=10 * 60), "gave no audio"))
+        self.assertIn("gave no audio 10 min after its lookup", line)
+        self.assertIn("stale, not counted", line)
+        self.assertEqual(list(audio_player._fast_client_recent), [])
 
 
 # --- What the fast client answered -----------------------------------------------------------
@@ -584,6 +651,13 @@ class TestReader(_FastClientState):
         self.assertIn(str(audio_player._STREAM_CHUNK_BYTES), line[0])
         self.assertIn("42 s", line[0])
 
+    def test_a_later_refusal_of_an_old_fast_url_counts_nothing(self):
+        """After a long pause the next window can go to a URL older than any measured serving."""
+        out = self._cut_mid_stream(settle=False, minted_at=time.time() - 2 * 3600)
+        self.assertLessEqual(_bench_left(), 0)
+        self.assertEqual(list(audio_player._fast_client_recent), [])
+        self.assertIn("stale, not counted", out)
+
     def test_a_later_refusal_of_a_settling_stream_benches_nothing(self):
         self._cut_mid_stream()
         self.assertLessEqual(_bench_left(), 0)
@@ -702,14 +776,25 @@ class TestPlayAfterARefusal(_FastClientState):
         self.assertEqual(r.result["title"], WEB)
         self.assertEqual(list(audio_player._fast_client_recent), [False])
 
-    def test_no_audio_from_a_prefetched_fast_stream_keeps_the_old_route(self):
-        """A prefetched URL that gives no audio is looked up again as before; nothing counts."""
+    def test_no_audio_from_a_prefetched_fast_stream_goes_to_the_configured_client(self):
+        """The play command hands play() its own fresh lookup as a prefetched result: one more
+        visionos lookup would only cost another wait before the fallback."""
         r = self._play([_result(WEB)], [[], [FRAME]], prefetched=_result(FAST), refuse=False)
         self.assertIsNone(r.error)
-        self.assertEqual(r.fast_args, [True])
+        self.assertEqual(r.fast_args, [False])
         self.assertEqual(r.opened, [FAST, WEB])
         self.assertEqual(r.result["title"], WEB)
+        self.assertEqual(list(audio_player._fast_client_recent), [False], "fresh, so it counts")
+        self.assertIn("gave no audio", r.out)
+
+    def test_no_audio_from_a_stale_prefetched_fast_stream_counts_nothing(self):
+        r = self._play([_result(WEB)], [[], [FRAME]],
+                       prefetched=_result(FAST, minted_ago=10 * 60), refuse=False)
+        self.assertIsNone(r.error)
+        self.assertEqual(r.fast_args, [False])
+        self.assertEqual(r.opened, [FAST, WEB])
         self.assertEqual(list(audio_player._fast_client_recent), [])
+        self.assertIn("stale, not counted", r.out)
 
     def test_no_audio_from_another_fresh_stream_is_still_a_failure(self):
         r = self._play([_result(WEB)], [[]], refuse=False)

@@ -877,26 +877,26 @@ def _issued_to_fast_client(stream_client: str | None) -> bool:
     return bool(_FAST_CLIENT_C) and stream_client == _FAST_CLIENT_C
 
 
-def _note_fast_attempt(ok: bool, reason: str = "", bench_now: bool = False) -> None:
+def _note_fast_attempt(ok: bool, reason: str = "", bench_now: bool = False) -> bool:
     """Record one fast-client attempt: a success is one of its streams giving a first frame, a
     failure is a refused lookup or stream URL. A lookup that returns records nothing. A failure
     benches the fast client when it is the second among the last five attempts, or at once with
-    ``bench_now``."""
+    ``bench_now``. Returns False when nothing was recorded because it is benched."""
     global _fast_client_benched_until, _fast_client_benches
     with _fast_client_lock:
         now = time.monotonic()
         if now < _fast_client_benched_until:
             # Started before the bench landed, so it says nothing the bench did not.
-            return
+            return False
         if ok:
             if _fast_client_benches:
                 print(f"[yt-dlp] {_FAST_CLIENT} stream played again — back in use")
             _fast_client_benches = 0
             _fast_client_recent.append(True)
-            return
+            return True
         _fast_client_recent.append(False)
         if not bench_now and _fast_client_recent.count(False) < 2:
-            return
+            return True
         bench = _FAST_BENCHES[min(_fast_client_benches, len(_FAST_BENCHES) - 1)]
         _fast_client_benches += 1
         _fast_client_benched_until = now + bench
@@ -904,20 +904,21 @@ def _note_fast_attempt(ok: bool, reason: str = "", bench_now: bool = False) -> N
         span = f"{bench / 3600:g} h" if bench >= 3600 else f"{bench / 60:g} min"
         print(f"[yt-dlp] Benching {_FAST_CLIENT} for {span} ({reason}) — lookups use the "
               f"configured client until then ({_fast_client_benches} bench(es) in a row)")
+        return True
 
 
-def _note_fast_stream_refused(info: dict) -> None:
-    """A fast-client URL was refused on its first window, or opened and gave no audio. Fresh,
-    that counts against the fast client; older, the URL went stale in a cache, which says
-    nothing about the client."""
+def _note_fast_stream_refused(info: dict, what: str = "refused") -> None:
+    """A fast-client URL was refused on its first window, or opened and gave no audio (``what``
+    says which). Fresh, that counts against the fast client; older, the URL went stale in a
+    cache, which says nothing about the client."""
     age = time.time() - (info.get("minted_at") or 0.0)
-    if age <= _FAST_FRESH_REFUSAL:
-        print(f"[stream] {_FAST_CLIENT} stream URL refused {age:.0f} s after its lookup — "
-              f"counted against {_FAST_CLIENT}; looking the track up with the configured client")
-        _note_fast_attempt(False, f"a stream URL was refused {age:.0f} s after its lookup")
-    else:
-        print(f"[stream] {_FAST_CLIENT} stream URL refused {age / 60:.0f} min after its lookup — "
-              f"stale, not counted; looking the track up with the configured client")
+    if age > _FAST_FRESH_REFUSAL:
+        print(f"[stream] {_FAST_CLIENT} stream URL {what} {age / 60:.0f} min after its lookup — "
+              f"stale, not counted")
+        return
+    counted = _note_fast_attempt(False, f"a stream URL {what} {age:.0f} s after its lookup")
+    print(f"[stream] {_FAST_CLIENT} stream URL {what} {age:.0f} s after its lookup — "
+          + (f"counted against {_FAST_CLIENT}" if counted else "not counted, it is benched already"))
 
 
 def _fast_client_verdict(exc: BaseException) -> str:
@@ -960,6 +961,11 @@ def _resolve_with_clients(query: str, client: str, debug: bool, cookies_file: st
         if verdict == "raise":
             raise
         reason = str(e).strip().splitlines()[0][:160] if str(e).strip() else type(e).__name__
+        if youtube_block_remaining() > 0 and not _yt_block_probing:
+            # Another guild's lookup armed the shared block while this one was out: asking the
+            # configured client now is one more request to an address YouTube has just flagged.
+            # Nothing is counted against the fast client.
+            raise YouTubeBlockedError(youtube_block_remaining()) from e
         print(f"[yt-dlp] {name} refused this lookup ({reason}) — asking {client}")
         # Its error is the answer when it is refused too: both refused means the address or
         # the video, which the shared block around this call deals with. Nothing is counted.
@@ -1548,13 +1554,20 @@ class _CurlStreamReader:
                 response = self._open_window(offset)
             if response is None and not self._closed.is_set():
                 if not self._settle and self._last_status in (401, 403):
-                    # A fast-client URL refused mid-track is how android_vr's cut-off began
-                    # (August 2026): stop asking that client at once. The track ends as before.
-                    print(f"[stream] {_FAST_CLIENT} URL refused at byte {offset} "
-                          f"({self.error_text}), {time.time() - self._minted_at:.0f} s after "
-                          f"its lookup")
-                    _note_fast_attempt(False, f"a stream URL was refused at byte {offset}",
-                                       bench_now=True)
+                    age = time.time() - self._minted_at
+                    if age <= _FAST_URL_MAX_AGE:
+                        # A fast-client URL refused mid-track is how android_vr's cut-off began
+                        # (August 2026): stop asking that client at once. The track ends as before.
+                        print(f"[stream] {_FAST_CLIENT} URL refused at byte {offset} "
+                              f"({self.error_text}), {age:.0f} s after its lookup")
+                        _note_fast_attempt(False, f"a stream URL was refused at byte {offset}",
+                                           bench_now=True)
+                    else:
+                        # Older than any fast-client URL was measured serving (a long pause, a
+                        # long track): that says nothing about the client.
+                        print(f"[stream] {_FAST_CLIENT} URL refused at byte {offset} "
+                              f"({self.error_text}), {age / 60:.0f} min after its lookup — "
+                              f"stale, not counted")
                 else:
                     print(f"[stream] giving up at byte {offset}: {self.error_text}")
         except OSError:
@@ -2310,11 +2323,13 @@ class AudioPlayer:
             # frame means the stream produced no audio. From a cached URL that is
             # stale/revoked — tear down and re-resolve fresh. From a fresh resolve it is a
             # failure: accepting it "played" the track for 0 s and reset auto-next's
-            # breaker, so a CDN refusing every fresh URL walked the whole queue. A fresh
-            # fast-client stream with no audio is handled like a refused one instead.
+            # breaker, so a CDN refusing every fresh URL walked the whole queue. A fast-client
+            # stream with no audio is handled like a refused one instead, prefetched or not
+            # (the play command hands play() its own fresh lookup as a prefetched result); the
+            # URL's age decides whether it counts against the fast client.
             frame = await loop.run_in_executor(_STREAM_EXECUTOR, src.read)
             if not frame:
-                refused = not used_cache and _issued_to_fast_client(info.get("client"))
+                refused = _issued_to_fast_client(info.get("client"))
                 if self._debug:
                     print("[debug][player] Stream produced no audio — "
                           + ("re-resolving fresh" if used_cache or refused else "failing the play"))
@@ -2331,7 +2346,7 @@ class AudioPlayer:
                 candidate = None
                 invalidate_resolve_cache(url_or_query)
                 if refused:
-                    _note_fast_stream_refused(info)
+                    _note_fast_stream_refused(info, "gave no audio")
                     fast = False
                 elif not used_cache:
                     raise StreamFailedError("The audio stream ended before producing any audio")
