@@ -351,13 +351,12 @@ class TestVerdicts(_FastClientState):
 
     def test_an_unknown_error_benches_on_the_second_failure_in_five_attempts(self):
         failing = _Clients(visionos=NOT_ON_APP, web_embedded=_result(WEB))
-        working = _Clients(visionos=_result(FAST), web_embedded=_result(WEB))
         self.assertEqual(self._lookup(failing)["client"], WEB)
         self.assertEqual(failing.asked, ["visionos", "web_embedded"])
         self.assertLessEqual(_bench_left(), 0, "one failure is not enough")
         for _ in range(3):
-            self._lookup(working)
-        self._lookup(failing)                           # 2nd failure within the last five
+            _quiet(audio_player._note_fast_attempt, True)    # a fast-client stream played
+        self._lookup(failing)                          # 2nd failure within the last five
         self.assertAlmostEqual(_bench_left(), audio_player._FAST_BENCHES[0], delta=5)
 
     def test_a_failure_outside_the_last_five_attempts_is_forgotten(self):
@@ -366,10 +365,9 @@ class TestVerdicts(_FastClientState):
                 _reset()
                 _enable_fast_client()
                 failing = _Clients(visionos=NOT_ON_APP, web_embedded=_result(WEB))
-                working = _Clients(visionos=_result(FAST), web_embedded=_result(WEB))
                 self._lookup(failing)
                 for _ in range(successes):
-                    self._lookup(working)
+                    _quiet(audio_player._note_fast_attempt, True)    # a fast-client stream played
                 self._lookup(failing)
                 self.assertLessEqual(_bench_left(), 0)
 
@@ -434,6 +432,15 @@ class TestBench(_FastClientState):
 # --- What the fast client answered -----------------------------------------------------------
 
 class TestResultHandling(_FastClientState):
+
+    def test_an_accepted_answer_records_nothing(self):
+        """android_vr (August 2026) kept answering lookups while every stream URL was refused."""
+        audio_player._fast_client_benches = 2
+        clients = _Clients(visionos=_result(FAST), web_embedded=_result(WEB))
+        self.assertEqual(self._lookup(clients)["client"], FAST)
+        self.assertEqual(clients.asked, ["visionos"])
+        self.assertEqual(list(audio_player._fast_client_recent), [])
+        self.assertEqual(audio_player._fast_client_benches, 2, "the escalation is not reset")
 
     def test_an_answer_from_another_client_is_kept_without_a_second_lookup(self):
         """A made-for-kids video: yt-dlp appends web_embedded inside the visionos lookup."""
@@ -656,7 +663,7 @@ class TestPlayAfterARefusal(_FastClientState):
                 patch.object(audio_player, "invalidate_resolve_cache", invalidate), \
                 patch.object(audio_player, "_open_audio_stream", side_effect=open_stream), \
                 patch("discord.FFmpegPCMAudio", side_effect=ffmpeg), \
-                contextlib.redirect_stdout(io.StringIO()):
+                contextlib.redirect_stdout(io.StringIO()) as out:
             player = audio_player.AudioPlayer(self.CONFIG)
             player.set_voice_client(vc)
             try:
@@ -666,7 +673,8 @@ class TestPlayAfterARefusal(_FastClientState):
                 error = e
         return SimpleNamespace(error=error, result=result, vc=vc, opened=opened, player=player,
                                fast_args=[c.kwargs.get("fast") for c in resolve.call_args_list],
-                               invalidated=[c.args[0] for c in invalidate.call_args_list])
+                               invalidated=[c.args[0] for c in invalidate.call_args_list],
+                               out=out.getvalue())
 
     def test_a_refused_fresh_url_is_looked_up_again_with_the_configured_client(self):
         r = self._play([_result(FAST), _result(WEB)], [[FRAME]])
@@ -717,6 +725,68 @@ class TestPlayAfterARefusal(_FastClientState):
         self.assertEqual(r.vc.played, [])
         self.assertIsNone(r.player._ytdlp_proc)
         self.assertFalse(r.player.is_playing)
+
+
+class TestSuccessIsAStreamThatPlays(_FastClientState):
+    """A fast-client success is its stream giving a first frame, never a lookup that returned."""
+
+    CONFIG = TestPlayAfterARefusal.CONFIG
+    _play = TestPlayAfterARefusal._play
+
+    def test_a_fast_client_stream_that_plays_records_one_success(self):
+        for name, resolves, prefetched in (("fresh", [_result(FAST)], None),
+                                           ("prefetched", [], _result(FAST))):
+            with self.subTest(name):
+                _reset()
+                _enable_fast_client()
+                r = self._play(resolves, [[FRAME]], prefetched=prefetched, refuse=False)
+                self.assertIsNone(r.error)
+                self.assertEqual(r.opened, [FAST])
+                self.assertEqual(list(audio_player._fast_client_recent), [True])
+
+    def test_lookups_that_answer_do_not_stop_the_bench_escalating(self):
+        """android_vr, August 2026: every lookup answered and every stream URL was refused."""
+        clients = _Clients(visionos=_result(FAST), web_embedded=_result(WEB))
+
+        def resolve(query, client, debug=False, cookies_file=None, fast=False):
+            return audio_player._resolve_gated(query, client, debug, cookies_file, fast)
+
+        def two_refused_plays():
+            for _ in range(2):
+                r = self._play(resolve, [[FRAME]])
+                self.assertIsNone(r.error)
+                self.assertEqual(r.opened, [FAST, WEB])
+            return r.out
+
+        with patch.object(audio_player, "_resolve_audio_url", clients):
+            two_refused_plays()
+            self.assertAlmostEqual(_bench_left(), audio_player._FAST_BENCHES[0], delta=5)
+            TestBench._expire()
+            out = two_refused_plays()
+        self.assertAlmostEqual(_bench_left(), audio_player._FAST_BENCHES[1], delta=5)
+        self.assertEqual(audio_player._fast_client_benches, 2)
+        self.assertIn("(2 bench(es) in a row)", out)
+        self.assertNotIn("back in use", out)
+        self.assertEqual(clients.asked, ["visionos", "web_embedded"] * 4)
+
+    def test_after_a_bench_a_stream_that_plays_brings_it_back_and_a_lookup_does_not(self):
+        _quiet(audio_player._note_fast_attempt, False, "refused", bench_now=True)
+        TestBench._expire()
+        clients = _Clients(visionos=_result(FAST), web_embedded=_result(WEB))
+        out = io.StringIO()
+        with patch.object(audio_player, "_resolve_audio_url", clients), \
+                contextlib.redirect_stdout(out):
+            result = audio_player._resolve_gated(WATCH, "web_embedded", False, None, True)
+        self.assertEqual(result["client"], FAST)
+        self.assertNotIn("back in use", out.getvalue())
+        self.assertEqual(audio_player._fast_client_benches, 1, "a lookup alone resets nothing")
+
+        r = self._play([_result(FAST)], [[FRAME]], refuse=False)
+        self.assertIsNone(r.error)
+        self.assertEqual(r.out.count("back in use"), 1)
+        self.assertEqual(audio_player._fast_client_benches, 0)
+        _quiet(audio_player._note_fast_attempt, False, "refused", bench_now=True)
+        self.assertAlmostEqual(_bench_left(), audio_player._FAST_BENCHES[0], delta=5)
 
 
 if __name__ == "__main__":

@@ -810,9 +810,9 @@ _FAST_URL_MAX_AGE = 60 * 60         # a fast-client URL was measured serving up 
 _FAST_FRESH_REFUSAL = 60.0          # a URL refused this soon after its lookup counts against it
 _FAST_BENCHES = (1800.0, 3600.0, 7200.0, 14400.0, 28800.0)   # per bench in a row
 _fast_client_lock = threading.Lock()
-_fast_client_recent: deque = deque(maxlen=5)   # last attempts, True = worked; 2 failures bench
+_fast_client_recent: deque = deque(maxlen=5)   # last attempts, True = its stream played; 2 failures bench
 _fast_client_benched_until = 0.0    # time.monotonic() before which the fast client is skipped
-_fast_client_benches = 0            # benches since it last worked; picks the next duration
+_fast_client_benches = 0            # benches since its stream last played; picks the next duration
 
 # The video itself is refused, the same way for every client: asking the configured client
 # too would only double a dead track's cost.
@@ -878,8 +878,10 @@ def _issued_to_fast_client(stream_client: str | None) -> bool:
 
 
 def _note_fast_attempt(ok: bool, reason: str = "", bench_now: bool = False) -> None:
-    """Record one fast-client attempt. A failure benches the fast client when it is the second
-    among the last five attempts, or at once with ``bench_now``."""
+    """Record one fast-client attempt: a success is one of its streams giving a first frame, a
+    failure is a refused lookup or stream URL. A lookup that returns records nothing. A failure
+    benches the fast client when it is the second among the last five attempts, or at once with
+    ``bench_now``."""
     global _fast_client_benched_until, _fast_client_benches
     with _fast_client_lock:
         now = time.monotonic()
@@ -888,7 +890,7 @@ def _note_fast_attempt(ok: bool, reason: str = "", bench_now: bool = False) -> N
             return
         if ok:
             if _fast_client_benches:
-                print(f"[yt-dlp] {_FAST_CLIENT} is answering again — back in use")
+                print(f"[yt-dlp] {_FAST_CLIENT} stream played again — back in use")
             _fast_client_benches = 0
             _fast_client_recent.append(True)
             return
@@ -972,7 +974,6 @@ def _resolve_with_clients(query: str, client: str, debug: bool, cookies_file: st
     if issued_to and issued_to != c_value:
         return result       # yt-dlp answered from another client inside the same lookup
     if issued_to == c_value and result.get("is_audio_only") and _can_stream_in_process(result):
-        _note_fast_attempt(True)
         return result
     # Its own answer is a combined format, HLS or a live stream (a manifest URL carries no c=,
     # so its client reads ""): a path nobody measured. _resolve_audio_url has already cached
@@ -2338,6 +2339,10 @@ class AudioPlayer:
 
             source = src
             first_frame = frame
+            # Counted here, not when the lookup returned: android_vr kept answering lookups
+            # while every one of its stream URLs was refused.
+            if _issued_to_fast_client(info.get("client")):
+                _note_fast_attempt(True)
             break
 
         if source is None:
