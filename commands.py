@@ -15,6 +15,7 @@ from audio_player import (
     is_playlist_url, extract_playlist_info, resolve_audio, enumerate_playlist,
     is_stream_info_fresh, get_related_tracks, _youtube_video_id,
     warm_stream_url, _can_stream_in_process, is_permanent_resolve_error,
+    _issued_to_fast_client, invalidate_resolve_cache,
     is_systemic_resolve_error, youtube_block_remaining, YouTubeBlockedError, _fmt_wait,
     _RESOLVE_LANE, _PLAYLIST_LANE, _STREAM_EXECUTOR,
 )
@@ -1998,6 +1999,22 @@ async def _prefetch_next_track(bot, guild_id):
             warmed = await asyncio.get_event_loop().run_in_executor(
                 _STREAM_EXECUTOR, warm_stream_url, info["url"], debug
             )
+            if not warmed and _issued_to_fast_client(info.get("client")):
+                # A background lookup can still be handed a fast-client URL (the resolve
+                # cache, another guild's lookup in flight). One that refuses its probe would
+                # cost the transition a configured-client lookup and the ad wait, so get
+                # that URL now, while the current track still plays.
+                track.resolved_info = None
+                invalidate_resolve_cache(info.get("webpage_url") or track.query)
+                _last_prefetch_monotonic = time.monotonic()
+                info = await resolve_audio(track.query, yt_client, False, cookies_file,
+                                           background=True)
+                track.resolved_info = info
+                track.resolved_at = time.time()
+                if _can_stream_in_process(info):
+                    warmed = await asyncio.get_event_loop().run_in_executor(
+                        _STREAM_EXECUTOR, warm_stream_url, info["url"], debug
+                    )
             if debug and not warmed:
                 print("[debug][prefetch] CDN URL still cold — playback will wait it out")
     except asyncio.CancelledError:

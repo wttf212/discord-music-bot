@@ -14,6 +14,7 @@ the tests do not depend on the installed yt-dlp.
 import asyncio
 import contextlib
 import io
+import itertools
 import os
 import sys
 import time
@@ -45,9 +46,13 @@ SERVER_ERROR = DownloadError(f"ERROR: [youtube] {VID}: HTTP Error 503: Service U
 NO_RESULTS = audio_player._no_results_error("some song")
 
 
+_SIG = itertools.count()
+
+
 def _result(c, minted_ago=0.0, audio_only=True, protocol="https", is_live=False):
+    # Every lookup gets its own URL, as YouTube's signed ones are.
     url = (f"https://r1---sn-x.googlevideo.com/videoplayback?expire={int(time.time()) + 6 * 3600}"
-           f"&id={VID}&itag=251&clen=1024&c={c}")
+           f"&id={VID}&itag=251&clen=1024&c={c}&sig={next(_SIG)}")
     return {"url": url, "title": c, "thumbnail": "", "webpage_url": WATCH,
             "is_audio_only": audio_only, "duration": 100, "artist": "", "protocol": protocol,
             "is_live": is_live, "client": c, "minted_at": time.time() - minted_ago}
@@ -71,6 +76,8 @@ class _Clients:
     def __call__(self, query, client, debug=False, cookies_file=None, **kwargs):
         self.calls.append((client, cookies_file))
         answer = self.answers[client]
+        if callable(answer):
+            answer = answer()       # a fresh result, and so a fresh URL, for every lookup
         if isinstance(answer, BaseException):
             raise answer
         return answer
@@ -194,8 +201,11 @@ class TestStartupWiring(unittest.TestCase):
         with open(os.path.join(_ROOT, "main.py"), encoding="utf-8") as fh:
             src = fh.read()
         call = src.index("configure_fast_client(_yt_cfg.get(\"fast_client\"), "
-                         "_yt_cfg.get(\"client\", \"web\"), _cookies_file)")
+                         "_yt_cfg.get(\"client\", \"web\"), _cookies_in_use)")
         self.assertLess(src.index("COOKIE-02"), call)
+        self.assertIn("_cookies_in_use = _cookies_file if _cookies_file and "
+                      "os.path.isfile(_cookies_file) else None", src,
+                      "a cookies_file that does not exist is not used, so it must not turn it off")
         self.assertLess(call, src.index("bot = MusicBot(config)"))
         self.assertIn("from audio_player import AudioPlayer, shutdown_audio, configure_fast_client",
                       src)
@@ -491,6 +501,16 @@ class TestRefusalLines(_FastClientState):
         self.assertNotIn("counted against", line)
         self.assertEqual(audio_player._fast_client_benches, 1)
 
+    def test_one_refused_url_counts_once(self):
+        """Guilds can share one URL (in-flight lookups, the resolve cache)."""
+        shared = _result(FAST)
+        lines = self._lines((shared,), (dict(shared),))
+        self.assertEqual(list(audio_player._fast_client_recent), [False])
+        self.assertLessEqual(_bench_left(), 0, "one refused URL is one failure")
+        self.assertIn("already counted", lines[1])
+        self._lines((_result(FAST),))
+        self.assertGreater(_bench_left(), 0, "a second URL refused is the second failure")
+
     def test_a_stale_url_is_named_stale(self):
         [line] = self._lines((_result(FAST, minted_ago=10 * 60), "gave no audio"))
         self.assertIn("gave no audio 10 min after its lookup", line)
@@ -552,6 +572,82 @@ class TestResultHandling(_FastClientState):
 
 
 # --- Freshness ---------------------------------------------------------------------------------
+
+class TestCombinedFormatWarning(_FastClientState):
+    """A combined answer from the fast client is not kept, so no advice about keeping it."""
+
+    def _out(self, client):
+        @contextlib.contextmanager
+        def fake_resolver(key, opts):
+            yield SimpleNamespace(extract_info=lambda q, download=False: {
+                "id": VID, "url": "https://r1.googlevideo.com/videoplayback?expire=99999999999&itag=18",
+                "vcodec": "avc1.42001E", "title": "T", "thumbnail": "", "webpage_url": WATCH,
+                "duration": 100})
+
+        out = io.StringIO()
+        with patch.object(audio_player, "_resolver", fake_resolver), \
+                patch.object(audio_player, "_resolve_cache_put", lambda *a, **k: None), \
+                contextlib.redirect_stdout(out):
+            audio_player._resolve_audio_url(WATCH, client)
+        return out.getvalue()
+
+    def test_only_the_configured_clients_combined_answer_gets_the_warning(self):
+        self.assertNotIn("Combined video+audio", self._out("visionos"))
+        self.assertNotIn("youtube.client", self._out("visionos"))
+        self.assertIn("Combined video+audio", self._out("web_embedded"))
+
+
+class TestPrefetchReplacesARefusedFastUrl(_FastClientState):
+    """A background lookup can be handed a fast-client URL (resolve cache, a lookup in flight)."""
+
+    def _prefetch(self, first, warms):
+        import commands
+        from track_queue import Track, TrackQueue
+
+        class _GS:
+            def __init__(self):
+                self.queue = TrackQueue()
+                self.prefetch_task = None
+
+        class _Bot:
+            config = {"youtube": {"client": "web_embedded"}, "debug": False}
+
+            def __init__(self):
+                self.gs = _GS()
+
+            def get_guild_state(self, guild_id):
+                return self.gs
+
+        bot = _Bot()
+        bot.gs.queue.add(Track(query=WATCH, title="t", requested_by="u1"))
+        commands._last_prefetch_monotonic = 0.0
+        resolve = AsyncMock(side_effect=[first, _result(WEB)])
+        probes = iter(warms)
+        with patch.object(commands, "resolve_audio", resolve), \
+                patch.object(commands, "warm_stream_url", lambda url, debug=False: next(probes)), \
+                patch.object(commands, "invalidate_resolve_cache") as invalidate, \
+                contextlib.redirect_stdout(io.StringIO()):
+            asyncio.run(commands._prefetch_next_track(bot, 1))
+        return bot.gs.queue.list()[0], resolve, invalidate
+
+    def test_a_refused_fast_url_is_replaced_by_the_configured_clients(self):
+        track, resolve, invalidate = self._prefetch(_result(FAST), [False, True])
+        self.assertEqual(track.resolved_info["client"], WEB)
+        self.assertEqual(resolve.await_count, 2)
+        self.assertTrue(all(c.kwargs.get("background") for c in resolve.await_args_list))
+        invalidate.assert_called_once_with(WATCH)
+
+    def test_a_fast_url_that_answers_is_kept(self):
+        track, resolve, invalidate = self._prefetch(_result(FAST), [True])
+        self.assertEqual(track.resolved_info["client"], FAST)
+        self.assertEqual(resolve.await_count, 1)
+        invalidate.assert_not_called()
+
+    def test_a_cold_configured_client_url_is_kept_as_before(self):
+        track, resolve, _ = self._prefetch(_result(WEB), [False])
+        self.assertEqual(track.resolved_info["client"], WEB)
+        self.assertEqual(resolve.await_count, 1, "playback waits out its ad as before")
+
 
 class TestFreshness(_FastClientState):
 
@@ -833,7 +929,7 @@ class TestSuccessIsAStreamThatPlays(_FastClientState):
 
     def test_lookups_that_answer_do_not_stop_the_bench_escalating(self):
         """android_vr, August 2026: every lookup answered and every stream URL was refused."""
-        clients = _Clients(visionos=_result(FAST), web_embedded=_result(WEB))
+        clients = _Clients(visionos=lambda: _result(FAST), web_embedded=lambda: _result(WEB))
 
         def resolve(query, client, debug=False, cookies_file=None, fast=False):
             return audio_player._resolve_gated(query, client, debug, cookies_file, fast)

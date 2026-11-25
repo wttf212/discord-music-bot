@@ -811,6 +811,9 @@ _fast_client_lock = threading.Lock()
 _fast_client_recent: deque = deque(maxlen=5)   # last attempts, True = its stream played; 2 failures bench
 _fast_client_benched_until = 0.0    # time.monotonic() before which the fast client is skipped
 _fast_client_benches = 0            # benches since its stream last played; picks the next duration
+# Refused stream URLs already counted: guilds can share one URL (in-flight lookups, the resolve
+# cache), and one refusal must not count twice towards the two-in-five bench.
+_fast_refused_urls: deque = deque(maxlen=64)
 
 # The video itself is refused, the same way for every client: asking the configured client
 # too would only double a dead track's cost.
@@ -849,6 +852,7 @@ def configure_fast_client(name: str | None, client: str, cookies_file: str | Non
     with _fast_client_lock:
         _FAST_CLIENT, _FAST_CLIENT_C = None, ""
         _fast_client_recent.clear()
+        _fast_refused_urls.clear()
         _fast_client_benched_until = 0.0
         _fast_client_benches = 0
     name = (name or "").strip().lower()
@@ -913,6 +917,15 @@ def _note_fast_stream_refused(info: dict, what: str = "refused") -> None:
     if age > _FAST_FRESH_REFUSAL:
         print(f"[stream] {_FAST_CLIENT} stream URL {what} {age / 60:.0f} min after its lookup — "
               f"stale, not counted")
+        return
+    url = info.get("url")
+    with _fast_client_lock:
+        again = url in _fast_refused_urls
+        if not again:
+            _fast_refused_urls.append(url)
+    if again:
+        print(f"[stream] {_FAST_CLIENT} stream URL {what} {age:.0f} s after its lookup — "
+              f"already counted for another play")
         return
     counted = _note_fast_attempt(False, f"a stream URL {what} {age:.0f} s after its lookup")
     print(f"[stream] {_FAST_CLIENT} stream URL {what} {age:.0f} s after its lookup — "
@@ -1186,7 +1199,9 @@ def _resolve_audio_url(query: str, client: str, debug: bool = False,
             else:
                 print("[yt-dlp] PO Token: not present in URL")
 
-            if not is_audio_only:
+            # A fast-client answer like this is not kept: _resolve_with_clients logs it and asks
+            # the configured client, so this warning and its advice would be wrong.
+            if not is_audio_only and not (_FAST_CLIENT and client == _FAST_CLIENT):
                 with_pot = "pot=" in url
                 cause = ("bgutil attestation may be broken (YouTube changed ytAtR)" if with_pot
                          else f"YouTube is serving the '{client}' client only this format for "
