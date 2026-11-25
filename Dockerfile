@@ -21,7 +21,8 @@ RUN curl -fsSL https://deno.land/install.sh | sh
 # starve discord.py's audio sender thread (measured, 2 pinned cores, 50 streams: p99
 # packet gap 21 ms -> 125 ms with 4 concurrent resolves, 48 ms with Deno and bgutil
 # below normal priority). yt-dlp finds deno through PATH, so a wrapper in front of the
-# real binary is enough. main.py starts the bgutil server niced the same way.
+# real binary is enough. main.py would start the bgutil server niced the same way; it is
+# not started while lookups ask for no PO tokens.
 RUN mkdir -p /opt/nice-bin \
     && printf '#!/bin/sh\nexec nice -n 10 %s/bin/deno "$@"\n' "$DENO_INSTALL" > /opt/nice-bin/deno \
     && chmod +x /opt/nice-bin/deno

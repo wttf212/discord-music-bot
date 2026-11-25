@@ -8,6 +8,9 @@ import os
 import sys
 import time
 import unittest
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -62,7 +65,18 @@ class TestYoutubeExtractorArgs(unittest.TestCase):
     def test_anti_detection_args_preserved(self):
         args = _youtube_extractor_args("web,android_vr", None)
         self.assertEqual(args["youtube"]["player_client"], ["web", "android_vr"])
-        self.assertEqual(args["youtube"]["fetch_pot"], ["always"])
+        # googlevideo answers 403 to URLs carrying the bundled bgutil build's token, so no
+        # provider may be asked ("never"); "missing_pot" keeps the token-less formats that
+        # yt-dlp would otherwise drop once web_embedded has a token policy.
+        self.assertEqual(args["youtube"]["fetch_pot"], ["never"])
+        self.assertEqual(args["youtube"]["formats"], ["missing_pot"])
+
+    def test_subprocess_command_line_carries_same_values(self):
+        with patch.object(audio_player.subprocess, "Popen") as popen:
+            audio_player._start_ytdlp_stream(WATCH.format("abc12345678"), "web_embedded",
+                                             direct_url=None)
+        cmd = popen.call_args.args[0]
+        self.assertIn("youtube:player_client=web_embedded;fetch_pot=never;formats=missing_pot", cmd)
 
 
 class TestResolveCache(unittest.TestCase):
@@ -159,14 +173,79 @@ class TestResolveCache(unittest.TestCase):
         self.assertIsNone(_resolve_cache_get(WATCH.format("vid00000001")))
 
 
+class TestStreamClient(unittest.TestCase):
+
+    def test_reads_the_c_param(self):
+        self.assertEqual(audio_player._stream_client(
+            "https://r1.googlevideo.com/videoplayback?expire=1&c=WEB_EMBEDDED_PLAYER&clen=5"),
+            "WEB_EMBEDDED_PLAYER")
+        self.assertEqual(audio_player._stream_client(
+            "https://r1.googlevideo.com/videoplayback?c=VISIONOS&expire=1"), "VISIONOS")
+
+    def test_absent_param_is_empty(self):
+        self.assertEqual(audio_player._stream_client(
+            "https://r1.googlevideo.com/videoplayback?expire=1&id=abc"), "")
+        self.assertEqual(audio_player._stream_client("https://r1.googlevideo.com/videoplayback"), "")
+        self.assertEqual(audio_player._stream_client(""), "")
+
+    def test_unparsable_value_is_empty(self):
+        self.assertEqual(audio_player._stream_client("http://[bad/videoplayback?c=X"), "")
+        self.assertEqual(audio_player._stream_client(None), "")
+
+
+class TestResolveRecordsClientAndTime(unittest.TestCase):
+    """The result of a lookup says which client the URL came from and when it was minted."""
+
+    def setUp(self):
+        audio_player._resolve_cache.clear()
+
+    tearDown = setUp
+
+    def _resolve(self, url, query=WATCH.format("abc12345678")):
+        info = {"id": "abc12345678", "url": url, "vcodec": "none", "title": "T",
+                "thumbnail": "", "webpage_url": query, "duration": 100}
+
+        @contextmanager
+        def fake_resolver(key, opts):
+            yield SimpleNamespace(extract_info=lambda q, download=False: dict(info))
+
+        with patch.object(audio_player, "_resolver", fake_resolver):
+            return audio_player._resolve_audio_url(query, "web_embedded")
+
+    def test_youtube_lookup_carries_client_and_mint_time(self):
+        before = time.time()
+        out = self._resolve("https://r1.googlevideo.com/videoplayback?expire=99999999999&c=VISIONOS")
+        self.assertEqual(out["client"], "VISIONOS")
+        self.assertLessEqual(before, out["minted_at"])
+        self.assertAlmostEqual(out["minted_at"], time.time(), delta=1)
+
+    def test_url_without_c_gives_empty_client(self):
+        out = self._resolve("https://r1.googlevideo.com/videoplayback?expire=99999999999")
+        self.assertEqual(out["client"], "")
+        self.assertIn("minted_at", out)
+
+    def test_non_youtube_url_gives_empty_client(self):
+        out = self._resolve("https://cf-media.sndcdn.com/track.mp3?Policy=x",
+                            query="https://soundcloud.com/artist/track")
+        self.assertEqual(out["client"], "")
+
+    def test_cache_hit_returns_both_keys_unchanged(self):
+        out = self._resolve("https://r1.googlevideo.com/videoplayback?expire=99999999999&c=VISIONOS")
+        hit = _resolve_cache_get(WATCH.format("abc12345678"))
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["client"], "VISIONOS")
+        self.assertEqual(hit["minted_at"], out["minted_at"])
+
+
 class TestPlayInvalidatesCache(unittest.TestCase):
     """A dead cached URL must not be handed straight back to play()'s retry."""
 
     def test_play_calls_invalidate_on_cached_failure(self):
         import inspect
         src = inspect.getsource(audio_player.AudioPlayer._start_playback)   # play()'s body
-        self.assertEqual(src.count("invalidate_resolve_cache(url_or_query)"), 2,
-                         "both cached-URL failure branches must invalidate the cache")
+        self.assertEqual(src.count("invalidate_resolve_cache(url_or_query)"), 3,
+                         "both cached-URL failure branches and a refused fast-client URL "
+                         "must invalidate the cache")
 
 
 if __name__ == "__main__":

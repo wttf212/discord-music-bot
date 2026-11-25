@@ -1,6 +1,6 @@
 discord.py[voice]>=2.7.0
 davey>=0.1.6,<0.2  # 0.2 silences voice on discord.py 2.7.1 (discord.py#10549); lift once a release ships #10548
-yt-dlp[default,curl-cffi]>=2026.7.4  # <2026.07 breaks YouTube extraction ("Sign in to confirm you're not a bot")
+yt-dlp[default,curl-cffi]>=2026.10.26  # needs the visionos client (2026.08.19) and the 2026.10.21 web_embedded identity; older builds also trip YouTube's bot check
 yt-dlp-ejs[all]
 pyyaml
 imageio-ffmpeg

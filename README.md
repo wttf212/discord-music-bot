@@ -17,7 +17,7 @@ A Discord music bot with YouTube, SoundCloud, and Spotify. (Use it at your own r
 - 🎚️ Per-guild equalizer (bass, treble, presets)
 - 🔧 Configurable audio bitrate per server
 - 🔒 DAVE E2EE voice encryption support (discord.py v2.7.0+)
-- 🛡️ Automatic PO token generation via bgutil-pot (prevents YouTube blocks)
+- ⚡ Fast first play — a cold track starts in about 1.5-2 s instead of about 5 s through the `visionos` client, with the normal client as automatic fallback (`youtube.fast_client: ""` turns it off)
 - 📌 Channel restriction (`!settc`)
 - 🚪 Auto-leave when voice channel empties
 
@@ -54,6 +54,7 @@ Copy `config.example.yaml` to `config.yaml` and fill in:
 | `prefix` | Command prefix (default: `!`) |
 | `owner_id` | Your Discord user ID (for `!settc` and `!shutdown`) |
 | `debug` | Enable verbose logging |
+| `youtube.fast_client` | Default `"visionos"`: tried first for plays someone is waiting on; `""` turns it off. Needs yt-dlp 2026.08.19+, ignored when `cookies_file` is set. See `config.example.yaml` |
 | `audio.bitrate` | Opus encoding bitrate in kbps (default: 128) |
 | `spotify.client_id` / `spotify.client_secret` | *(optional)* Enable Spotify **playlist/album** links (single track links work without them) |
 
@@ -68,7 +69,7 @@ Passing your YouTube visitor cookies reduces bot-detection on residential IPs.
    - **Docker**: use `cookies_file: "/data/cookies.txt"` and uncomment the bind-mount in step 4.
 4. Docker only: uncomment the `- ./cookies.txt:/data/cookies.txt` line in `docker-compose.yml`.
 
-Re-export every ~4 months. See `config.example.yaml` for full details.
+Re-export every ~4 months. See `config.example.yaml` for full details. A `cookies_file` turns `youtube.fast_client` off: yt-dlp does not use visionos for a logged-in session.
 
 ## Commands
 

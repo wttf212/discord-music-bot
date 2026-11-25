@@ -15,6 +15,7 @@ from audio_player import (
     is_playlist_url, extract_playlist_info, resolve_audio, enumerate_playlist,
     is_stream_info_fresh, get_related_tracks, _youtube_video_id,
     warm_stream_url, _can_stream_in_process, is_permanent_resolve_error,
+    _issued_to_fast_client, invalidate_resolve_cache,
     is_systemic_resolve_error, youtube_block_remaining, YouTubeBlockedError, _fmt_wait,
     _RESOLVE_LANE, _PLAYLIST_LANE, _STREAM_EXECUTOR,
 )
@@ -1118,6 +1119,12 @@ def _loading_offer_text(title: str) -> str:
     return f"**{title}** — loading track list…\nClick 'Load playlist' to add the rest."
 
 
+def _loading_card_text(title: str) -> str:
+    """The playlist line on track 1's loading card. That card has no Load button yet
+    (the offer is armed once track 1 plays), so it carries no "click" instruction."""
+    return f"**{title}** — loading track list…"
+
+
 def _resolve_offer_outcome(full_info: dict, title: str):
     """Resolve a completed full-enumeration result into the offer outcome.
 
@@ -1825,8 +1832,13 @@ def _release_np_views(gs):
         view.stop()
 
 
-async def update_np_embed(bot, channel_id: int, view: "PlayerView"):
-    """Edit the existing NP message card in-place (no new message)."""
+async def update_np_embed(bot, channel_id: int, view: "PlayerView", *, wait: bool = False):
+    """Edit the existing NP message card in-place (no new message).
+
+    The edit normally runs in its own task. ``wait=True`` awaits it instead, for a caller
+    that edits the same card again right after: two edits sent as separate tasks can
+    land in either order, leaving the older one on the card.
+    """
     channel = bot.get_channel(channel_id)
     if not channel or not hasattr(channel, 'guild') or not channel.guild:
         return
@@ -1835,7 +1847,10 @@ async def update_np_embed(bot, channel_id: int, view: "PlayerView"):
     msg_id = gs.np_message_id
     if not msg_id:
         return
-    asyncio.create_task(_do_update_np_embed(bot, channel, msg_id, view))
+    if wait:
+        await _do_update_np_embed(bot, channel, msg_id, view)
+    else:
+        asyncio.create_task(_do_update_np_embed(bot, channel, msg_id, view))
 
 
 async def _clear_np(bot, channel_id: int):
@@ -1984,6 +1999,22 @@ async def _prefetch_next_track(bot, guild_id):
             warmed = await asyncio.get_event_loop().run_in_executor(
                 _STREAM_EXECUTOR, warm_stream_url, info["url"], debug
             )
+            if not warmed and _issued_to_fast_client(info.get("client")):
+                # A background lookup can still be handed a fast-client URL (the resolve
+                # cache, another guild's lookup in flight). One that refuses its probe would
+                # cost the transition a configured-client lookup and the ad wait, so get
+                # that URL now, while the current track still plays.
+                track.resolved_info = None
+                invalidate_resolve_cache(info.get("webpage_url") or track.query)
+                _last_prefetch_monotonic = time.monotonic()
+                info = await resolve_audio(track.query, yt_client, False, cookies_file,
+                                           background=True)
+                track.resolved_info = info
+                track.resolved_at = time.time()
+                if _can_stream_in_process(info):
+                    warmed = await asyncio.get_event_loop().run_in_executor(
+                        _STREAM_EXECUTOR, warm_stream_url, info["url"], debug
+                    )
             if debug and not warmed:
                 print("[debug][prefetch] CDN URL still cold — playback will wait it out")
     except asyncio.CancelledError:
@@ -2412,10 +2443,13 @@ class MusicCog(commands.Cog):
                 await _finalize_offer(entry, full_fut, playlist_title)
                 return
 
-            # Not playing: limit=1-first — track 1 starts at the same latency as
-            # today, then the offer appears instantly while ONE background pass
-            # enumerates the rest (Invariant 3: full_fut created after limit=1
-            # returns, non-blocking, before voice-join).
+            # Not playing: limit=1-first, then track 1 starts the way a single track does.
+            # Its resolve overlaps the voice join, and its card shows at once (title from the
+            # playlist entry, artwork from the video id) instead of "Loading playlist…" until
+            # audio plays. ONE background pass enumerates the rest (Invariant 3: full_fut is
+            # created after limit=1 returns, non-blocking, before voice-join). Nothing here
+            # waits for the full enumeration, but it used to look as if it did: by the time
+            # track 1 played, a normal-sized list had finished and the card showed its count.
             status_msg = await ctx.send("Loading playlist…")
             try:
                 first_info = await _RESOLVE_LANE.run(extract_playlist_info, query, yt_client, 1)
@@ -2428,8 +2462,13 @@ class MusicCog(commands.Cog):
                 return
             playlist_title = first_info["title"]
             first_track_info = first_tracks[0]
+            first_url = first_track_info["url"]
 
             full_fut = asyncio.create_task(enumerate_playlist(query, yt_client))
+            resolve_fut = asyncio.create_task(resolve_audio(
+                first_url, yt_client, self.bot.config.get("debug", False),
+                self.bot.config.get("youtube", {}).get("cookies_file") or None,
+            ))
 
             # Join voice if not already connected
             if not voice_client or not voice_client.is_connected():
@@ -2451,43 +2490,88 @@ class MusicCog(commands.Cog):
                         await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
                 except Exception as e:
                     _abandon_enumeration(full_fut)
+                    _discard_future(resolve_fut)  # let the in-flight resolve finish and drop it
                     await status_msg.edit(content=f"Failed to join voice channel: {e}")
                     return
 
-            # Start track 1 immediately (do not wait for full enumeration).
-            # Disarm the armed auto-next chain before play() (see single-track play path for rationale).
+            # Disarm the armed auto-next chain now, in the same step the voice join returns
+            # and before anything else can suspend (see single-track play path for the
+            # rationale). Unlike a single track, track 1's resolve is still running here: a
+            # chain waiting out a voice drop or a YouTube block with a track it kept would
+            # otherwise see the voice this start just connected, resume during the resolve,
+            # and start that track — only for this start to cut it off and lose it.
             if gs.auto_next_task and not gs.auto_next_task.done():
                 gs.auto_next_task.cancel()
                 gs.auto_next_task = None
             gs.auto_next_gen += 1
+
+            # Show track 1's card straight away; it becomes the live card via an in-place
+            # edit once playback starts, as on the single-track path. No Load button yet —
+            # the offer is armed once track 1 plays — so no "click" line either.
+            first_title = first_track_info.get("title")
+            loading_view = build_player_view(
+                self.bot, first_title if first_title and first_title != "Unknown" else "Loading…",
+                _loading_card_text(playlist_title),
+                thumbnail=_youtube_thumbnail(first_url), url=first_url,
+                requester_name=f"<@{user_id}>",
+                queue_tracks=gs.queue.preview_fair_order(),
+                guild_id=ctx.guild.id, loading=True,
+            )
+            asyncio.create_task(_safe_delete(status_msg))
+            await send_new_np(self.bot, channel_id, loading_view)
+            loading_card = gs.np_message_id
+
+            async def _fail(message: str):
+                """Replace the loading card with a plain error line — unless another start
+                has put up its own card since; that one is not ours to delete."""
+                if gs.np_message_id == loading_card:
+                    await _clear_np(self.bot, channel_id)
+                try:
+                    await ctx.send(message)
+                except Exception:
+                    pass
+
             try:
-                played = await gs.player.play(first_track_info["url"])
+                info = await resolve_fut
+                # And again right before play(), with nothing in between: a manual advance
+                # that finished while track 1 was resolving (a !!skip, another !!play) may
+                # have armed a new chain, and play() stops the current track — that chain
+                # would wake and start a second play() alongside this one.
+                if gs.auto_next_task and not gs.auto_next_task.done():
+                    gs.auto_next_task.cancel()
+                    gs.auto_next_task = None
+                gs.auto_next_gen += 1
+                played = await gs.player.play(first_url, info, time.time())
                 title = played["title"]
                 track_thumbnail = played.get("thumbnail", "")
                 track_url = played.get("webpage_url", "")
-                gs.queue.current = Track(query=first_track_info["url"], title=title,
+                gs.queue.current = Track(query=first_url, title=title,
                                          requested_by=user_id, thumbnail=track_thumbnail, url=track_url)
             except Exception as e:
                 _abandon_enumeration(full_fut)
-                # Track 1 resolves inside play(), after the disarm. A YouTube block or a voice
-                # drop is no fault of the playlist, and the chain cancelled above may have been
-                # waiting one out with a track it kept: re-arm it, as a manual skip does.
+                # A YouTube block or a voice drop is no fault of the playlist, and the chain
+                # cancelled above may have been waiting one out with a track it kept: re-arm
+                # it, as a manual skip does.
                 if (is_systemic_resolve_error(e)
                         or _live_voice_client(self.bot, gs, ctx.guild.id) is None):
                     _start_auto_next(self.bot, channel_id, ctx.guild.id)
-                await status_msg.edit(content=f"Error playing first track: {e}")
+                await _fail(f"Error playing first track: {_friendly_ytdlp_error(e)}")
                 return
 
             # Audio is now playing — arm the offer BEFORE building the card so
-            # has_pending renders the Load button, then show the card and auto-next.
+            # has_pending renders the Load button.
             entry = _make_offer(full_fut, playlist_title)
-
-            view = build_player_view(self.bot, title, _loading_offer_text(playlist_title),
-                                     thumbnail=track_thumbnail, url=track_url,
-                                     requester_name=f"<@{user_id}>",
-                                     queue_tracks=gs.queue.preview_fair_order(), guild_id=ctx.guild.id)
-            asyncio.create_task(_safe_delete(status_msg))
-            await send_new_np(self.bot, channel_id, view)
+            if not full_fut.done():
+                # The rest is still loading: turn the loading card into the live card now,
+                # and wait for that edit so _finalize_offer's count edit can't overtake it.
+                view = build_player_view(self.bot, title, _loading_offer_text(playlist_title),
+                                         thumbnail=track_thumbnail, url=track_url,
+                                         requester_name=f"<@{user_id}>",
+                                         queue_tracks=gs.queue.preview_fair_order(),
+                                         guild_id=ctx.guild.id)
+                await update_np_embed(self.bot, channel_id, view, wait=True)
+            # Otherwise the list landed first (any list of up to ~100 tracks): _finalize_offer
+            # makes the one edit, straight to the live card with the real count.
             _start_auto_next(self.bot, channel_id, ctx.guild.id)
 
             await _finalize_offer(entry, full_fut, playlist_title)

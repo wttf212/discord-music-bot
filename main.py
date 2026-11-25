@@ -5,8 +5,9 @@ import sys
 import yaml
 from dataclasses import dataclass, field
 
-# Load bgutil PO token provider plugin for yt-dlp (must be done before yt-dlp is imported)
-# This enables dynamic PO token generation to prevent YouTube IP bans
+# Load bgutil PO token provider plugin for yt-dlp (must be done before yt-dlp is imported).
+# Lookups do not ask for tokens at present (fetch_pot=never in audio_player.py: googlevideo
+# refuses the bundled build's tokens); the plugin stays registered for a provider that works.
 _base_dir = os.path.dirname(os.path.abspath(__file__))
 _plugin_dir = os.path.join(_base_dir, "yt-dlp-plugins", "bgutil-ytdlp-pot-provider")
 if os.path.isdir(_plugin_dir) and _plugin_dir not in sys.path:
@@ -17,7 +18,11 @@ _deno_dir = os.path.join(os.path.expanduser("~"), ".deno", "bin")
 if os.path.isdir(_deno_dir) and _deno_dir not in os.environ.get("PATH", ""):
     os.environ["PATH"] = _deno_dir + os.pathsep + os.environ.get("PATH", "")
 
-# Start bgutil-pot HTTP server in background (PO token provider)
+# bgutil-pot HTTP server (PO token provider). Not started while lookups ask for no tokens
+# (fetch_pot=never in audio_player.py, because googlevideo refuses the bundled build's tokens):
+# it would only sit idle. The binary and the plugin stay installed; set _START_BGUTIL together
+# with fetch_pot if a provider whose tokens work is ever set up.
+_START_BGUTIL = False
 import subprocess
 import shutil
 _bgutil_name = "bgutil-pot.exe" if sys.platform == "win32" else "bgutil-pot"
@@ -28,13 +33,15 @@ _bgutil_proc = None
 
 
 def _lower_priority():
-    """preexec_fn: start the child at nice 10, so its CPU bursts (minting a PO token for
-    every resolve) yield to discord.py's audio sender thread on a small host instead of
+    """preexec_fn: start the child at nice 10, so its CPU bursts (minting PO tokens)
+    yield to discord.py's audio sender thread on a small host instead of
     competing with it. Deno gets the same treatment from a wrapper in the Dockerfile."""
     os.nice(10)
 
 
-if _bgutil_path:
+if not _START_BGUTIL:
+    print("[main] bgutil-pot not started: lookups do not ask for PO tokens")
+elif _bgutil_path:
     try:
         _bgutil_proc = subprocess.Popen(
             [_bgutil_path, "server", "--host", "127.0.0.1"],
@@ -50,7 +57,7 @@ else:
 
 import discord
 from discord.ext import commands
-from audio_player import AudioPlayer, shutdown_audio
+from audio_player import AudioPlayer, shutdown_audio, configure_fast_client
 from track_queue import TrackQueue
 
 
@@ -136,6 +143,10 @@ class MusicBot(commands.Bot):
 
 
 def main():
+    # Production images install the newest yt-dlp at build time, so say which one is running.
+    import yt_dlp
+    print(f"[main] yt-dlp {yt_dlp.version.__version__}")
+
     # --- TLS-01c: curl_cffi startup check ---
     try:
         import curl_cffi
@@ -182,6 +193,15 @@ def main():
                 )
             else:
                 print(f"[main] cookies_file found ({int(_age_days)} days old) — cookie auth enabled")
+
+    # Lookups someone is waiting on try youtube.fast_client first, with youtube.client as the
+    # fallback. On by default (visionos); fast_client: "" turns it off. configure_fast_client
+    # says why when it stays off.
+    _yt_cfg = config.get("youtube", {})
+    # A cookies_file that does not exist is not used (see above), so it doesn't count.
+    _cookies_in_use = _cookies_file if _cookies_file and os.path.isfile(_cookies_file) else None
+    configure_fast_client(_yt_cfg.get("fast_client", "visionos"), _yt_cfg.get("client", "web"),
+                          _cookies_in_use)
 
     bot = MusicBot(config)
 
