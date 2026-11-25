@@ -141,6 +141,38 @@ class TestRouting(unittest.TestCase):
             self.assertEqual(len(vc.plays), 1)
         _run(go())
 
+    def test_clips_after_the_queue_runs_out_play_alone(self):
+        async def go(update, heard):
+            vc, _, sp = _setup()
+            sp.song_change(1)
+            vc.play(sp.wrap(_Music(2), 1))
+            vc.pump()                                 # the song ends by itself and nothing is next
+            sp.between_songs = AsyncMock(return_value=update)
+            await sp.end_of_queue()
+            self.assertEqual(await sp.say(_clip(5)), "solo")
+            self.assertEqual(await sp.say(_clip(6)), "solo")
+            self.assertEqual(len(vc.plays), 2)        # the song, then one speech-only source
+            self.assertEqual(vc.pump(), heard)
+            self.assertEqual(sp.waiting_clips(), 0)
+        for update, heard in ((None, [5, 5, 5, 6, 6, 6]), (_clip(9), [9, 9, 9, 5, 5, 5, 6, 6, 6])):
+            with self.subTest(update=update is not None):
+                _run(go(update, heard))
+
+    def test_clips_before_the_next_song_starts_play_alone(self):
+        async def go():
+            vc, _, sp = _setup()
+            sp.song_change(1)
+            vc.play(sp.wrap(_Music(2), 1))
+            vc.pump()                                 # the song ends; the next start is still waiting
+            self.assertEqual(await sp.say(_clip(5)), "solo")
+            self.assertEqual(await sp.say(_clip(6)), "solo")
+            self.assertEqual(len(vc.plays), 2)
+            self.assertEqual(vc.pump(), [5, 5, 5, 6, 6, 6])
+            await _settle()
+            sp.song_change(2)
+            self.assertEqual(sp.wrap(_Music(5), 2).pending_clips(), 0)   # nothing was held for it
+        _run(go())
+
     def test_finished_solo_with_busy_voice_uses_the_backlog(self):
         async def go():
             vc, _, sp = _setup()

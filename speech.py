@@ -147,7 +147,7 @@ class Speech:
         self.track_started_at: float | None = None
         self._gen: int | None = None
         self._starting = False
-        self._mixer: SpeechMixer | None = None    # the live song's mixer
+        self._mixer: SpeechMixer | None = None    # the song's mixer; kept after a natural end until the next change
         self._solo: SpeechMixer | None = None     # speech-only source on the voice client
         self._solo_done: asyncio.Event | None = None
         self._held: list[bytes] = []              # for the next song's mixer
@@ -183,7 +183,10 @@ class Speech:
         mixer = self._mixer
         if mixer is not None and mixer.add(pcm):  # add() refuses once the song's audio has ended
             return "paused" if self._player.is_paused else "mixer"
-        if self._starting or (mixer is not None and _busy(vc)):
+        # Held while a song starts, or while the refused mixer is still on the voice client,
+        # finishing the song's speech. Once the client lets go of it the song is over and the
+        # clip plays alone, although that mixer stays remembered until the next song change.
+        if self._starting or (mixer is not None and _busy(vc) and getattr(vc, "source", None) is mixer):
             self._held.append(pcm)
             return "held"
         self._queue_solo([pcm])
