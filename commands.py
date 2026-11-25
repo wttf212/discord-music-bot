@@ -2820,6 +2820,13 @@ class MusicCog(commands.Cog):
 
         gs = self.bot.get_guild_state(ctx.guild.id)
         channel_id = gs.current_text_channel_id or ctx.channel.id
+        # Disarm the auto-next chain before the stop, as the ◄/► buttons do. The stop ends any
+        # gap speech, which releases a start waiting on it onto the closing connection; a live
+        # chain takes that failure for a voice drop, then rejoins and plays the track.
+        if gs.auto_next_task and not gs.auto_next_task.done():
+            gs.auto_next_task.cancel()
+            gs.auto_next_task = None
+        gs.auto_next_gen += 1
         gs.player.stop_playback()
         gs.queue.clear()
         await gs.player.disconnect()

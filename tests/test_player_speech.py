@@ -1,13 +1,13 @@
 """AudioPlayer + Speech: gap speech plays before the song, music is always wrapped."""
-import asyncio, os, sys, threading, unittest
+import asyncio, os, sys, threading, time, unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import discord
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import audio_player, speech
-from track_queue import Track
+import audio_player, commands, speech
+from track_queue import Track, TrackQueue
 from test_play_abort import FRAME, INFO, _FakeVoice, _Harness
 
 CLIP = FRAME * 3
@@ -39,6 +39,29 @@ class _OneAtATimeVoice(_FakeVoice):
         self.source = self.after = None
         if source is not None and after:
             after(None)
+
+
+class _LeavingVoice(_OneAtATimeVoice):
+    """discord.py 2.7.1's disconnect(): the connection reads as closed before its first await,
+    and the guild drops the client only once Discord confirms the leave."""
+
+    def __init__(self, guild, channel):
+        super().__init__()
+        self.guild, self.channel, self.connected = guild, channel, True
+
+    def is_connected(self):
+        return self.connected
+
+    def play(self, source, after=None, **encoder_settings):
+        if not self.connected:
+            raise discord.ClientException("Not connected to voice.")
+        super().play(source, after, **encoder_settings)
+
+    async def disconnect(self, *, force=False):
+        self.stop()
+        self.connected = False
+        await asyncio.sleep(0.05)
+        self.guild.voice_client = None
 
 
 def _player(voice):
@@ -142,3 +165,70 @@ class TestPlayerSpeech(unittest.TestCase):
         with patch.object(discord, "FFmpegPCMAudio", lambda *a, **k: _Radio()):
             asyncio.run(player.play_radio(track))
         self.assertIsInstance(voice.played, speech.SpeechMixer)
+
+
+class TestStopDuringGapSpeech(unittest.TestCase):
+    """!stop while the next song waits out the gap speech. The stop ends the speech, which
+    releases the start onto a connection that is closing. The auto-next chain must not take
+    that for a voice drop: put the track back, rejoin the channel and play it."""
+
+    def test_stop_ends_auto_play_for_good(self):
+        harness, rejoins, sent, outcome = _Harness(), [], [], {}
+        self.addCleanup(lambda: [b.cleanup() for b in harness.buffers])
+        guild = SimpleNamespace(id=1, voice_client=None)
+
+        async def connect():
+            rejoins.append(_LeavingVoice(guild, channel))
+            guild.voice_client = rejoins[-1]
+            return rejoins[-1]
+
+        async def send(content=None, **kwargs):
+            sent.append(content)
+
+        channel = SimpleNamespace(members=[SimpleNamespace(bot=False)], connect=connect)
+        guild.voice_client = voice = _LeavingVoice(guild, channel)
+        player = _player(voice)
+        gs = SimpleNamespace(queue=TrackQueue(), player=player, auto_next_task=None,
+                             auto_next_gen=1, autoplay=False, current_text_channel_id=None)
+        gs.queue.add(Track(query="b", title="b", requested_by="u",
+                           resolved_info=dict(INFO), resolved_at=time.time()))
+        text = SimpleNamespace(id=10, send=send)
+        bot = SimpleNamespace(get_guild_state=lambda gid: gs, get_guild=lambda gid: guild,
+                              get_channel=lambda cid: text)
+        ctx = SimpleNamespace(bot=bot, guild=guild, author=SimpleNamespace(id=42),
+                              channel=text, send=send)
+
+        async def scenario():
+            parked = asyncio.Event()
+            real_wait_for_gap = player.speech.wait_for_gap
+
+            async def wait_for_gap(gen):
+                parked.set()
+                await real_wait_for_gap(gen)
+
+            player.speech.wait_for_gap = wait_for_gap
+            player.speech.queue_after(CLIP)
+            commands._start_auto_next(bot, 10, 1)   # pops "b"; its start waits out the clip
+            chain, outcome["chain gen"] = gs.auto_next_task, gs.auto_next_gen
+            await asyncio.wait_for(parked.wait(), 5)
+            await commands.MusicCog.stop.callback(SimpleNamespace(bot=bot), ctx)
+            await asyncio.wait({chain}, timeout=1)
+            outcome["chain ended"] = chain.done()
+
+        with harness.patched(), \
+                patch.object(commands, "_VOICE_RECOVERY_POLL", 0.01), \
+                patch.object(commands, "check_channel", AsyncMock(return_value=True)), \
+                patch.object(commands, "_check_vote", return_value=(True, "")), \
+                patch.object(commands, "update_np_stopped", AsyncMock()), \
+                patch.object(commands, "send_new_np", AsyncMock()), \
+                patch.object(commands, "build_player_view", lambda *a, **k: None), \
+                patch.object(commands, "_get_requester_name", lambda *a, **k: "u"), \
+                patch.object(commands, "_schedule_prefetch", lambda *a, **k: None), \
+                patch.object(commands, "_schedule_autoplay_topup", lambda *a, **k: None):
+            asyncio.run(scenario())
+
+        self.assertEqual(rejoins, [], "the chain rejoined the voice channel after !stop")
+        self.assertFalse(any("lost the voice connection" in m.lower() for m in sent), sent)
+        self.assertTrue(outcome["chain ended"], "the auto-next chain outlived !stop")
+        self.assertGreater(gs.auto_next_gen, outcome["chain gen"], "!stop must retire the chain's generation")
+        self.assertEqual(gs.queue.list(), [])
