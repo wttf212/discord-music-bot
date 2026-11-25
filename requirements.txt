@@ -5,3 +5,4 @@ yt-dlp-ejs[all]
 pyyaml
 imageio-ffmpeg
 tzdata  # IANA timezone database for zoneinfo (F1 race times in the guild's timezone)
+edge-tts>=7.3.1  # !tts and the half-hourly update: Microsoft Edge voices, no account or key

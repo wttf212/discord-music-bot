@@ -1,10 +1,21 @@
 """Text-to-speech helpers: text cleanup, the half-hourly update wording and its time mark."""
+import asyncio
 import re
+import subprocess
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import edge_tts
+
+from speech import FRAME_SIZE
+
 MAX_CHARS = 300
 VOICES = {"lv": "lv-LV-EveritaNeural", "en": "en-US-AriaNeural"}
+SYNTH_TIMEOUT = 15.0
+
+
+class TtsError(Exception):
+    """Speech could not be produced (service, decoder, empty audio or timeout)."""
 
 _CUSTOM_EMOJI = re.compile(r"<a?:(\w+):\d+>")
 _URL = re.compile(r"https?://\S+")
@@ -42,3 +53,43 @@ def half_hour_mark_passed(started_at: float, now: float, tz_name: str) -> bool:
     local = datetime.fromtimestamp(now, ZoneInfo(tz_name))
     mark = local.replace(minute=0 if local.minute < 30 else 30, second=0, microsecond=0)
     return mark.timestamp() > started_at
+
+
+async def _fetch_mp3(text: str, voice: str) -> bytes:
+    """Ask Microsoft's Edge voice service for the MP3 of text."""
+    chunks = []
+    async for chunk in edge_tts.Communicate(text, voice).stream():
+        if chunk["type"] == "audio":
+            chunks.append(chunk["data"])
+    return b"".join(chunks)
+
+
+def _decode_to_pcm(mp3: bytes, ffmpeg_path: str) -> bytes:
+    """Decode an MP3 to 48 kHz stereo s16le with FFmpeg."""
+    done = subprocess.run(
+        [ffmpeg_path, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+         "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"],
+        input=mp3, capture_output=True, check=True)
+    return done.stdout
+
+
+async def synthesize(text: str, lang: str, ffmpeg_path: str) -> bytes:
+    """Speak text in the language's voice; PCM padded with zeros to whole frames."""
+    async def _run() -> bytes:
+        mp3 = await _fetch_mp3(text, VOICES[lang])
+        if not mp3:
+            raise TtsError("no audio returned")
+        loop = asyncio.get_running_loop()
+        pcm = await loop.run_in_executor(None, _decode_to_pcm, mp3, ffmpeg_path)
+        if not pcm:
+            raise TtsError("decoder produced no audio")
+        return pcm + b"\x00" * (-len(pcm) % FRAME_SIZE)
+
+    try:
+        return await asyncio.wait_for(_run(), SYNTH_TIMEOUT)
+    except TtsError:
+        raise
+    except asyncio.TimeoutError as e:
+        raise TtsError("speech synthesis timed out") from e
+    except Exception as e:
+        raise TtsError(f"{type(e).__name__}: {e}") from e
