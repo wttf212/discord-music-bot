@@ -65,6 +65,8 @@ class SpeechMixer(discord.AudioSource):
     def _next_speech_frame(self) -> bytes | None:
         with self._lock:
             if not self._clips:
+                if self._music_ended:
+                    self.closed = True  # same locked block as the empty check: add() can't slip in after
                 return None
             clip = self._clips[0]
             frame = bytes(clip[self._offset:self._offset + FRAME_SIZE])
@@ -85,7 +87,6 @@ class SpeechMixer(discord.AudioSource):
             speech_frame = self._next_speech_frame()
             if speech_frame is None:
                 if self._music_ended:
-                    self.closed = True
                     self.finished = True
                     return b""
                 if self._gain >= 1.0:
@@ -108,7 +109,8 @@ class SpeechMixer(discord.AudioSource):
         return False
 
     def cleanup(self) -> None:
-        self.closed = True
+        with self._lock:
+            self.closed = True
         self.finished = True
         if self.music is not None:
             self.music.cleanup()

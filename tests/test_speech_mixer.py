@@ -124,3 +124,20 @@ class TestBookkeeping(unittest.TestCase):
         mixer.add(_tone(1, frames=3))
         self.assertEqual(mixer.read(), b"\x01" * 100)
         self.assertEqual(mixer.pending_clips(), 0)
+
+
+class TestAddRace(unittest.TestCase):
+    def test_add_after_the_empty_check_is_refused(self):
+        mixer = SpeechMixer(None)
+        results = []
+        original = mixer._next_speech_frame
+
+        def racing():
+            frame = original()
+            results.append(mixer.add(_tone(5)))  # add() lands right after the empty-queue decision
+            return frame
+
+        mixer._next_speech_frame = racing
+        self.assertEqual(mixer.read(), b"")
+        self.assertEqual(results, [False])
+        self.assertEqual(mixer.pending_clips(), 0)
