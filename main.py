@@ -107,10 +107,14 @@ class MusicBot(commands.Bot):
     def get_guild_state(self, guild_id: int) -> GuildState:
         """Return (or lazily create) per-guild state for the given guild."""
         if guild_id not in self._guild_states:
-            self._guild_states[guild_id] = GuildState(
+            state = GuildState(
                 player=AudioPlayer(self.config),
                 queue=TrackQueue(),
             )
+            if self.tts_enabled:
+                from tts_commands import attach_speech  # the optional TTS module, loaded only when it's on
+                attach_speech(self, guild_id, state.player)
+            self._guild_states[guild_id] = state
         return self._guild_states[guild_id]
 
     async def setup_hook(self):

@@ -122,6 +122,18 @@ All commands work with the prefix (default `!`) and as slash commands (e.g. `/pl
 | `!setlocation <city>` | Set the city for the weather shown on the player card *(admin)* |
 | `!settimezone <tz>` | Set the timezone for F1 race times, e.g. `Europe/Riga` *(admin)* |
 
+### Text-to-speech (optional)
+
+Off by default. To turn it on, install `requirements-tts.txt` (Docker: set `WITH_TTS=true` in `.env` and rebuild) and set `tts.enabled: true` in `config.yaml`.
+
+| Command | Description |
+|---------|-------------|
+| `!tts <text>` | Say something in the voice channel right now (the music dips) |
+| `!ttsafter <text>` | Say something after the current song |
+| `!ttslang lv\|en` | Speech language for this server *(admin only)* |
+| `!announce on\|off` | Say the time and songs left every half hour, between songs *(admin only)* |
+| `!ttsallow on\|off` | Turn text-to-speech on or off for this server *(admin only)* |
+
 ### Admin *(bot admin required)*
 
 | Command | Description |

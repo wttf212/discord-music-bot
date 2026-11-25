@@ -1768,6 +1768,11 @@ def _on_cooldown(guild_id, user_id, action: str, seconds: float) -> bool:
     return False
 
 
+def _speech(gs):
+    """This guild's Speech controller, or None."""
+    return getattr(gs.player, "speech", None)  # test doubles and any player without speech skip TTS
+
+
 async def check_channel(ctx: commands.Context) -> bool:
     """Check if command is in the allowed channel. Deletes message and notifies if not."""
     guild_id = str(ctx.guild.id) if ctx.guild else None
@@ -3566,7 +3571,16 @@ class MusicCog(commands.Cog):
     @commands.command(name="help")
     async def help_cmd(self, ctx: commands.Context):
         p = self.bot.command_prefix
-        await ctx.send(
+        tts_lines = ""
+        if getattr(self.bot, "tts_enabled", False):
+            tts_lines = (
+                f"`{p}tts <text>` — Say something in the voice channel right now (the music dips)\n"
+                f"`{p}ttsafter <text>` — Say something after the current song\n"
+                f"`{p}ttslang lv|en` — Speech language for this server *(admin only)*\n"
+                f"`{p}announce on|off` — Say the time and songs left every half hour, between songs *(admin only)*\n"
+                f"`{p}ttsallow on|off` — Turn text-to-speech on or off for this server *(admin only)*\n"
+            )
+        text = (
             f"**Available commands:**\n"
             f"`{p}play <url or keywords>` — Play from YouTube, SoundCloud, or Spotify (or search text)\n"
             f"`{p}search <keywords>` — Search YouTube and pick a result from a dropdown\n"
@@ -3591,6 +3605,7 @@ class MusicCog(commands.Cog):
             f"`{p}eq [bass|treble <N> | preset | reset]` — Per-guild equalizer, -10..+10 dB *(admin only)*\n"
             f"`{p}setlocation <city>` — Set the city for the weather line on the player *(admin only)*\n"
             f"`{p}settimezone <tz>` — Set the timezone for F1 race times, e.g. Europe/Riga *(admin only)*\n"
+            f"{tts_lines}"
             f"`{p}fairplay on|off` — Toggle user interleaving mode for queues *(admin only)*\n"
             f"`{p}fairness <0-100>` — Set the percentage of users strictly needed to skip/stop songs *(admin only)*\n"
             f"`{p}addadmin @user` — Add a user as a bot admin for this server *(owner only)*\n"
@@ -3598,6 +3613,13 @@ class MusicCog(commands.Cog):
             f"`{p}settc` — Restrict bot commands to this channel *(owner only)*\n"
             f"`{p}shutdown` — Shut down the bot *(owner only)*"
         )
+        # Discord refuses a message over 2000 characters, and the text-to-speech lines take
+        # the list past that, so it goes out in pieces split at line breaks.
+        while len(text) > 2000:
+            cut = text.rindex("\n", 0, 2000)
+            await ctx.send(text[:cut])
+            text = text[cut + 1:]
+        await ctx.send(text)
 
 # A 1006 voice-socket drop puts discord.py into its own reconnect loop, which can take
 # minutes. The auto-next chain has to wait that out: play() raises "Not connected to a
@@ -3916,6 +3938,9 @@ async def _auto_next(bot, channel_id, guild_id, generation):
 
 async def setup(bot):
     await bot.add_cog(MusicCog(bot))
+    if getattr(bot, "tts_enabled", False):
+        from tts_commands import TtsCog  # imported here: tts_commands imports from this module
+        await bot.add_cog(TtsCog(bot))
     # Warm the flourish caches so the first card shows them.
     asyncio.create_task(_refresh_weather_for(dict(DEFAULT_WEATHER_LOCATION)))
     asyncio.create_task(_refresh_sky_for(dict(DEFAULT_WEATHER_LOCATION)))
