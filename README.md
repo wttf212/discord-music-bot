@@ -17,7 +17,7 @@ Use it at your own risk: YouTube bans IP addresses that it thinks belong to bots
 - Each server has its own bitrate and equalizer settings.
 - The first song usually starts in about 2 seconds.
 - Optional text-to-speech: the bot can read out messages sent with `!tts`, and every half hour it can say the time and how many songs are left. It stays off unless you turn it on.
-- Works with Discord's end-to-end encrypted voice (DAVE).
+- Works with Discord's end-to-end encrypted voice (DAVE), which needs discord.py 2.7 or newer.
 - The owner can limit the bot to one text channel with `!settc`.
 - It leaves the voice channel when everyone else has left, after a minute if music is still playing.
 
@@ -98,7 +98,7 @@ The settings are in `config.yaml`, and `config.example.yaml` explains each one i
 
 ## YouTube cookies (optional)
 
-Cookies from your browser can make YouTube less likely to treat the bot as a bot, mostly on home internet connections.
+Cookies from your browser can make YouTube less likely to flag the bot, mostly on home internet connections.
 
 1. Export them on the host, not inside Docker:
 
