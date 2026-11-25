@@ -1,5 +1,5 @@
 """tts.synthesize: edge-tts MP3 -> FFmpeg -> whole PCM frames, every failure a TtsError."""
-import asyncio, os, subprocess, sys, unittest
+import asyncio, importlib.util, os, subprocess, sys, unittest
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -51,6 +51,7 @@ class TestSynthesize(unittest.TestCase):
         self.assertEqual(kwargs["input"], b"mp3")
         self.assertTrue(kwargs["check"])
 
+    @unittest.skipUnless(importlib.util.find_spec("edge_tts"), "edge-tts is not installed")
     def test_fetch_keeps_only_audio_chunks(self):
         class _Communicate:
             def __init__(self, text, voice):
@@ -60,5 +61,5 @@ class TestSynthesize(unittest.TestCase):
                 for chunk in ({"type": "audio", "data": b"a"}, {"type": "WordBoundary"},
                               {"type": "audio", "data": b"b"}):
                     yield chunk
-        with patch.object(tts.edge_tts, "Communicate", _Communicate):
+        with patch("edge_tts.Communicate", _Communicate):
             self.assertEqual(asyncio.run(tts._fetch_mp3("hi", "v")), b"ab")

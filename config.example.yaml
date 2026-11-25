@@ -48,6 +48,12 @@ youtube:
 #   client_id: "YOUR_SPOTIFY_CLIENT_ID"
 #   client_secret: "YOUR_SPOTIFY_CLIENT_SECRET"
 
+# Text-to-speech: turns on !tts, !ttsafter and the half-hourly update.
+# Needs the optional package: pip install -r requirements-tts.txt
+# (Docker: set WITH_TTS=true in .env, then rebuild). No account or key is needed.
+tts:
+  enabled: false
+
 ffmpeg_path: "ffmpeg"
 
 audio:

@@ -1,11 +1,10 @@
 """Text-to-speech helpers: text cleanup, the half-hourly update wording and its time mark."""
 import asyncio
+import importlib.util
 import re
 import subprocess
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
-import edge_tts
 
 from speech import FRAME_SIZE
 
@@ -55,8 +54,30 @@ def half_hour_mark_passed(started_at: float, now: float, tz_name: str) -> bool:
     return mark.timestamp() > started_at
 
 
+def wanted(config: dict) -> bool:
+    """True when config.yaml turns text-to-speech on (off by default)."""
+    return bool((config.get("tts") or {}).get("enabled", False))
+
+
+def installed() -> bool:
+    """True when the optional edge-tts package can be imported."""
+    return importlib.util.find_spec("edge_tts") is not None
+
+
+def startup_status(config: dict) -> tuple[bool, str]:
+    """(enabled, log line): on only when wanted and the package is installed."""
+    if not wanted(config):
+        return False, "Text-to-speech is off (set tts.enabled: true in config.yaml to turn it on)."
+    if not installed():
+        return False, ("Warning: tts.enabled is true, but the edge-tts package is not installed, "
+                       "so text-to-speech stays off. Install it with: pip install -r requirements-tts.txt "
+                       "(Docker: set WITH_TTS=true in .env and rebuild).")
+    return True, "Text-to-speech is on."
+
+
 async def _fetch_mp3(text: str, voice: str) -> bytes:
     """Ask Microsoft's Edge voice service for the MP3 of text."""
+    import edge_tts  # optional package; an ImportError becomes a TtsError in synthesize
     chunks = []
     async for chunk in edge_tts.Communicate(text, voice).stream():
         if chunk["type"] == "audio":

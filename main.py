@@ -59,6 +59,7 @@ import discord
 from discord.ext import commands
 from audio_player import AudioPlayer, shutdown_audio, configure_fast_client
 from track_queue import TrackQueue
+import tts
 
 
 @dataclass
@@ -99,6 +100,7 @@ class MusicBot(commands.Bot):
         )
 
         self.config = config
+        self.tts_enabled, self.tts_status = tts.startup_status(config)
         self._guild_states: dict[int, GuildState] = {}
         self.pending_playlists: dict = {}  # channel_id (str) -> playlist info; channel IDs are globally unique
 
@@ -204,6 +206,7 @@ def main():
                           _cookies_in_use)
 
     bot = MusicBot(config)
+    print(f"[main] {bot.tts_status}")
 
     async def _do_empty_leave(bot, guild_id: int, message: str):
         """Shared teardown for one guild: stop playback, clear queue, disconnect, send message."""

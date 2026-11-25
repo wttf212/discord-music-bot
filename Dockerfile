@@ -36,6 +36,10 @@ COPY . .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Optional text-to-speech package, only when built with WITH_TTS=true
+ARG WITH_TTS=false
+RUN if [ "$WITH_TTS" = "true" ]; then pip install --no-cache-dir -r requirements-tts.txt; fi
+
 # Download bgutil-pot binary (YouTube PO token generator, Linux x86_64)
 RUN curl -fsSL \
     "https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/latest/download/bgutil-pot-linux-x86_64" \
