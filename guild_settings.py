@@ -244,3 +244,39 @@ def get_display_prefs(guild_id: str) -> dict:
         "location": guild.get("weather_location") or dict(DEFAULT_WEATHER_LOCATION),
         "timezone": guild.get("timezone") or DEFAULT_TIMEZONE,
     }
+
+
+# --- Text-to-speech: language, the !tts switch and the half-hourly update ------
+
+TTS_LANGUAGES = ("lv", "en")
+DEFAULT_TTS_LANGUAGE = "lv"
+
+
+def get_tts_language(guild_id: str) -> str:
+    lang = load_settings().get(guild_id, {}).get("tts_language")
+    return lang if lang in TTS_LANGUAGES else DEFAULT_TTS_LANGUAGE
+
+
+def set_tts_language(guild_id: str, lang: str):
+    if lang not in TTS_LANGUAGES:
+        raise ValueError(f"unsupported TTS language: {lang!r}")
+    with _guild_entry(guild_id) as guild:
+        guild["tts_language"] = lang
+
+
+def get_tts_allowed(guild_id: str) -> bool:
+    return bool(load_settings().get(guild_id, {}).get("tts_allowed", True))
+
+
+def set_tts_allowed(guild_id: str, allowed: bool):
+    with _guild_entry(guild_id) as guild:
+        guild["tts_allowed"] = bool(allowed)
+
+
+def get_announce(guild_id: str) -> bool:
+    return bool(load_settings().get(guild_id, {}).get("announce", False))
+
+
+def set_announce(guild_id: str, on: bool):
+    with _guild_entry(guild_id) as guild:
+        guild["announce"] = bool(on)
