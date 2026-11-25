@@ -20,6 +20,8 @@ from concurrent.futures import ThreadPoolExecutor
 import discord
 from yt_dlp.utils import DownloadCancelled, DownloadError
 
+from speech import Speech
+
 # Audio work runs on dedicated pools, NOT asyncio's default executor.
 #
 # The default pool is min(32, cpu+4) — six workers on a 2-vCPU VPS. Starting one track
@@ -2119,6 +2121,7 @@ class AudioPlayer:
         self._playback_done = asyncio.Event()
         self._ytdlp_proc: subprocess.Popen | None = None
         self._playback_gen = 0  # Incremented at start of play()/play_radio() to guard stale after_playback callbacks
+        self.speech = Speech(self)
 
         self._sample_rate = config["audio"]["sample_rate"]
         self._channels = config["audio"]["channels"]
@@ -2137,6 +2140,7 @@ class AudioPlayer:
     def set_voice_client(self, voice_client):
         """Set the discord.py VoiceClient (called when bot joins a voice channel)."""
         self._voice_client = voice_client
+        self.speech.reset()
 
     def get_bitrate_for_guild(self, guild_id: int | None) -> int:
         """Return per-guild bitrate in bps, falling back to the config default."""
@@ -2209,6 +2213,7 @@ class AudioPlayer:
                 self.current_artist = ""
                 self.current_duration = None
                 self._playback_done.set()
+            self.speech.start_failed(gen)
             raise
 
     async def _start_playback(self, url_or_query: str, prefetched_info: dict | None,
@@ -2228,7 +2233,8 @@ class AudioPlayer:
 
         self._playback_gen += 1
         _gen = self._playback_gen
-        self.stop_playback()
+        self.stop_playback(keep_speech=True)
+        self.speech.song_change(_gen)
 
         # Resolve → stream. A background prefetch / enqueue may already have resolved
         # this track; reuse that CDN URL while it is comfortably fresh so the transition
@@ -2412,10 +2418,12 @@ class AudioPlayer:
         built.append(source)
         await loop.run_in_executor(_STREAM_EXECUTOR, source.prefill)
 
+        await self.speech.wait_for_gap(_gen)
         encoder_settings = self._encoder_settings()
         if self._debug:
             print(f"[debug][player] Opus encoder: signal=music, bitrate={encoder_settings['bitrate']}kbps, FEC=off, PLP=0%, bandwidth=full")
 
+        source = self.speech.wrap(source, _gen)
         self._voice_client.play(source, after=after_playback, **encoder_settings)
 
         if self._debug:
@@ -2435,8 +2443,12 @@ class AudioPlayer:
             self._voice_client.resume()
             self.is_paused = False
 
-    def stop_playback(self):
-        """Stop current playback and terminate the yt-dlp stream subprocess."""
+    def stop_playback(self, keep_speech: bool = False):
+        """Stop current playback and terminate the yt-dlp stream subprocess.
+
+        keep_speech is a track start's own stop: speech playing alone keeps the voice
+        client, and the start waits for it. Every other stop cuts all speech.
+        """
         if self._debug:
             print(f"[debug][player] stop_playback() called")
         self.is_playing = False
@@ -2444,8 +2456,11 @@ class AudioPlayer:
         self.current_track_title = None
         self.current_artist = ""
         self.current_duration = None
-        if self._voice_client and (self._voice_client.is_playing() or self._voice_client.is_paused()):
-            self._voice_client.stop()
+        if not (keep_speech and self.speech.solo_active):
+            if self._voice_client and (self._voice_client.is_playing() or self._voice_client.is_paused()):
+                self._voice_client.stop()
+        if not keep_speech:
+            self.speech.cut()
         # Tear down the audio stream (frees the network connection and CPU).
         # terminate() is instant; the wait()/kill() reap runs on a daemon thread so a
         # slow-dying subprocess never freezes the event loop mid-skip. The local handle
@@ -2481,77 +2496,84 @@ class AudioPlayer:
         loop = asyncio.get_event_loop()
         self._playback_gen += 1
         _gen = self._playback_gen
-        self.stop_playback()
-
-        if self._debug:
-            print(f"[debug][player] play_radio() starting: {title} -> {stream_url}")
-
-        # Direct HTTP stream -- FFmpeg handles MP3/AAC/OGG natively.
-        # before_options go BEFORE -i (reconnect flags); options go AFTER -i (-vn = no video).
-        # Do NOT use pipe=True -- stream_url is a string URL, not a file descriptor.
-        # -reconnect_at_eof 1: reconnect when server closes the HTTP connection between chunks
-        #   (common with Shoutcast/IceCast stations that restart after each song).
-        # -probesize 32k -analyzeduration 0: skip FFmpeg's default 5-second/5MB stream probe.
-        #   Without these, FFmpeg blocks for up to 5s before emitting the first PCM frame;
-        #   discord.py's AudioPlayer thread sets its clock before that first read, so it rushes
-        #   every subsequent frame with delay=0 — audible as choppy/robotic audio at stream start.
-        # Build the FFmpeg source off the event loop — Popen spawn is blocking and
-        # would otherwise stall every guild's interactions during a radio start.
-        source = await loop.run_in_executor(
-            _STREAM_EXECUTOR,
-            lambda: discord.FFmpegPCMAudio(
-                stream_url,
-                executable=self._ffmpeg_path,
-                before_options=(
-                    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
-                    "-reconnect_at_eof 1 "
-                    "-probesize 32k -analyzeduration 0"
-                ),
-                options="-vn",
-                stderr=subprocess.PIPE,
-            ),
-        )
-
-        def _log_ffmpeg_stderr(proc):
-            try:
-                for raw in proc.stderr:
-                    line = raw.decode("utf-8", errors="replace").rstrip()
-                    if line:
-                        print(f"[ffmpeg] {line}")
-            except Exception:
-                pass
-        threading.Thread(
-            target=_log_ffmpeg_stderr, args=(source._process,), daemon=True
-        ).start()
-
-        self.is_playing = True
-        self.is_paused = False
-        self.current_track_title = title
-        self._playback_done.clear()
-
-        def after_playback(error):
-            if self._playback_gen != _gen:
-                return  # Stale callback from a previous stream — ignore
-            if error:
-                print(f"[player] Radio playback ended with error: {error}")
-            self.is_playing = False
-            self.current_track_title = None
-            loop.call_soon_threadsafe(self._playback_done.set)
-
-        # Prime with one frame so the audio thread's first read() is instant.
-        # Reduced probesize means FFmpeg produces the first frame within ~100ms,
-        # so a 3-second timeout is conservative. Falls back gracefully on slow stations.
+        self.stop_playback(keep_speech=True)
         try:
-            first_frame = await asyncio.wait_for(
-                loop.run_in_executor(_STREAM_EXECUTOR, source.read),
-                timeout=3.0,
-            )
-            if first_frame:
-                source = _PrimedAudioSource(source, first_frame)
-        except asyncio.TimeoutError:
-            pass
+            self.speech.song_change(_gen)
 
-        self._voice_client.play(source, after=after_playback, **self._encoder_settings())
+            if self._debug:
+                print(f"[debug][player] play_radio() starting: {title} -> {stream_url}")
+
+            # Direct HTTP stream -- FFmpeg handles MP3/AAC/OGG natively.
+            # before_options go BEFORE -i (reconnect flags); options go AFTER -i (-vn = no video).
+            # Do NOT use pipe=True -- stream_url is a string URL, not a file descriptor.
+            # -reconnect_at_eof 1: reconnect when server closes the HTTP connection between chunks
+            #   (common with Shoutcast/IceCast stations that restart after each song).
+            # -probesize 32k -analyzeduration 0: skip FFmpeg's default 5-second/5MB stream probe.
+            #   Without these, FFmpeg blocks for up to 5s before emitting the first PCM frame;
+            #   discord.py's AudioPlayer thread sets its clock before that first read, so it rushes
+            #   every subsequent frame with delay=0 — audible as choppy/robotic audio at stream start.
+            # Build the FFmpeg source off the event loop — Popen spawn is blocking and
+            # would otherwise stall every guild's interactions during a radio start.
+            source = await loop.run_in_executor(
+                _STREAM_EXECUTOR,
+                lambda: discord.FFmpegPCMAudio(
+                    stream_url,
+                    executable=self._ffmpeg_path,
+                    before_options=(
+                        "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+                        "-reconnect_at_eof 1 "
+                        "-probesize 32k -analyzeduration 0"
+                    ),
+                    options="-vn",
+                    stderr=subprocess.PIPE,
+                ),
+            )
+
+            def _log_ffmpeg_stderr(proc):
+                try:
+                    for raw in proc.stderr:
+                        line = raw.decode("utf-8", errors="replace").rstrip()
+                        if line:
+                            print(f"[ffmpeg] {line}")
+                except Exception:
+                    pass
+            threading.Thread(
+                target=_log_ffmpeg_stderr, args=(source._process,), daemon=True
+            ).start()
+
+            self.is_playing = True
+            self.is_paused = False
+            self.current_track_title = title
+            self._playback_done.clear()
+
+            def after_playback(error):
+                if self._playback_gen != _gen:
+                    return  # Stale callback from a previous stream — ignore
+                if error:
+                    print(f"[player] Radio playback ended with error: {error}")
+                self.is_playing = False
+                self.current_track_title = None
+                loop.call_soon_threadsafe(self._playback_done.set)
+
+            # Prime with one frame so the audio thread's first read() is instant.
+            # Reduced probesize means FFmpeg produces the first frame within ~100ms,
+            # so a 3-second timeout is conservative. Falls back gracefully on slow stations.
+            try:
+                first_frame = await asyncio.wait_for(
+                    loop.run_in_executor(_STREAM_EXECUTOR, source.read),
+                    timeout=3.0,
+                )
+                if first_frame:
+                    source = _PrimedAudioSource(source, first_frame)
+            except asyncio.TimeoutError:
+                pass
+
+            await self.speech.wait_for_gap(_gen)
+            source = self.speech.wrap(source, _gen)
+            self._voice_client.play(source, after=after_playback, **self._encoder_settings())
+        except BaseException:
+            self.speech.start_failed(_gen)
+            raise
 
         if self._debug:
             print(f"[debug][player] Radio playback started: {title}")
@@ -2578,6 +2600,7 @@ class AudioPlayer:
     async def disconnect(self):
         """Stop playback and disconnect from voice."""
         self.stop_playback()
+        self.speech.reset()
         if self._voice_client and self._voice_client.is_connected():
             await self._voice_client.disconnect()
         self._voice_client = None

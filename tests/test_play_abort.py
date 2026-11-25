@@ -206,7 +206,7 @@ class TestAbortedStartLeavesNothingRunning(unittest.TestCase):
         player, outcome = self._start(harness, voice, cancel=False)
         self.addCleanup(lambda: [b.cleanup() for b in harness.buffers])
         self.assertEqual(outcome.get("result", {}).get("title"), "T", outcome)
-        self.assertIs(voice.played, harness.buffers[0])
+        self.assertIs(voice.played.music, harness.buffers[0])
         self.assertIs(player._ytdlp_proc, harness.procs[0])
         self.assertFalse(harness.procs[0].terminated.is_set())
         self.assertFalse(harness.ffmpegs[0].cleaned.is_set())
