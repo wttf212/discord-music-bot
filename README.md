@@ -17,7 +17,7 @@ A Discord music bot with YouTube, SoundCloud, and Spotify. (Use it at your own r
 - 🎚️ Per-guild equalizer (bass, treble, presets)
 - 🔧 Configurable audio bitrate per server
 - 🔒 DAVE E2EE voice encryption support (discord.py v2.7.0+)
-- ⚡ Optional fast first play — `youtube.fast_client: "visionos"` starts a cold track in about 1.5-2 s instead of about 5 s, with the normal client as automatic fallback
+- ⚡ Fast first play — a cold track starts in about 1.5-2 s instead of about 5 s through the `visionos` client, with the normal client as automatic fallback (`youtube.fast_client: ""` turns it off)
 - 📌 Channel restriction (`!settc`)
 - 🚪 Auto-leave when voice channel empties
 
@@ -54,7 +54,7 @@ Copy `config.example.yaml` to `config.yaml` and fill in:
 | `prefix` | Command prefix (default: `!`) |
 | `owner_id` | Your Discord user ID (for `!settc` and `!shutdown`) |
 | `debug` | Enable verbose logging |
-| `youtube.fast_client` | *(optional)* `"visionos"`: tried first for plays someone is waiting on; needs yt-dlp 2026.08.19+, ignored when `cookies_file` is set. See `config.example.yaml` |
+| `youtube.fast_client` | Default `"visionos"`: tried first for plays someone is waiting on; `""` turns it off. Needs yt-dlp 2026.08.19+, ignored when `cookies_file` is set. See `config.example.yaml` |
 | `audio.bitrate` | Opus encoding bitrate in kbps (default: 128) |
 | `spotify.client_id` / `spotify.client_secret` | *(optional)* Enable Spotify **playlist/album** links (single track links work without them) |
 

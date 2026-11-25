@@ -199,9 +199,9 @@ class TestStartupWiring(unittest.TestCase):
 
     def test_main_configures_it_after_the_cookies_check_and_before_the_bot(self):
         with open(os.path.join(_ROOT, "main.py"), encoding="utf-8") as fh:
-            src = fh.read()
-        call = src.index("configure_fast_client(_yt_cfg.get(\"fast_client\"), "
-                         "_yt_cfg.get(\"client\", \"web\"), _cookies_in_use)")
+            src = " ".join(fh.read().split())
+        call = src.index('configure_fast_client(_yt_cfg.get("fast_client", "visionos"), '
+                         '_yt_cfg.get("client", "web"), _cookies_in_use)')
         self.assertLess(src.index("COOKIE-02"), call)
         self.assertIn("_cookies_in_use = _cookies_file if _cookies_file and "
                       "os.path.isfile(_cookies_file) else None", src,
@@ -210,11 +210,14 @@ class TestStartupWiring(unittest.TestCase):
         self.assertIn("from audio_player import AudioPlayer, shutdown_audio, configure_fast_client",
                       src)
 
-    def test_the_example_config_leaves_it_off(self):
+    def test_it_is_on_by_default(self):
+        """A config without the line gets visionos, and the example shows the same default.
+        An explicit "" is the way to turn it off (test_empty_is_off_and_silent)."""
         with open(os.path.join(_ROOT, "config.example.yaml"), encoding="utf-8") as fh:
-            text = fh.read()
-        self.assertIn('# fast_client: "visionos"', text)
-        self.assertNotIn("fast_client", yaml.safe_load(text)["youtube"])
+            example = yaml.safe_load(fh.read())
+        self.assertEqual(example["youtube"]["fast_client"], "visionos")
+        with open(os.path.join(_ROOT, "main.py"), encoding="utf-8") as fh:
+            self.assertIn('_yt_cfg.get("fast_client", "visionos")', fh.read())
 
 
 # --- Plumbing: which lookups may use it ----------------------------------------------------

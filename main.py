@@ -195,11 +195,13 @@ def main():
                 print(f"[main] cookies_file found ({int(_age_days)} days old) — cookie auth enabled")
 
     # Lookups someone is waiting on try youtube.fast_client first, with youtube.client as the
-    # fallback. Off unless set; configure_fast_client says why when it stays off.
+    # fallback. On by default (visionos); fast_client: "" turns it off. configure_fast_client
+    # says why when it stays off.
     _yt_cfg = config.get("youtube", {})
     # A cookies_file that does not exist is not used (see above), so it doesn't count.
     _cookies_in_use = _cookies_file if _cookies_file and os.path.isfile(_cookies_file) else None
-    configure_fast_client(_yt_cfg.get("fast_client"), _yt_cfg.get("client", "web"), _cookies_in_use)
+    configure_fast_client(_yt_cfg.get("fast_client", "visionos"), _yt_cfg.get("client", "web"),
+                          _cookies_in_use)
 
     bot = MusicBot(config)
 
