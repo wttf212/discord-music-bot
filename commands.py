@@ -1046,6 +1046,11 @@ class _ControlsRow(discord.ui.ActionRow):
         if _live_voice_client(self.view.bot, gs, guild_id) is None:
             await _respond(interaction, "Voice connection is down — reconnecting. Try again in a moment.")
             return
+        speech = _speech(gs)
+        if speech and speech.in_gap:
+            speech.cut()  # only the speech; the next song starts right away
+            await _respond(interaction, "Skipped the announcement.")
+            return
         if gs.auto_next_task and not gs.auto_next_task.done():
             gs.auto_next_task.cancel()
             gs.auto_next_task = None
@@ -1073,6 +1078,8 @@ class _ControlsRow(discord.ui.ActionRow):
                                                interaction.channel.id, next_track, e):
                     await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
+            if speech:
+                await speech.end_of_queue()
             await update_np_stopped(self.view.bot, interaction.channel.id)
 
     @discord.ui.button(label="■", style=discord.ButtonStyle.danger, custom_id="btn_stop")  # ■
@@ -2855,6 +2862,11 @@ class MusicCog(commands.Cog):
         if _live_voice_client(self.bot, gs, ctx.guild.id) is None:
             await ctx.send("Voice connection is down — reconnecting. Try again in a moment.")
             return
+        speech = _speech(gs)
+        if speech and speech.in_gap:
+            speech.cut()  # only the speech; the next song starts right away
+            await ctx.send("Skipped the announcement.", delete_after=3)
+            return
         # Cancel the existing auto-next task and invalidate its generation
         if gs.auto_next_task and not gs.auto_next_task.done():
             gs.auto_next_task.cancel()
@@ -2884,6 +2896,8 @@ class MusicCog(commands.Cog):
                     await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
             await ctx.send("Skipped. Queue is empty.")
+            if speech:
+                await speech.end_of_queue()
             channel_id = gs.current_text_channel_id or ctx.channel.id
             await update_np_stopped(self.bot, channel_id)
 
@@ -3813,6 +3827,9 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                         next_track = gs.queue.next()
                 if not next_track:
                     # Queue drained — update embed to stopped state and strip buttons
+                    speech = _speech(gs)
+                    if speech:
+                        await speech.end_of_queue()
                     await update_np_stopped(bot, channel_id)
                     break
             try:
