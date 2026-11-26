@@ -50,7 +50,7 @@ youtube:
 
 # Text-to-speech: turns on !tts, !ttsafter and the half-hourly update.
 # Needs the optional package: pip install -r requirements-tts.txt
-# (Docker: set WITH_TTS=true in .env, then rebuild). No account or key is needed.
+# (the Docker image that docker-compose.yml builds already has it). No account or key is needed.
 tts:
   enabled: false
 
