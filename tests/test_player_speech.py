@@ -41,6 +41,30 @@ class _OneAtATimeVoice(_FakeVoice):
             after(None)
 
 
+class _PausableVoice(_OneAtATimeVoice):
+    """discord.py's pause: a paused client is not playing, and stop() ends the pause."""
+
+    def __init__(self):
+        super().__init__()
+        self.paused = False
+
+    def is_playing(self):
+        return self.source is not None and not self.paused
+
+    def is_paused(self):
+        return self.source is not None and self.paused
+
+    def pause(self):
+        self.paused = True
+
+    def resume(self):
+        self.paused = False
+
+    def finish(self):
+        self.paused = False
+        super().finish()
+
+
 class _LeavingVoice(_OneAtATimeVoice):
     """discord.py 2.7.1's disconnect(): the connection reads as closed before its first await,
     and the guild drops the client only once Discord confirms the leave."""
@@ -158,6 +182,35 @@ class TestPlayerSpeech(unittest.TestCase):
         player.set_voice_client(voice)
         self.assertEqual(player.speech.waiting_clips(), 1, "an accepted !ttsafter clip was dropped")
         self.assertEqual(player.speech.track_started_at, 123.0, "the update's start time was dropped")
+
+    def test_a_pause_during_the_gap_does_not_carry_over_to_the_track(self):
+        # The pause holds the gap speech, so the track starts once the speech counts as stuck.
+        # The pause was the speech's: the track must not start out flagged as paused.
+        radio = Track(query="r", title="R", requested_by="u", url="http://radio", is_radio=True)
+        for kind in ("song", "radio"):
+            with self.subTest(kind=kind):
+                harness, voice = _Harness(), _PausableVoice()
+                player = _player(voice)
+                self.addCleanup(lambda h=harness: [b.cleanup() for b in h.buffers])
+
+                async def go():
+                    player.speech.queue_after(CLIP)
+                    start = (player.play("q", prefetched_info=dict(INFO)) if kind == "song"
+                             else player.play_radio(radio))
+                    task = asyncio.ensure_future(start)
+                    for _ in range(200):          # flagged as playing; the speech is on the client
+                        await asyncio.sleep(0.01)
+                        if player.is_playing:
+                            break
+                    player.pause()
+                    self.assertTrue(player.is_paused, "precondition: the gap speech was paused")
+                    await asyncio.wait_for(task, 5)
+                    self.assertIsNotNone(voice.plays[-1].music, "the track never started")
+                    self.assertFalse(player.is_paused, "the track plays but counts as paused")
+                    self.assertEqual(await player.speech.say(CLIP), "mixer")
+
+                with harness.patched(), patch.object(speech, "GAP_MARGIN", 0.05):
+                    asyncio.run(go())
 
     def test_radio_is_wrapped_too(self):
         class _Radio(discord.AudioSource):

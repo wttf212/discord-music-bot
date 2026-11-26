@@ -2432,6 +2432,7 @@ class AudioPlayer:
             print(f"[debug][player] Opus encoder: signal=music, bitrate={encoder_settings['bitrate']}kbps, FEC=off, PLP=0%, bandwidth=full")
 
         source = self.speech.wrap(source, _gen)
+        self.is_paused = False  # a pause during the gap paused the speech, not this track
         self._voice_client.play(source, after=after_playback, **encoder_settings)
 
         if self._debug:
@@ -2582,6 +2583,7 @@ class AudioPlayer:
             if self._playback_gen != _gen or not self.speech.is_current(_gen):
                 raise asyncio.CancelledError  # overtaken during the gap; see _start_playback
             source = self.speech.wrap(source, _gen)
+            self.is_paused = False  # a pause during the gap paused the speech, not this station
             self._voice_client.play(source, after=after_playback, **self._encoder_settings())
         except BaseException:
             # As in play(): stop the FFmpeg, and leave the player idle unless a newer start
