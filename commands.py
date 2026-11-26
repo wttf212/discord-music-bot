@@ -2560,6 +2560,13 @@ class MusicCog(commands.Cog):
                 track_url = played.get("webpage_url", "")
                 gs.queue.current = Track(query=first_url, title=title,
                                          requested_by=user_id, thumbnail=track_thumbnail, url=track_url)
+            except asyncio.CancelledError:
+                # A stop or a newer start overtook track 1 (play() gives up as cancelled), or
+                # this command is being cancelled. Nobody will load the rest, so stop its pages.
+                # No error line, and the card is left alone: a stop updates it itself, and a
+                # newer start owns it now.
+                _abandon_enumeration(full_fut)
+                raise
             except Exception as e:
                 _abandon_enumeration(full_fut)
                 # A YouTube block or a voice drop is no fault of the playlist, and the chain
