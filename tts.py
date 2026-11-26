@@ -48,14 +48,14 @@ def announcement_text(lang: str, now_local: datetime, songs_left: int) -> str:
     return f"It's {clock}. {tail}"
 
 
-_PLACEHOLDER = re.compile(r"@(laiks|queue)\b", re.IGNORECASE)
+_PLACEHOLDER = re.compile(r"(?<!\w)@(laiks|queue)\b", re.IGNORECASE | re.ASCII)
 
 
 def fill_announcement(template: str, now_local: datetime, songs_left: int) -> str:
     """An admin's update text with @laiks as HH:MM and @queue as the songs left. Only these
     two words change; the result still goes through clean_text."""
     values = {"laiks": now_local.strftime("%H:%M"), "queue": str(songs_left)}
-    return _PLACEHOLDER.sub(lambda m: values[m[1].lower()], template)
+    return _PLACEHOLDER.sub(lambda m: values.get(m[1].lower(), m[0]), template)
 
 
 def half_hour_mark_passed(started_at: float, now: float, tz_name: str) -> bool:

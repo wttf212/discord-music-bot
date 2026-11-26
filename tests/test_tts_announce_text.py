@@ -44,6 +44,19 @@ class TestFill(unittest.TestCase):
     def test_whole_words_only(self):
         self.assertEqual(tts.fill_announcement("@queuex @laiks", NOW, 1), "@queuex 14:34")
 
+    def test_a_placeholder_inside_a_word_or_address_is_left_alone(self):
+        for text in ("abc@laiks", "info@queue.lv"):
+            with self.subTest(text=text):
+                self.assertEqual(tts.fill_announcement(text, NOW, 1), text)
+
+    def test_look_alike_letters_are_not_placeholders(self):
+        for text in ("@laıks", "@LAİKS", "@laikſ"):
+            with self.subTest(text=text):
+                self.assertEqual(tts.fill_announcement(text, NOW, 1), text)
+
+    def test_upper_and_mixed_case_still_fill(self):
+        self.assertEqual(tts.fill_announcement("@LAIKS @Queue", NOW, 4), "14:34 4")
+
     def test_no_placeholders(self):
         self.assertEqual(tts.fill_announcement("just words", NOW, 1), "just words")
 
@@ -109,6 +122,12 @@ class TestCommand(_Base):
     def test_empty_after_cleaning_is_refused_with_usage(self):
         _, reply = self._run("text", text="@@@")
         self.assertIn("announce text <text>", reply)
+        self.assertIsNone(guild_settings.get_announce_text("1"))
+
+    def test_text_is_not_stored_when_the_example_fails(self):
+        with patch.object(tts, "fill_announcement", side_effect=KeyError("x")):
+            with self.assertRaises(KeyError):
+                self._run("text", text="hello")
         self.assertIsNone(guild_settings.get_announce_text("1"))
 
     def test_on_off_still_work(self):

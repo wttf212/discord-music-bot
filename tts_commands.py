@@ -217,9 +217,10 @@ async def _announce_text(bot, ctx, gid: str, text: str | None) -> None:
     if not tts.clean_text(text, get_tts_language(gid)):
         await ctx.send(usage)
         return
-    set_announce_text(gid, text)
+    # Build the example first: a failure here must not leave the text stored.
     now_local = datetime.now(ZoneInfo(get_timezone(gid)))
     example = tts.fill_announcement(text, now_local, len(bot.get_guild_state(ctx.guild.id).queue))
+    set_announce_text(gid, text)
     await ctx.send(f'Update text set. It will sound like: "{example}"',
                    allowed_mentions=discord.AllowedMentions.none())
 
