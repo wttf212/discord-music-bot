@@ -6,8 +6,10 @@ without text-to-speech). A caller's `except Exception` cleanup never sees it, so
 holding something nothing else will clean up does that in an `except asyncio.CancelledError`
 and re-raises. It sends no error line: whatever overtook the start owns the card and the chain.
 
-The playlist start with nothing playing stops the background enumeration of the rest of the
-list, which would otherwise keep paging YouTube for a list nobody will load.
+- The playlist start with nothing playing stops the background enumeration of the rest of
+  the list, which would otherwise keep paging YouTube for a list nobody will load.
+- The radio and search pickers, and a Spotify start, delete their "Loading…" message.
+- A slash /skipto deletes its deferred "is thinking…" reply.
 
 Network and Discord are faked.
 """
