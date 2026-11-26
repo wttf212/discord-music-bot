@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import discord
 import commands, guild_settings, tts, tts_commands
 from track_queue import Track
-from test_tts_commands import _Env, _Base, CLIP
+from test_tts_commands import _Env, _Base, CLIP, help_text
 
 EXAMPLE = "Okupantu radio, precīzs laiks ir @laiks un rindā ir @queue dziesmas"
 NOW = datetime(2026, 11, 25, 14, 34, tzinfo=ZoneInfo("Europe/Riga"))
@@ -54,8 +54,10 @@ class TestFill(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(tts.fill_announcement(text, NOW, 1), text)
 
-    def test_upper_and_mixed_case_still_fill(self):
-        self.assertEqual(tts.fill_announcement("@LAIKS @Queue", NOW, 4), "14:34 4")
+    def test_latvian_letters_count_as_word_characters(self):
+        for text in ("rindā@queue", "@laiksā"):
+            with self.subTest(text=text):
+                self.assertEqual(tts.fill_announcement(text, NOW, 1), text)
 
     def test_no_placeholders(self):
         self.assertEqual(tts.fill_announcement("just words", NOW, 1), "just words")
@@ -213,19 +215,9 @@ class TestNoPings(_Base):
 
 
 class TestHelp(unittest.TestCase):
-    def _help(self, enabled):
-        sent = []
-
-        async def send(content=None, **kwargs):
-            sent.append(content)
-
-        bot = SimpleNamespace(command_prefix="!", tts_enabled=enabled)
-        asyncio.run(commands.MusicCog.help_cmd.callback(SimpleNamespace(bot=bot), SimpleNamespace(send=send)))
-        return "\n".join(sent)
-
     def test_help(self):
-        self.assertIn("`!announce text <text>` — Your own words for that update", self._help(True))
-        self.assertNotIn("announce", self._help(False))
+        self.assertIn("`!announce text <text>` — Your own words for that update", help_text(True))
+        self.assertNotIn("announce", help_text(False))
 
 
 if __name__ == "__main__":

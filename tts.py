@@ -55,7 +55,7 @@ def announcement_text(lang: str, now_local: datetime, songs_left: int) -> str:
     return f"It's {clock}. {tail}"
 
 
-_PLACEHOLDER = re.compile(r"(?<!\w)@(laiks|queue)\b", re.IGNORECASE | re.ASCII)
+_PLACEHOLDER = re.compile(r"(?<!\w)@((?ai:laiks|queue))(?!\w)")
 
 
 def fill_announcement(template: str, now_local: datetime, songs_left: int) -> str:
