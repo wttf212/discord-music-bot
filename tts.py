@@ -55,8 +55,10 @@ def half_hour_mark_passed(started_at: float, now: float, tz_name: str) -> bool:
 
 
 def wanted(config: dict) -> bool:
-    """True when config.yaml turns text-to-speech on (off by default)."""
-    return bool((config.get("tts") or {}).get("enabled", False))
+    """True when config.yaml turns text-to-speech on (off by default). Only `enabled: true`
+    under `tts:` does; any other shape, such as `tts: true` or a quoted "false", leaves it off."""
+    section = config.get("tts")
+    return isinstance(section, dict) and section.get("enabled") is True
 
 
 def installed() -> bool:

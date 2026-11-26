@@ -19,6 +19,12 @@ class TestWanted(unittest.TestCase):
             self.assertFalse(tts.wanted(config), config)
         self.assertTrue(tts.wanted({"tts": {"enabled": True}}))
 
+    def test_a_malformed_setting_leaves_it_off(self):
+        # `tts: true` is a plausible slip, and a quoted "false" reads as truthy.
+        for config in ({"tts": True}, {"tts": "on"}, {"tts": ["enabled"]},
+                       {"tts": {"enabled": "false"}}, {"tts": {"enabled": "true"}}):
+            self.assertFalse(tts.wanted(config), config)
+
 
 class TestStartupStatus(unittest.TestCase):
     def test_not_wanted(self):
@@ -63,6 +69,12 @@ class TestMusicBotFlag(unittest.TestCase):
             bot = main.MusicBot({"prefix": "!"})
         self.assertTrue(bot.tts_enabled)
         self.assertEqual(bot.tts_status, "Text-to-speech is on.")
+
+    def test_a_malformed_setting_does_not_stop_the_bot(self):
+        # The status is read in MusicBot.__init__: raising there took the music down too.
+        import main
+        bot = main.MusicBot({"prefix": "!", "tts": True})
+        self.assertFalse(bot.tts_enabled)
 
 
 class TestPackaging(unittest.TestCase):
