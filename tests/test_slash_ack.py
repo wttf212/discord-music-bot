@@ -11,6 +11,9 @@ interaction"), and the user sees "The application did not respond".
 - A slash command used outside the channel set by !settc got no answer at all.
   check_channel tried to delete a message that doesn't exist and posted its notice
   in the allowed channel.
+- /play defers, and a single track that started posted and edited its card through the
+  channel, so nothing answered the interaction. It showed "is thinking…" until the token
+  expired, then "The application did not respond", although the track played.
 """
 import asyncio
 import os
@@ -39,11 +42,16 @@ def _dead_token():
 
 class _Interaction:
     """A slash-command interaction. Once `expired` is set, Discord refuses the first
-    response (a reply or a defer). Followups to an acknowledged one still work."""
+    response (a reply or a defer). Followups to an acknowledged one still work.
+
+    A deferred one shows "is thinking…" until it is answered. The first followup takes
+    that message's place as the original response; deleting the original removes it."""
 
     def __init__(self, expired=False):
         self.expired = expired
         self.acked = False
+        self.thinking = False
+        self.original = None
         self.replies = []    # (content, ephemeral)
         self.response = SimpleNamespace(is_done=lambda: self.acked, defer=self._defer,
                                         send_message=self._first_response)
@@ -53,15 +61,26 @@ class _Interaction:
         if self.expired:
             raise _dead_token()
         self.acked = True
+        self.thinking = True
 
     async def _first_response(self, content=None, **kwargs):
         if self.expired:
             raise _dead_token()
         self.acked = True
-        self.replies.append((content, kwargs.get("ephemeral", False)))
+        self.original = (content, kwargs.get("ephemeral", False))
+        self.replies.append(self.original)
 
     async def _followup(self, content=None, **kwargs):
-        self.replies.append((content, kwargs.get("ephemeral", False)))
+        reply = (content, kwargs.get("ephemeral", False))
+        if self.thinking:
+            self.thinking = False
+            self.original = reply
+        self.replies.append(reply)
+
+    async def delete_original_response(self):
+        self.thinking = False
+        self.replies = [r for r in self.replies if r is not self.original]
+        self.original = None
 
 
 class _Ctx:
@@ -85,6 +104,10 @@ class _Ctx:
             await it.followup.send(content, **kwargs)
         else:
             await it.response.send_message(content, **kwargs)
+
+    async def defer(self, ephemeral=False):
+        if self.interaction:
+            await self.interaction.response.defer(ephemeral=ephemeral)
 
 
 class _Player:
@@ -219,6 +242,66 @@ class TestSetlocationSlash(_Patched):
             asyncio.run(commands.MusicCog.setlocation.callback(
                 commands.MusicCog(ctx.bot), ctx, city="Riga"))
         self.assertIn(("Weather location set to **Riga**.", False), it.replies)
+
+
+class _VC:
+    """The bot's voice connection: up, in the caller's channel, nothing playing."""
+
+    channel = SimpleNamespace()
+
+    def is_connected(self):
+        return True
+
+    def is_playing(self):
+        return False
+
+
+class TestPlaySlash(_Patched):
+    """/play defers, since the voice join and the resolve can outlast the 3 s window, and a
+    single track that starts shows the card in the channel."""
+
+    LINK = "https://www.youtube.com/watch?v=aaaaaaaaaaa"
+    SPOTIFY_TRACK = "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC"
+    RESOLVED = {"title": "Song", "webpage_url": LINK, "thumbnail": "",
+                "url": "https://r1.googlevideo.com/videoplayback?id=x&expire=99999999999"}
+    SPOTIFY = {"title": "Song", "tracks": [{"query": "Artist - Song", "title": "Song"}]}
+
+    def _play(self, query, player=None, it=None):
+        it = it or _Interaction()
+        ctx = _Ctx(_Bot(_guild_state(player or _Player())), it)
+        ctx.guild.voice_client = _VC()
+        ctx.author.voice = SimpleNamespace(channel=_VC.channel)
+        with patch.object(commands, "resolve_audio", AsyncMock(return_value=dict(self.RESOLVED))), \
+                patch.object(commands, "resolve_spotify", return_value=self.SPOTIFY):
+            asyncio.run(commands.MusicCog.play.callback(
+                commands.MusicCog(ctx.bot), ctx, query=query))
+        return it
+
+    def test_a_started_track_answers_the_interaction(self):
+        """The card is the answer: the "thinking" message goes, and nothing else is posted."""
+        for name, query in {"a link": self.LINK, "a single Spotify track": self.SPOTIFY_TRACK}.items():
+            with self.subTest(name):
+                self.start_auto_next.reset_mock()
+                it = self._play(query)
+                self.start_auto_next.assert_called_once()     # the track started
+                self.assertFalse(it.thinking, "the deferred interaction was never answered")
+                self.assertEqual(it.replies, [])
+
+    def test_a_failed_delete_still_leaves_the_track_playing(self):
+        """Deleting the "thinking" message can fail, but the track has started: nothing may
+        escape, auto-play stays armed, and no error is posted."""
+        it = _Interaction()
+        it.delete_original_response = AsyncMock(side_effect=_dead_token())
+        try:
+            self._play(self.LINK, it=it)
+        except discord.HTTPException as e:
+            self.fail(f"the failed delete escaped the command: {e!r}")
+        self.start_auto_next.assert_called_once()
+        self.assertEqual(it.replies, [])
+
+    def test_a_failed_start_keeps_its_error_reply(self):
+        it = self._play(self.LINK, _Player(error=RuntimeError("voice went away")))
+        self.assertEqual(it.replies, [("Error playing track: voice went away", False)])
 
 
 class TestRestrictedChannel(_Patched):
