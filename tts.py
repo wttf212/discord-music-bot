@@ -7,14 +7,15 @@ import subprocess
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from speech import FRAME_SIZE
+from speech import DUCK_ATTACK_FRAMES, FRAME_SIZE
 
 MAX_CHARS = 300
 VOICES = {"lv": "lv-LV-EveritaNeural", "en": "en-US-AriaNeural"}   # the female voices
 MALE_VOICES = {"lv": "lv-LV-NilsNeural", "en": "en-US-AndrewNeural"}
 SYNTH_TIMEOUT = 15.0
-# Speech is compressed, then limited to PEAK_CEILING. The mixer dips music to 25%, so speech (at most 0.70)
-# plus music (at most 0.25) never passes full scale.
+# Speech is compressed, then limited to PEAK_CEILING. Once the mixer's dip has settled, music is at 25%, so
+# speech (at most 0.70) plus music (at most 0.25) stays under full scale. The dip takes DUCK_ATTACK_FRAMES
+# to settle, and _ensure_lead_in makes sure speech starts only after that.
 SPEECH_FILTER = "acompressor=threshold=-26dB:ratio=4:attack=5:release=80:makeup=8,alimiter=limit=0.70:level=false"
 PEAK_CEILING = 0.70
 MAX_LEVEL_GAIN = 8.0   # a nearly silent clip is not blown up into noise
@@ -105,7 +106,7 @@ async def _fetch_mp3(text: str, voice: str) -> bytes:
 
 
 def _decode_to_pcm(mp3: bytes, ffmpeg_path: str) -> bytes:
-    """Decode an MP3 to 48 kHz stereo s16le with FFmpeg."""
+    """Decode an MP3 to 48 kHz stereo s16le with FFmpeg, compressing and limiting it, then leveling it."""
     done = subprocess.run(
         [ffmpeg_path, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
          "-af", SPEECH_FILTER, "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"],
@@ -116,10 +117,21 @@ def _decode_to_pcm(mp3: bytes, ffmpeg_path: str) -> bytes:
 def _level(pcm: bytes) -> bytes:
     """Scale s16le PCM so its sample peak is PEAK_CEILING of full scale (gain capped at MAX_LEVEL_GAIN)."""
     pcm = pcm[:len(pcm) - len(pcm) % 2]
-    peak = audioop.max(pcm, 2) if pcm else 0
+    peak = audioop.max(pcm, 2)
     if not peak:
         return pcm
     return audioop.mul(pcm, 2, min(PEAK_CEILING * 32767 / peak, MAX_LEVEL_GAIN))
+
+
+def _ensure_lead_in(pcm: bytes) -> bytes:
+    """Make speech start only after the mixer's music dip has settled: prepend silent frames
+    until the clip has DUCK_ATTACK_FRAMES of quiet (peak under 5% of full scale) at its start."""
+    lead = 0
+    for i in range(0, len(pcm) - FRAME_SIZE + 1, FRAME_SIZE):
+        if audioop.max(pcm[i:i + FRAME_SIZE], 2) >= 0.05 * 32767:
+            break
+        lead += 1
+    return b"\x00" * FRAME_SIZE * max(0, DUCK_ATTACK_FRAMES - lead) + pcm
 
 
 async def synthesize(text: str, lang: str, ffmpeg_path: str, voice: str = "female") -> bytes:
@@ -132,7 +144,7 @@ async def synthesize(text: str, lang: str, ffmpeg_path: str, voice: str = "femal
         pcm = await loop.run_in_executor(None, _decode_to_pcm, mp3, ffmpeg_path)
         if not pcm:
             raise TtsError("decoder produced no audio")
-        return pcm + b"\x00" * (-len(pcm) % FRAME_SIZE)
+        return _ensure_lead_in(pcm + b"\x00" * (-len(pcm) % FRAME_SIZE))
 
     try:
         return await asyncio.wait_for(_run(), SYNTH_TIMEOUT)

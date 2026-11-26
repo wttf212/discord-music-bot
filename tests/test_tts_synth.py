@@ -12,7 +12,8 @@ class TestSynthesize(unittest.TestCase):
     def test_pads_to_whole_frames_and_uses_the_language_voice(self):
         fetch = AsyncMock(return_value=b"mp3")
         with patch.object(tts, "_fetch_mp3", fetch), \
-             patch.object(tts, "_decode_to_pcm", return_value=b"\x01" * (F + 10)):
+             patch.object(tts, "_decode_to_pcm", return_value=b"\x01" * (F + 10)), \
+             patch.object(tts, "_ensure_lead_in", lambda pcm: pcm):   # the lead-in has its own tests
             pcm = asyncio.run(tts.synthesize("sveiki", "lv", "ffmpeg"))
         self.assertEqual(len(pcm), 2 * F)
         self.assertEqual(pcm[F + 10:], b"\x00" * (F - 10))
@@ -42,10 +43,11 @@ class TestSynthesize(unittest.TestCase):
                 asyncio.run(tts.synthesize("hi", "en", "ffmpeg"))
 
     def test_decoder_command(self):
-        PCM = bytes([16, 0]) * 8
-        done = subprocess.CompletedProcess([], 0, stdout=PCM, stderr=b"")
+        pcm = bytes([16, 0]) * 8
+        done = subprocess.CompletedProcess([], 0, stdout=pcm, stderr=b"")
         with patch.object(tts.subprocess, "run", return_value=done) as run:
-            self.assertEqual(tts._decode_to_pcm(b"mp3", "ffmpeg"), tts._level(PCM))
+            # peak 16 is raised by the gain cap, 8x
+            self.assertEqual(tts._decode_to_pcm(b"mp3", "ffmpeg"), bytes([128, 0]) * 8)
         args, kwargs = run.call_args
         self.assertEqual(args[0], ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
                                    "-af", tts.SPEECH_FILTER, "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"])
