@@ -194,6 +194,7 @@ It needs no account or key. The voices are Microsoft Edge's online ones, so the 
 | `!ttsallow on\|off` | Allow or block `!tts` and `!ttsafter` on this server *(admin only)* |
 
 - The voices are Latvian Everita (female) and Nils (male), and English Aria (female) and Andrew (male). The default is female; an admin changes it with `!ttsvoice male`.
+- Speech is leveled to a fixed loud volume, so every voice is equally loud and stands out over the music.
 - Speech is in Latvian until an admin switches the server to English with `!ttslang en`.
 - `!tts` and `!ttsafter` work on every server until an admin blocks them there with `!ttsallow off`. The half-hourly update has its own switch, `!announce`.
 - The half-hourly update is off until an admin runs `!announce on`. It uses the server's timezone from `!settimezone`.

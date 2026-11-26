@@ -1,5 +1,6 @@
 """Text-to-speech helpers: text cleanup, the half-hourly update wording and its time mark."""
 import asyncio
+import audioop
 import importlib.util
 import re
 import subprocess
@@ -12,6 +13,11 @@ MAX_CHARS = 300
 VOICES = {"lv": "lv-LV-EveritaNeural", "en": "en-US-AriaNeural"}   # the female voices
 MALE_VOICES = {"lv": "lv-LV-NilsNeural", "en": "en-US-AndrewNeural"}
 SYNTH_TIMEOUT = 15.0
+# Speech is compressed, then limited to PEAK_CEILING. The mixer dips music to 25%, so speech (at most 0.70)
+# plus music (at most 0.25) never passes full scale.
+SPEECH_FILTER = "acompressor=threshold=-26dB:ratio=4:attack=5:release=80:makeup=8,alimiter=limit=0.70:level=false"
+PEAK_CEILING = 0.70
+MAX_LEVEL_GAIN = 8.0   # a nearly silent clip is not blown up into noise
 
 
 class TtsError(Exception):
@@ -102,9 +108,18 @@ def _decode_to_pcm(mp3: bytes, ffmpeg_path: str) -> bytes:
     """Decode an MP3 to 48 kHz stereo s16le with FFmpeg."""
     done = subprocess.run(
         [ffmpeg_path, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
-         "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"],
+         "-af", SPEECH_FILTER, "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"],
         input=mp3, capture_output=True, check=True)
-    return done.stdout
+    return _level(done.stdout)
+
+
+def _level(pcm: bytes) -> bytes:
+    """Scale s16le PCM so its sample peak is PEAK_CEILING of full scale (gain capped at MAX_LEVEL_GAIN)."""
+    pcm = pcm[:len(pcm) - len(pcm) % 2]
+    peak = audioop.max(pcm, 2) if pcm else 0
+    if not peak:
+        return pcm
+    return audioop.mul(pcm, 2, min(PEAK_CEILING * 32767 / peak, MAX_LEVEL_GAIN))
 
 
 async def synthesize(text: str, lang: str, ffmpeg_path: str, voice: str = "female") -> bytes:

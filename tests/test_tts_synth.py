@@ -42,12 +42,13 @@ class TestSynthesize(unittest.TestCase):
                 asyncio.run(tts.synthesize("hi", "en", "ffmpeg"))
 
     def test_decoder_command(self):
-        done = subprocess.CompletedProcess([], 0, stdout=b"pcm", stderr=b"")
+        PCM = bytes([16, 0]) * 8
+        done = subprocess.CompletedProcess([], 0, stdout=PCM, stderr=b"")
         with patch.object(tts.subprocess, "run", return_value=done) as run:
-            self.assertEqual(tts._decode_to_pcm(b"mp3", "ffmpeg"), b"pcm")
+            self.assertEqual(tts._decode_to_pcm(b"mp3", "ffmpeg"), tts._level(PCM))
         args, kwargs = run.call_args
         self.assertEqual(args[0], ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
-                                   "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"])
+                                   "-af", tts.SPEECH_FILTER, "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"])
         self.assertEqual(kwargs["input"], b"mp3")
         self.assertTrue(kwargs["check"])
 
