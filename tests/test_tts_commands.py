@@ -234,6 +234,38 @@ class TestTts(_Base):
         tts.synthesize.assert_awaited_once_with("come to #general", "lv", "ffmpeg")
 
 
+class TestSlash(_Base):
+    """/tts and /ttsafter: deferred before the synthesis, which can outlast Discord's 3 s, then a
+    public reply with the text. That reply is what shows everyone who made the bot speak."""
+
+    def _env(self, **kwargs):
+        env = _Env(**kwargs)
+        env.ctx.interaction = SimpleNamespace()
+        env.ctx.defer = AsyncMock()
+        env.deferred_first = []
+
+        async def synthesize(*args):
+            env.deferred_first.append(env.ctx.defer.await_count == 1)
+            return CLIP
+        tts.synthesize.side_effect = synthesize
+        return env
+
+    def test_deferred_then_a_public_reply_with_its_note(self):
+        for name, env_kwargs, reply in (
+                ("tts", {}, "🔊 hei"),
+                ("ttsafter", {"playing": True}, "🔊 hei *(after this song)*"),
+                ("tts", {"speech_": _Speech(result="paused")}, "🔊 hei *(when playback resumes)*")):
+            with self.subTest(reply=reply):
+                commands._button_cooldowns.clear()
+                env = self._env(**env_kwargs)
+                env.run(name, text="hei")
+                self.assertEqual(env.deferred_first, [True], "synthesis began before the defer")
+                self.assertEqual(env.sent, [reply])
+                for call in env.ctx.send.await_args_list:
+                    self.assertNotEqual(call.kwargs.get("ephemeral"), True, "the reply must be public")
+                env.message.add_reaction.assert_not_awaited()
+
+
 class TestAdmin(_Base):
     def test_ttsallow_off_cuts_speech(self):
         env = _Env()
