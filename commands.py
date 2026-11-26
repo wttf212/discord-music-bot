@@ -580,6 +580,23 @@ class RadioPickerView(discord.ui.View):
             pass
 
 
+async def _connect_voice(voice_channel):
+    """voice_channel.connect(), with a handshake that discord.py interrupts raised as an error.
+
+    When the bot is moved, or the voice server changes, while it connects, discord.py 2.7.1
+    restarts the handshake and cancels the task this connect() awaits. That CancelledError
+    is no cancellation of the caller, but it skipped every `except Exception` around a join:
+    a slash command stayed on "is thinking…", and auto-play's reconnect ended the chain
+    without a word.
+    """
+    try:
+        return await voice_channel.connect()
+    except asyncio.CancelledError:
+        if asyncio.current_task().cancelling():
+            raise  # the caller itself is being cancelled: a stop, or shutdown
+        raise ConnectionError("the voice connection was interrupted, try again") from None
+
+
 async def _join_voice(ctx, gs, voice_channel):
     """Join voice_channel, give the player the new client and restore the server's saved
     bitrate and EQ. Returns the client; a failed join raises for the caller to report.
@@ -588,7 +605,7 @@ async def _join_voice(ctx, gs, voice_channel):
     is still reconnecting one.
     """
     guild_id = str(ctx.guild.id)
-    voice_client = await voice_channel.connect()
+    voice_client = await _connect_voice(voice_channel)
     gs.player.set_voice_client(voice_client)
     saved_br = get_bitrate(guild_id)
     if saved_br:
@@ -3744,7 +3761,7 @@ async def _self_reconnect(bot, gs, guild_id, generation, voice_channel) -> bool:
     print(f"[commands] discord.py dropped the voice client — reconnecting to "
           f"{voice_channel} (guild {guild_id})")
     try:
-        vc = await voice_channel.connect()
+        vc = await _connect_voice(voice_channel)
     except Exception as e:
         print(f"[commands] Voice reconnect failed: {e} (guild {guild_id})")
         return False

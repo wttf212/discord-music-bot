@@ -313,6 +313,26 @@ class TestPlaySlash(_Patched):
         self.assertEqual(it.replies, [])                # no error line for an overtaken start
         self.start_auto_next.assert_not_called()        # the stop or the newer start owns auto-play
 
+    def test_an_interrupted_voice_join_answers(self):
+        """discord.py cancels the connect it is running when the bot is moved, or the voice
+        server changes, mid-handshake. That is a failed join, and its error is the answer."""
+        class _InterruptedVoiceChannel:
+            async def connect(self):
+                connector = asyncio.ensure_future(asyncio.sleep(3600))
+                asyncio.get_running_loop().call_soon(connector.cancel)
+                return await connector
+
+        it = _Interaction()
+        ctx = _Ctx(_Bot(_guild_state(_Player())), it)      # not in voice yet
+        ctx.author.voice = SimpleNamespace(channel=_InterruptedVoiceChannel())
+        with patch.object(commands, "resolve_audio", AsyncMock(return_value=dict(self.RESOLVED))):
+            asyncio.run(commands.MusicCog.play.callback(
+                commands.MusicCog(ctx.bot), ctx, query=self.LINK))
+        self.assertFalse(it.thinking, "the interrupted join left /play on 'is thinking…'")
+        self.assertEqual(it.replies, [("Failed to join voice channel: "
+                                       "the voice connection was interrupted, try again", False)])
+        self.start_auto_next.assert_not_called()
+
     def test_a_failed_delete_still_ends_as_cancelled(self):
         """The delete can fail, also with the HTTP session already closed at shutdown. The
         start must still end as cancelled, not as that error."""

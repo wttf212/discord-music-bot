@@ -6,6 +6,9 @@ Every flow that joins the author's voice channel goes through commands._join_voi
 After a restart the player knows only the config's default bitrate and a flat EQ, so the
 join is where a server gets its saved settings back. The settings file and the player
 are real; only the voice channel is faked.
+
+A join that discord.py interrupts mid-handshake fails like any other join, so every one of
+those flows reports it.
 """
 import asyncio
 import os
@@ -78,6 +81,52 @@ class TestJoinVoiceRestoresSettings(unittest.TestCase):
 
         self.assertEqual(self.player.get_bitrate_for_guild(GUILD), 128_000)
         self.assertEqual(self.player.get_eq_for_guild(GUILD), (0, 0))
+
+
+class _InterruptedChannel:
+    """A voice channel whose handshake discord.py interrupts. When the bot is moved, or the
+    voice server changes, while it connects, discord.py 2.7.1 restarts the handshake and
+    cancels the connector task that connect() awaits. The task awaiting connect() was not
+    cancelled itself, yet it gets a CancelledError."""
+
+    async def connect(self):
+        connector = asyncio.ensure_future(asyncio.sleep(3600))
+        asyncio.get_running_loop().call_soon(connector.cancel)
+        return await connector
+
+
+class _SlowChannel:
+    """A voice channel whose handshake is still running."""
+
+    async def connect(self):
+        await asyncio.sleep(3600)
+
+
+class TestInterruptedJoin(unittest.TestCase):
+    """A join that discord.py interrupts fails like any other join, so every caller's
+    `except Exception` reports it: a slash command answers instead of staying on "is
+    thinking…". Cancelling the caller itself (a stop, or shutdown) still cancels."""
+
+    def setUp(self):
+        self.player = audio_player.AudioPlayer(CONFIG)
+        self.gs = SimpleNamespace(player=self.player)
+        self.ctx = SimpleNamespace(guild=SimpleNamespace(id=GUILD))
+
+    def test_an_interrupted_handshake_is_a_failed_join(self):
+        with self.assertRaises(ConnectionError):
+            asyncio.run(commands._join_voice(self.ctx, self.gs, _InterruptedChannel()))
+        self.assertIsNone(self.player._voice_client)    # no half-made client is adopted
+
+    def test_cancelling_the_caller_still_cancels(self):
+        async def scenario():
+            join = asyncio.ensure_future(commands._join_voice(self.ctx, self.gs, _SlowChannel()))
+            await asyncio.sleep(0)                      # into the handshake
+            join.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await join
+
+        asyncio.run(scenario())
+        self.assertIsNone(self.player._voice_client)
 
 
 if __name__ == "__main__":

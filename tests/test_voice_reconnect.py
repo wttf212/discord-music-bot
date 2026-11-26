@@ -531,6 +531,36 @@ class TestSelfReconnect(unittest.TestCase):
         self.assertFalse(any("skipping track" in m.lower() for m in sent))
         self.assertFalse(any("consecutive errors" in m.lower() for m in sent))
 
+    def test_an_interrupted_connect_is_retried(self):
+        """When the bot is moved, or the voice server changes, during the handshake,
+        discord.py 2.7.1 cancels the connect it is running. That is a failed attempt, not a
+        cancel of the chain: the chain tries again and the track plays."""
+        channel = _InterruptedOnceChannel()
+        vc = _VC(connected=False, channel=channel)
+        player = _Player(vc)
+        gs = _GS(player)
+        track = Track(query="a", title="a", requested_by="u")
+        gs.queue.add(track)
+        bot = _Bot(gs, _Guild(None))
+
+        asyncio.run(commands._auto_next(bot, 10, 1, 1))
+
+        self.assertEqual(channel.connect_calls, 2)
+        self.assertEqual(player.play_calls, ["a"])
+
+
+class _InterruptedOnceChannel(_VoiceChannel):
+    """The first connect() is interrupted as discord.py does it: it cancels the connector
+    task that connect() awaits, though nothing cancelled the caller."""
+
+    async def connect(self):
+        if self.connect_calls == 0:
+            self.connect_calls += 1
+            connector = asyncio.ensure_future(asyncio.sleep(3600))
+            asyncio.get_running_loop().call_soon(connector.cancel)
+            return await connector
+        return await super().connect()
+
 
 class TestManualAdvanceVoiceGuard(unittest.TestCase):
     """Fix 1: prev/next/skip/skipto must refuse the advance outright when voice is
