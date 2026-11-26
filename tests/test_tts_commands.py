@@ -10,6 +10,7 @@ import commands, guild_settings, speech, tts, tts_commands
 from track_queue import Track, TrackQueue
 
 CLIP = b"\x00" * speech.FRAME_SIZE
+ANNA = 555555555555555555   # a member id; clean_content reads only 15-20 digit ids
 
 
 class _Speech:
@@ -264,6 +265,32 @@ class TestSlash(_Base):
                 for call in env.ctx.send.await_args_list:
                     self.assertNotEqual(call.kwargs.get("ephemeral"), True, "the reply must be public")
                 env.message.add_reaction.assert_not_awaited()
+
+    def test_a_member_who_is_not_cached_is_named_or_left_out(self):
+        # A slash command's text comes without mention data, and without the members intent
+        # only members in voice are cached: clean_content alone reads anyone else as
+        # "deleted-user", which was spoken and echoed in the public reply.
+        anna = SimpleNamespace(id=ANNA, display_name="Anna", name="anna")
+        for cached_member, cached_user, said in ((None, anna, "hi Anna there"),
+                                                 (None, None, "hi there"),
+                                                 (anna, None, "hi Anna there")):
+            with self.subTest(said=said):
+                commands._button_cooldowns.clear()
+                tts.synthesize.reset_mock()
+                env = self._env()
+                env.ctx.guild.get_member = lambda uid, m=cached_member: m
+                env.bot.get_user = lambda uid, u=cached_user: u
+                env.run("tts", text=f"hi <@!{ANNA}> there")
+                tts.synthesize.assert_awaited_once_with(said, "lv", "ffmpeg")
+
+    def test_prefix_mentions_come_with_the_message(self):
+        env = _Env()
+        env.message.mentions = [SimpleNamespace(id=ANNA, display_name="Anna", name="anna")]
+        env.ctx.guild.get_member = lambda uid: None
+        env.bot.get_user = MagicMock(return_value=None)
+        env.run("tts", text=f"hi <@{ANNA}>")
+        tts.synthesize.assert_awaited_once_with("hi Anna", "lv", "ffmpeg")
+        env.bot.get_user.assert_not_called()
 
 
 class TestAdmin(_Base):

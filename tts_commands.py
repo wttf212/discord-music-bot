@@ -3,6 +3,7 @@
 !tts speaks now, over the music; !ttsafter waits for the next song change. Admins set the
 server's speech language, the half-hourly update and the server's own off switch.
 """
+import re
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -49,6 +50,22 @@ def attach_speech(bot, guild_id: int, player) -> None:
     """Give a new player the half-hourly update. main.get_guild_state calls this when TTS is on."""
     player.speech.between_songs = lambda started_at, starting_next: _update_clip(
         bot, guild_id, started_at, starting_next)
+
+
+_USER_MENTION = re.compile(r"<@!?(\d+)>")
+
+
+def _name_uncached_members(ctx, text: str) -> str:
+    """A slash command's text comes without mention data, and without the members intent only
+    members in voice are cached: clean_content reads anyone else as "deleted-user". Name them
+    from the bot's user cache instead, or leave the mention out."""
+    def name(match):
+        uid = int(match[1])
+        if ctx.guild.get_member(uid) is not None:
+            return match[0]  # clean_content names it
+        user = ctx.bot.get_user(uid)
+        return f"@{user.display_name}" if user is not None else ""
+    return _USER_MENTION.sub(name, text)
 
 
 async def _join_author_voice(ctx, gs):
@@ -98,6 +115,8 @@ async def _tts_flow(cog, ctx, text: str | None, after: bool) -> None:
         return
 
     lang = get_tts_language(gid)
+    if ctx.interaction:
+        text = _name_uncached_members(ctx, text)
     # Mentions become names; without fix_channel_mentions a channel's id would be read out.
     mentions_as_names = commands.clean_content(fix_channel_mentions=True, use_nicknames=True)
     text = tts.clean_text(await mentions_as_names.convert(ctx, text), lang)
