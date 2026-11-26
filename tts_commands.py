@@ -154,6 +154,9 @@ async def _tts_flow(cog, ctx, text: str | None, after: bool) -> None:
         except speech.SpeechUnavailable:
             await ctx.send("Voice connection is down — try again in a moment.")
             return
+    # The author can delete a prefix !tts, and its reaction with it: this line keeps who made
+    # the bot say what.
+    print(f"[tts] guild {gid} user {ctx.author} ({ctx.author.id}) -> {where}: {text}")
 
     if ctx.interaction:
         note = {"after": " *(after this song)*", "paused": " *(when playback resumes)*"}.get(where, "")

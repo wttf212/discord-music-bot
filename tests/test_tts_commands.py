@@ -85,6 +85,19 @@ class TestTts(_Base):
         tts.synthesize.assert_awaited_once_with("labdien", "lv", "ffmpeg")
         env.message.add_reaction.assert_awaited_once_with("🔊")
 
+    def test_each_accepted_clip_is_logged_with_its_author(self):
+        # The author can delete a prefix !tts, and its reaction goes with it: the log keeps
+        # who made the bot say what.
+        for name, where in (("tts", "solo"), ("ttsafter", "after")):
+            with self.subTest(command=name):
+                commands._button_cooldowns.clear()
+                env = _Env(playing=True) if name == "ttsafter" else _Env()
+                with patch("builtins.print") as log:
+                    env.run(name, text="labdien")
+                lines = [" ".join(map(str, c.args)) for c in log.call_args_list]
+                self.assertTrue(any(line.startswith("[tts] guild 1 user ") and "(42)" in line
+                                    and line.endswith(f"-> {where}: labdien") for line in lines), lines)
+
     def test_after_song_while_a_song_plays_waits_for_the_change(self):
         env = _Env(playing=True)
         env.run("ttsafter", text="paldies")
