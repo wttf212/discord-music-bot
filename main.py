@@ -59,6 +59,7 @@ import discord
 from discord.ext import commands
 from audio_player import AudioPlayer, shutdown_audio, configure_fast_client
 from track_queue import TrackQueue
+import tts
 
 
 @dataclass
@@ -99,16 +100,21 @@ class MusicBot(commands.Bot):
         )
 
         self.config = config
+        self.tts_enabled, self.tts_status = tts.startup_status(config)
         self._guild_states: dict[int, GuildState] = {}
         self.pending_playlists: dict = {}  # channel_id (str) -> playlist info; channel IDs are globally unique
 
     def get_guild_state(self, guild_id: int) -> GuildState:
         """Return (or lazily create) per-guild state for the given guild."""
         if guild_id not in self._guild_states:
-            self._guild_states[guild_id] = GuildState(
+            state = GuildState(
                 player=AudioPlayer(self.config),
                 queue=TrackQueue(),
             )
+            if self.tts_enabled:
+                from tts_commands import attach_speech  # the optional TTS module, loaded only when it's on
+                attach_speech(self, guild_id, state.player)
+            self._guild_states[guild_id] = state
         return self._guild_states[guild_id]
 
     async def setup_hook(self):
@@ -204,6 +210,7 @@ def main():
                           _cookies_in_use)
 
     bot = MusicBot(config)
+    print(f"[main] {bot.tts_status}")
 
     async def _do_empty_leave(bot, guild_id: int, message: str):
         """Shared teardown for one guild: stop playback, clear queue, disconnect, send message."""
@@ -212,6 +219,7 @@ def main():
 
         gs.queue.clear()
         gs.player.stop_playback()
+        gs.player.speech.reset()  # leaving drops the waiting clips and the update's start time
         gs.auto_next_gen += 1
         if gs.auto_next_task and not gs.auto_next_task.done():
             gs.auto_next_task.cancel()

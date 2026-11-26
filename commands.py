@@ -580,6 +580,43 @@ class RadioPickerView(discord.ui.View):
             pass
 
 
+async def _connect_voice(voice_channel):
+    """voice_channel.connect(), with a handshake that discord.py interrupts raised as an error.
+
+    When the bot is moved, or the voice server changes, while it connects, discord.py 2.7.1
+    restarts the handshake and cancels the task this connect() awaits. That CancelledError
+    is no cancellation of the caller, but it skipped every `except Exception` around a join:
+    a slash command stayed on "is thinking…", and auto-play's reconnect ended the chain
+    without a word.
+    """
+    try:
+        return await voice_channel.connect()
+    except asyncio.CancelledError:
+        if asyncio.current_task().cancelling():
+            raise  # the caller itself is being cancelled: a stop, or shutdown
+        raise ConnectionError("the voice connection was interrupted, try again") from None
+
+
+async def _join_voice(ctx, gs, voice_channel):
+    """Join voice_channel, give the player the new client and restore the server's saved
+    bitrate and EQ. Returns the client; a failed join raises for the caller to report.
+
+    Callers deal with an existing client first, so this never connects while discord.py
+    is still reconnecting one.
+    """
+    guild_id = str(ctx.guild.id)
+    voice_client = await _connect_voice(voice_channel)
+    gs.player.set_voice_client(voice_client)
+    saved_br = get_bitrate(guild_id)
+    if saved_br:
+        await gs.player.set_bitrate(ctx.guild.id, saved_br)
+    saved_bass = get_eq_bass(guild_id)
+    saved_treble = get_eq_treble(guild_id)
+    if saved_bass != 0 or saved_treble != 0:
+        await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+    return voice_client
+
+
 async def _play_radio_selected(bot, ctx: commands.Context, station: dict,
                                picker_msg: discord.Message):
     """Continue the play flow with a radio station selected from RadioPickerView.
@@ -588,7 +625,6 @@ async def _play_radio_selected(bot, ctx: commands.Context, station: dict,
     gs.player.play(url). The Track has is_radio=True so it is excluded from history.
     NP embed shows extra_desc="\U0001f534 LIVE" instead of a duration.
     """
-    guild_id = str(ctx.guild.id)
     gs = bot.get_guild_state(ctx.guild.id)
     voice_channel = ctx.author.voice.channel
     user_id = str(ctx.author.id)
@@ -608,15 +644,7 @@ async def _play_radio_selected(bot, ctx: commands.Context, station: dict,
                 pass
             gs.player._voice_client = None
         try:
-            voice_client = await voice_channel.connect()
-            gs.player.set_voice_client(voice_client)
-            saved_br = get_bitrate(guild_id)
-            if saved_br:
-                await gs.player.set_bitrate(ctx.guild.id, saved_br)
-            saved_bass = get_eq_bass(guild_id)
-            saved_treble = get_eq_treble(guild_id)
-            if saved_bass != 0 or saved_treble != 0:
-                await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+            voice_client = await _join_voice(ctx, gs, voice_channel)
         except Exception as e:
             await picker_msg.edit(
                 content=f"Failed to join voice channel: {e}",
@@ -661,6 +689,11 @@ async def _play_radio_selected(bot, ctx: commands.Context, station: dict,
         await picker_msg.delete()
         await send_new_np(bot, channel_id, view)
         _start_auto_next(bot, channel_id, ctx.guild.id)
+    except asyncio.CancelledError:
+        # A stop or a newer start overtook this one. That is no error, but the picker must
+        # not stay on "Loading…": its view is stopped, so nothing else would clear it.
+        await _safe_delete(picker_msg)
+        raise
     except Exception as e:
         await picker_msg.edit(
             content=f"Error starting radio: {e}",
@@ -807,7 +840,6 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
     Trusts the flat-search metadata for display (so a queue-add skips the redundant
     background full resolve) and overlaps the URL resolve with the voice connect.
     """
-    guild_id = str(ctx.guild.id)
     gs = bot.get_guild_state(ctx.guild.id)
     voice_channel = ctx.author.voice.channel
     user_id = str(ctx.author.id)
@@ -859,15 +891,7 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
                 pass
             gs.player._voice_client = None
         try:
-            voice_client = await voice_channel.connect()
-            gs.player.set_voice_client(voice_client)
-            saved_br = get_bitrate(guild_id)
-            if saved_br:
-                await gs.player.set_bitrate(ctx.guild.id, saved_br)
-            saved_bass = get_eq_bass(guild_id)
-            saved_treble = get_eq_treble(guild_id)
-            if saved_bass != 0 or saved_treble != 0:
-                await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+            voice_client = await _join_voice(ctx, gs, voice_channel)
         except Exception as e:
             _discard_future(resolve_fut)
             await picker_msg.edit(
@@ -914,6 +938,11 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
         await picker_msg.delete()
         await send_new_np(bot, channel_id, view)
         _start_auto_next(bot, channel_id, ctx.guild.id)
+    except asyncio.CancelledError:
+        # Overtaken by a stop or a newer start: no error, but don't leave the picker on
+        # "Loading…" (see _play_radio_selected).
+        await _safe_delete(picker_msg)
+        raise
     except Exception as e:
         await picker_msg.edit(
             content=f"Error playing track: {e}",
@@ -1046,6 +1075,11 @@ class _ControlsRow(discord.ui.ActionRow):
         if _live_voice_client(self.view.bot, gs, guild_id) is None:
             await _respond(interaction, "Voice connection is down — reconnecting. Try again in a moment.")
             return
+        speech = _speech(gs)
+        if speech and speech.in_gap:
+            speech.skip_gap()  # only the speech; the next song starts right away
+            await _respond(interaction, "Skipped the announcement.")
+            return
         if gs.auto_next_task and not gs.auto_next_task.done():
             gs.auto_next_task.cancel()
             gs.auto_next_task = None
@@ -1073,6 +1107,8 @@ class _ControlsRow(discord.ui.ActionRow):
                                                interaction.channel.id, next_track, e):
                     await interaction.channel.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
+            if speech:
+                await speech.end_of_queue()
             await update_np_stopped(self.view.bot, interaction.channel.id)
 
     @discord.ui.button(label="■", style=discord.ButtonStyle.danger, custom_id="btn_stop")  # ■
@@ -1084,6 +1120,7 @@ class _ControlsRow(discord.ui.ActionRow):
         if gs.auto_next_task and not gs.auto_next_task.done():
             gs.auto_next_task.cancel()
             gs.auto_next_task = None
+        gs.auto_next_gen += 1  # as !stop does: a chain whose cancel was lost can't rejoin
         gs.player.stop_playback()
         gs.queue.clear()
         await gs.player.disconnect()
@@ -1766,6 +1803,11 @@ def _on_cooldown(guild_id, user_id, action: str, seconds: float) -> bool:
         return True
     _button_cooldowns[key] = now
     return False
+
+
+def _speech(gs):
+    """This guild's Speech controller, or None."""
+    return getattr(gs.player, "speech", None)  # test doubles and any player without speech skip TTS
 
 
 async def check_channel(ctx: commands.Context) -> bool:
@@ -2479,15 +2521,7 @@ class MusicCog(commands.Cog):
                         pass
                     gs.player._voice_client = None
                 try:
-                    voice_client = await voice_channel.connect()
-                    gs.player.set_voice_client(voice_client)
-                    saved_br = get_bitrate(guild_id)
-                    if saved_br:
-                        await gs.player.set_bitrate(ctx.guild.id, saved_br)
-                    saved_bass = get_eq_bass(guild_id)
-                    saved_treble = get_eq_treble(guild_id)
-                    if saved_bass != 0 or saved_treble != 0:
-                        await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+                    voice_client = await _join_voice(ctx, gs, voice_channel)
                 except Exception as e:
                     _abandon_enumeration(full_fut)
                     _discard_future(resolve_fut)  # let the in-flight resolve finish and drop it
@@ -2547,6 +2581,15 @@ class MusicCog(commands.Cog):
                 track_url = played.get("webpage_url", "")
                 gs.queue.current = Track(query=first_url, title=title,
                                          requested_by=user_id, thumbnail=track_thumbnail, url=track_url)
+            except asyncio.CancelledError:
+                # A stop or a newer start overtook track 1 (play() gives up as cancelled), or
+                # this command is being cancelled. Nobody will load the rest, so stop its pages.
+                # No error line. A newer start has put up its own card; a card still on this
+                # start's "Loading…" is marked stopped, since not every stop edits it.
+                _abandon_enumeration(full_fut)
+                if gs.np_message_id == loading_card:
+                    await update_np_stopped(self.bot, channel_id)
+                raise
             except Exception as e:
                 _abandon_enumeration(full_fut)
                 # A YouTube block or a voice drop is no fault of the playlist, and the chain
@@ -2635,17 +2678,7 @@ class MusicCog(commands.Cog):
                     pass
                 gs.player._voice_client = None
             try:
-                voice_client = await voice_channel.connect()
-                gs.player.set_voice_client(voice_client)
-                # Restore saved bitrate for this guild
-                saved_br = get_bitrate(guild_id)
-                if saved_br:
-                    await gs.player.set_bitrate(ctx.guild.id, saved_br)
-                # Restore saved EQ for this guild (per D-09)
-                saved_bass = get_eq_bass(guild_id)
-                saved_treble = get_eq_treble(guild_id)
-                if saved_bass != 0 or saved_treble != 0:
-                    await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+                voice_client = await _join_voice(ctx, gs, voice_channel)
             except Exception as e:
                 _discard_future(resolve_fut)  # let the in-flight resolve finish and drop it
                 await ctx.send(f"Failed to join voice channel: {e}")
@@ -2665,6 +2698,7 @@ class MusicCog(commands.Cog):
             guild_id=ctx.guild.id, loading=True,
         )
         await send_new_np(self.bot, channel_id, loading_view)
+        loading_card = gs.np_message_id
 
         async def _fail(message: str):
             """Replace the loading card with a plain error line."""
@@ -2707,8 +2741,32 @@ class MusicCog(commands.Cog):
             # Edit the loading card in place rather than sending a second message.
             await update_np_embed(self.bot, channel_id, view)
             _start_auto_next(self.bot, channel_id, ctx.guild.id)
+        except asyncio.CancelledError:
+            # Overtaken by a stop or a newer start, which needs no word from here (as in
+            # /skipto). A newer start has put up its own card. A card still on this start's
+            # "Loading…" is marked stopped, since not every stop edits it (the empty-channel
+            # leave doesn't). A slash command would stay on "is thinking…", so its reply is
+            # deleted instead.
+            if gs.np_message_id == loading_card:
+                await update_np_stopped(self.bot, channel_id)
+            if ctx.interaction:
+                try:
+                    await ctx.interaction.delete_original_response()
+                except Exception:
+                    pass
+            raise
         except Exception as e:
             await _fail(f"Error playing track: {e}")
+            return
+
+        if ctx.interaction:
+            # The card is this command's answer. Delete the deferred "is thinking…" reply,
+            # which Discord otherwise ends as "The application did not respond". Not before
+            # play() has succeeded: until then, a failed start's error takes its place.
+            try:
+                await ctx.interaction.delete_original_response()
+            except discord.HTTPException:
+                pass
 
     @commands.hybrid_command(name="radio", description="Browse or search internet radio stations")
     @app_commands.describe(query="Station name to search, or leave blank to browse by country/genre")
@@ -2820,6 +2878,13 @@ class MusicCog(commands.Cog):
 
         gs = self.bot.get_guild_state(ctx.guild.id)
         channel_id = gs.current_text_channel_id or ctx.channel.id
+        # Disarm the auto-next chain before the stop, as the ◄/► buttons do. The stop ends any
+        # gap speech, which releases a start waiting on it onto the closing connection; a live
+        # chain takes that failure for a voice drop, then rejoins and plays the track.
+        if gs.auto_next_task and not gs.auto_next_task.done():
+            gs.auto_next_task.cancel()
+            gs.auto_next_task = None
+        gs.auto_next_gen += 1
         gs.player.stop_playback()
         gs.queue.clear()
         await gs.player.disconnect()
@@ -2842,6 +2907,11 @@ class MusicCog(commands.Cog):
         channel_id = ctx.channel.id
         if _live_voice_client(self.bot, gs, ctx.guild.id) is None:
             await ctx.send("Voice connection is down — reconnecting. Try again in a moment.")
+            return
+        speech = _speech(gs)
+        if speech and speech.in_gap:
+            speech.skip_gap()  # only the speech; the next song starts right away
+            await ctx.send("Skipped the announcement.", delete_after=3)
             return
         # Cancel the existing auto-next task and invalidate its generation
         if gs.auto_next_task and not gs.auto_next_task.done():
@@ -2872,6 +2942,8 @@ class MusicCog(commands.Cog):
                     await ctx.send(f"Skipping track: {_friendly_ytdlp_error(e)}")
         else:
             await ctx.send("Skipped. Queue is empty.")
+            if speech:
+                await speech.end_of_queue()
             channel_id = gs.current_text_channel_id or ctx.channel.id
             await update_np_stopped(self.bot, channel_id)
 
@@ -2939,7 +3011,6 @@ class MusicCog(commands.Cog):
         sp_tracks = resolved["tracks"]
         user_id = str(ctx.author.id)
         channel_id = ctx.channel.id
-        guild_id = str(ctx.guild.id)
         voice_channel = ctx.author.voice.channel
         voice_client = ctx.guild.voice_client
         playing = gs.player.is_playing and voice_client and voice_client.is_playing()
@@ -2964,15 +3035,7 @@ class MusicCog(commands.Cog):
                     pass
                 gs.player._voice_client = None
             try:
-                voice_client = await voice_channel.connect()
-                gs.player.set_voice_client(voice_client)
-                saved_br = get_bitrate(guild_id)
-                if saved_br:
-                    await gs.player.set_bitrate(ctx.guild.id, saved_br)
-                saved_bass = get_eq_bass(guild_id)
-                saved_treble = get_eq_treble(guild_id)
-                if saved_bass != 0 or saved_treble != 0:
-                    await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+                voice_client = await _join_voice(ctx, gs, voice_channel)
             except Exception as e:
                 await ctx.send(f"Failed to join voice channel: {e}")
                 return
@@ -2998,6 +3061,10 @@ class MusicCog(commands.Cog):
         gs.auto_next_gen += 1
         try:
             played = await gs.player.play(first["query"], info, resolved_at)
+        except asyncio.CancelledError:
+            # Overtaken by a stop or a newer start: no error, but don't leave "Loading…" up.
+            await _safe_delete(status)
+            raise
         except Exception as e:
             # A voice drop (or a block met re-resolving a stale URL) is no fault of the
             # track: re-arm auto-play, as a refused playlist start does.
@@ -3188,6 +3255,15 @@ class MusicCog(commands.Cog):
             return
         try:
             info = await gs.player.play(next_track.query, next_track.resolved_info, next_track.resolved_at)
+        except asyncio.CancelledError:
+            # Overtaken by a stop or a newer start, which needs no word from here. A deferred
+            # slash command would stay on "is thinking…", so its reply is deleted instead.
+            if ctx.interaction:
+                try:
+                    await ctx.interaction.delete_original_response()
+                except Exception:
+                    pass
+            raise
         except Exception as e:
             print(f"[commands] Manual advance failed (guild {ctx.guild.id}): {e}")
             if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track, e):
@@ -3559,7 +3635,18 @@ class MusicCog(commands.Cog):
     @commands.command(name="help")
     async def help_cmd(self, ctx: commands.Context):
         p = self.bot.command_prefix
-        await ctx.send(
+        tts_lines = ""
+        if getattr(self.bot, "tts_enabled", False):
+            tts_lines = (
+                f"`{p}tts <text>` — Say something in the voice channel right now (the music dips)\n"
+                f"`{p}ttsafter <text>` — Say something after the current song\n"
+                f"`{p}ttslang lv|en` — Speech language for this server *(admin only)*\n"
+                f"`{p}ttsvoice female|male` — Speech voice for this server *(admin only)*\n"
+                f"`{p}announce on|off` — Say the time and songs left every half hour, between songs *(admin only)*\n"
+                f"`{p}announce text <text>` — Your own words for that update: @laiks is the time, @queue the songs left; `reset` goes back to the default *(admin only)*\n"
+                f"`{p}ttsallow on|off` — Allow or block `{p}tts` and `{p}ttsafter` on this server *(admin only)*\n"
+            )
+        text = (
             f"**Available commands:**\n"
             f"`{p}play <url or keywords>` — Play from YouTube, SoundCloud, or Spotify (or search text)\n"
             f"`{p}search <keywords>` — Search YouTube and pick a result from a dropdown\n"
@@ -3584,6 +3671,7 @@ class MusicCog(commands.Cog):
             f"`{p}eq [bass|treble <N> | preset | reset]` — Per-guild equalizer, -10..+10 dB *(admin only)*\n"
             f"`{p}setlocation <city>` — Set the city for the weather line on the player *(admin only)*\n"
             f"`{p}settimezone <tz>` — Set the timezone for F1 race times, e.g. Europe/Riga *(admin only)*\n"
+            f"{tts_lines}"
             f"`{p}fairplay on|off` — Toggle user interleaving mode for queues *(admin only)*\n"
             f"`{p}fairness <0-100>` — Set the percentage of users strictly needed to skip/stop songs *(admin only)*\n"
             f"`{p}addadmin @user` — Add a user as a bot admin for this server *(owner only)*\n"
@@ -3591,6 +3679,13 @@ class MusicCog(commands.Cog):
             f"`{p}settc` — Restrict bot commands to this channel *(owner only)*\n"
             f"`{p}shutdown` — Shut down the bot *(owner only)*"
         )
+        # Discord refuses a message over 2000 characters, and the text-to-speech lines take
+        # the list past that, so it goes out in pieces split at line breaks.
+        while len(text) > 2000:
+            cut = text.rindex("\n", 0, 2000)
+            await ctx.send(text[:cut])
+            text = text[cut + 1:]
+        await ctx.send(text)
 
 # A 1006 voice-socket drop puts discord.py into its own reconnect loop, which can take
 # minutes. The auto-next chain has to wait that out: play() raises "Not connected to a
@@ -3666,7 +3761,7 @@ async def _self_reconnect(bot, gs, guild_id, generation, voice_channel) -> bool:
     print(f"[commands] discord.py dropped the voice client — reconnecting to "
           f"{voice_channel} (guild {guild_id})")
     try:
-        vc = await voice_channel.connect()
+        vc = await _connect_voice(voice_channel)
     except Exception as e:
         print(f"[commands] Voice reconnect failed: {e} (guild {guild_id})")
         return False
@@ -3784,6 +3879,9 @@ async def _auto_next(bot, channel_id, guild_id, generation):
                         next_track = gs.queue.next()
                 if not next_track:
                     # Queue drained — update embed to stopped state and strip buttons
+                    speech = _speech(gs)
+                    if speech:
+                        await speech.end_of_queue()
                     await update_np_stopped(bot, channel_id)
                     break
             try:
@@ -3893,6 +3991,9 @@ async def _auto_next(bot, channel_id, guild_id, generation):
             members = [m for m in voice_client.channel.members if not m.bot]
             if not members:
                 gs.player.stop_playback()
+                speech = _speech(gs)
+                if speech:
+                    speech.reset()  # leaving drops the waiting clips and the update's start time
                 await voice_client.disconnect()
                 gs.player._voice_client = None
 
@@ -3909,6 +4010,9 @@ async def _auto_next(bot, channel_id, guild_id, generation):
 
 async def setup(bot):
     await bot.add_cog(MusicCog(bot))
+    if getattr(bot, "tts_enabled", False):
+        from tts_commands import TtsCog  # imported here: tts_commands imports from this module
+        await bot.add_cog(TtsCog(bot))
     # Warm the flourish caches so the first card shows them.
     asyncio.create_task(_refresh_weather_for(dict(DEFAULT_WEATHER_LOCATION)))
     asyncio.create_task(_refresh_sky_for(dict(DEFAULT_WEATHER_LOCATION)))

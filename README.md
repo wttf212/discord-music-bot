@@ -1,194 +1,262 @@
 # Discord Music Bot
 
-A Discord music bot with YouTube, SoundCloud, and Spotify. (Use it at your own risk, YouTube loves to ban IPs)
+A self-hosted music bot for Discord, written in Python with discord.py. It plays YouTube, SoundCloud and Spotify links in voice channels, and it can play internet radio.
 
-## Features
+Use it at your own risk: YouTube bans IP addresses that it thinks belong to bots.
 
-- 🎵 Play from YouTube, SoundCloud, and Spotify (Spotify links are resolved to YouTube)
-- 🔍 YouTube search with a dropdown picker (`!search`)
-- ♾️ Autoplay / endless mode — keeps playing related tracks when the queue ends (`!autoplay`)
-- 🔁 Loop the current track or the whole queue (`!loop`)
-- 🧰 Queue tools — remove, move, skip-to, clear, and dedupe
-- 📩 Grab — DM yourself the currently playing track (`!grab`)
-- 🛰️ Live flourishes on the card — local weather, aurora forecast, next F1 race, and next rocket launch (per-server `!setlocation` / `!settimezone`; sensible Riga/Europe defaults if unset)
-- 📻 Internet radio browser — region/country/genre discovery or name search across 30k+ stations
-- 📋 Playlist support — plays the first track immediately, load the rest with `!loadall`
-- 🔀 Queue with fair-play interleaving and shuffle
-- 🎚️ Per-guild equalizer (bass, treble, presets)
-- 🔧 Configurable audio bitrate per server
-- 🔒 DAVE E2EE voice encryption support (discord.py v2.7.0+)
-- ⚡ Fast first play — a cold track starts in about 1.5-2 s instead of about 5 s through the `visionos` client, with the normal client as automatic fallback (`youtube.fast_client: ""` turns it off)
-- 📌 Channel restriction (`!settc`)
-- 🚪 Auto-leave when voice channel empties
+## What it does
 
-## Quick Start
+- Plays a YouTube, SoundCloud or Spotify link, or the top YouTube result for whatever you type. Spotify audio can't be streamed, so the bot plays the same song from YouTube.
+- `!search` shows YouTube results to pick from.
+- A YouTube or SoundCloud playlist starts with its first track. To queue the rest, click Load playlist on the player card or type `!loadall`. Spotify playlists and albums go straight into the queue. Either way, the limit is 2000 tracks.
+- The queue can be shuffled, looped, reordered and cleaned up. Fair play, on by default, alternates songs between the people who added them.
+- Autoplay adds related tracks when the queue runs out.
+- Internet radio: browse by region, country and genre, or search over 30,000 stations by name.
+- The player card has buttons for pause, previous, next, stop, the queue, loop, shuffle and grab. It also shows the local weather, the next F1 race and the next rocket launch, plus an aurora forecast when there's a chance to see one.
+- `!grab` sends you the current track in a DM.
+- Each server has its own bitrate and equalizer settings.
+- The first song usually starts in about 2 seconds.
+- Optional text-to-speech: the bot can read out messages sent with `!tts`, and every half hour it can say the time and how many songs are left. It stays off unless you turn it on.
+- Works with Discord's end-to-end encrypted voice (DAVE), which needs discord.py 2.7 or newer.
+- The owner can limit the bot to one text channel with `!settc`.
+- It leaves the voice channel when everyone else has left, after a minute if music is still playing.
+
+## Requirements
+
+To run the bot from source you need:
+
+- Python 3.11 or newer.
+- FFmpeg. If it isn't on your PATH, the bot uses the copy that comes with the imageio-ffmpeg package.
+- Deno, which yt-dlp uses to solve YouTube's JavaScript challenges. The setup scripts install it if it's missing.
+
+The Docker image comes with all three.
+
+You also need a Discord bot. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications), copy its bot token, turn on the Message Content intent and invite the bot to your server. The details are under [Discord permissions and intents](#discord-permissions-and-intents).
+
+## Setup
+
+The bot reads its token from `bot_token` in `config.yaml` or from the `DISCORD_BOT_TOKEN` environment variable. If both are set, the environment variable wins. The Docker setup uses the environment variable.
 
 ### Windows
-```bash
-setup.bat
-# Edit config.yaml with your bot token
+
+Run `setup.bat`. It creates a virtual environment, installs the Python packages, installs Deno if it's missing and copies `config.example.yaml` to `config.yaml`. Put your bot token and your Discord user ID (`owner_id`) in `config.yaml`, then start the bot from Command Prompt:
+
+```bat
 venv\Scripts\activate & python main.py
 ```
 
 ### Linux / macOS
+
 ```bash
 chmod +x setup.sh && ./setup.sh
-# Edit config.yaml with your bot token
+```
+
+The script does the same as `setup.bat`. Put your bot token and `owner_id` in `config.yaml`, then start the bot:
+
+```bash
 source venv/bin/activate && python3 main.py
 ```
 
 ### Docker
-```bash
-cp config.example.yaml config.yaml
-# Edit config.yaml with your bot token
-docker compose up -d
-```
+
+1. Copy the example config and set `owner_id` in it:
+
+   ```bash
+   cp config.example.yaml config.yaml
+   ```
+
+2. Create a file named `.env` next to `docker-compose.yml`, with your bot token in it:
+
+   ```
+   DISCORD_BOT_TOKEN=paste-your-token-here
+   ```
+
+3. Start the bot:
+
+   ```bash
+   docker compose up -d
+   ```
+
+Compose reads `.env` and passes the token to the bot, so `bot_token` in `config.yaml` can stay as it is.
 
 ## Configuration
 
-Copy `config.example.yaml` to `config.yaml` and fill in:
+The settings are in `config.yaml`. `config.example.yaml` has comments on the bot token and on the YouTube, Spotify and text-to-speech settings. These are the ones you're most likely to change:
 
-| Key | Description |
-|-----|-------------|
-| `bot_token` | Your Discord bot token |
-| `prefix` | Command prefix (default: `!`) |
-| `owner_id` | Your Discord user ID (for `!settc` and `!shutdown`) |
-| `debug` | Enable verbose logging |
-| `youtube.fast_client` | Default `"visionos"`: tried first for plays someone is waiting on; `""` turns it off. Needs yt-dlp 2026.08.19+, ignored when `cookies_file` is set. See `config.example.yaml` |
-| `audio.bitrate` | Opus encoding bitrate in kbps (default: 128) |
-| `spotify.client_id` / `spotify.client_secret` | *(optional)* Enable Spotify **playlist/album** links (single track links work without them) |
+| Key | What it does |
+|-----|--------------|
+| `bot_token` | Your bot token. The `DISCORD_BOT_TOKEN` environment variable wins over it |
+| `prefix` | The command prefix. Default `!` |
+| `owner_id` | Your Discord user ID. The owner can use every command and never needs a vote |
+| `debug` | `true` makes the log much more detailed |
+| `youtube.fast_client` | Gets the first song playing in about 2 seconds instead of about 5. On by default; set it to `""` to turn it off. Not used when `cookies_file` is set |
+| `youtube.cookies_file` | Optional. See [YouTube cookies](#youtube-cookies-optional) |
+| `spotify.client_id`, `spotify.client_secret` | Optional. Only Spotify playlist and album links need them. Get them from a free app on the [Spotify developer dashboard](https://developer.spotify.com/dashboard) |
+| `tts.enabled` | `true` turns on text-to-speech, once edge-tts is installed. Default `false`. See [Text-to-speech](#text-to-speech-optional) |
+| `audio.bitrate` | The default audio bitrate in kbps (128). `!bitrate` changes it for one server |
+| `ffmpeg_path` | Where FFmpeg is. The default, `ffmpeg`, means the one on your PATH |
 
-## Cookie Auth (Optional)
+## YouTube cookies (optional)
 
-Passing your YouTube visitor cookies reduces bot-detection on residential IPs.
+Cookies from your browser can make YouTube less likely to flag the bot, mostly on home internet connections.
 
-1. Export on the host: `yt-dlp --cookies-from-browser chrome --cookies cookies.txt -o /dev/null -- "https://www.youtube.com"`
-2. Place the resulting `cookies.txt` in the project root.
-3. Set `cookies_file` in `config.yaml` under the `youtube:` key:
-   - **Native** (Windows/Linux/macOS): use the path to `cookies.txt` on your filesystem, e.g. `cookies_file: "./cookies.txt"`
-   - **Docker**: use `cookies_file: "/data/cookies.txt"` and uncomment the bind-mount in step 4.
-4. Docker only: uncomment the `- ./cookies.txt:/data/cookies.txt` line in `docker-compose.yml`.
+1. Export them on the host, not inside Docker:
 
-Re-export every ~4 months. See `config.example.yaml` for full details. A `cookies_file` turns `youtube.fast_client` off: yt-dlp does not use visionos for a logged-in session.
+   ```bash
+   yt-dlp --cookies-from-browser chrome --cookies cookies.txt -o /dev/null -- "https://www.youtube.com"
+   ```
+
+2. Put the `cookies.txt` it writes in the project folder.
+3. In `config.yaml`, under `youtube:`, set `cookies_file`:
+   - From source: `cookies_file: "./cookies.txt"`
+   - Docker: `cookies_file: "/data/cookies.txt"`, and uncomment the `- ./cookies.txt:/data/cookies.txt` line in `docker-compose.yml`.
+
+Export them again every 4 months or so. The bot warns in its log once the file is more than 150 days old. While `cookies_file` is set, `youtube.fast_client` is off, so the first song starts more slowly.
 
 ## Commands
 
-All commands work with the prefix (default `!`) and as slash commands (e.g. `/play`, `/search`).
+Commands start with the prefix, `!` by default. `!help` shows a short version of this list in Discord.
+
+These also work as slash commands: `/play`, `/search`, `/grab`, `/shuffle`, `/loop`, `/autoplay`, `/remove`, `/move`, `/skipto`, `/clear`, `/dedupe`, `/radio`, `/setlocation`, `/settimezone`, and the text-to-speech commands when it's on.
+
+Commands marked *(admin only)* are for the bot owner and the bot admins the owner adds with `!addadmin`. Discord roles don't make someone a bot admin.
 
 ### Playback
 
-| Command | Description |
-|---------|-------------|
-| `!play <url or keywords>` | Play from YouTube, SoundCloud, or Spotify — links play directly, plain text auto-plays the top YouTube result (join voice first) |
+| Command | What it does |
+|---------|--------------|
+| `!play <url or keywords>` | Play a YouTube, SoundCloud or Spotify link, or the top YouTube result for your words. Join a voice channel first |
 | `!search <keywords>` | Search YouTube and pick a result from a dropdown |
-| `!grab` | DM yourself the currently playing track |
+| `!grab` | Send yourself the current track in a DM |
 | `!pause` | Pause playback |
 | `!resume` | Resume paused playback |
 | `!skip` | Skip the current track |
-| `!stop` | Stop playback, clear the queue, and leave voice |
+| `!stop` | Stop playback, clear the queue and leave the voice channel |
+
+When other people are listening too, `!skip`, `!pause` and `!resume` take a vote unless the current song is yours, and `!stop` takes one unless you added every song that is playing or queued. The pause, previous, next and stop buttons on the player card work the same way. `!fairness` sets how many votes it takes.
 
 ### Queue
 
-| Command | Description |
-|---------|-------------|
-| `!queue` | Show the current queue |
-| `!shuffle` | Shuffle the queued tracks |
-| `!loop [off\|track\|queue]` | Repeat the current track or the whole queue |
-| `!autoplay [on\|off]` | Keep playing related tracks when the queue ends |
-| `!remove <pos>` | Remove a track from the queue by position |
-| `!move <from> <to>` | Move a queued track to a new position |
+| Command | What it does |
+|---------|--------------|
+| `!queue` | Show the queue |
+| `!shuffle` | Shuffle the queue |
+| `!loop [off\|track\|queue]` | Repeat the current track or the whole queue. With no argument, it cycles through the modes |
+| `!autoplay [on\|off]` | Keep playing related tracks when the queue runs out. With no argument, it toggles |
+| `!remove <pos>` | Remove the track at that position |
+| `!move <from> <to>` | Move a queued track to another position |
 | `!skipto <pos>` | Jump straight to a queued track |
-| `!clear` | Clear the upcoming queue (keeps the current track) |
+| `!clear` | Clear the queue but keep the current track |
 | `!dedupe` | Remove duplicate tracks from the queue |
-| `!loadall` | Load all remaining tracks from the last pending playlist |
+| `!loadall` | Queue the rest of the playlist that was just added. The offer lasts two minutes |
 
 ### Radio
 
-| Command | Description |
-|---------|-------------|
-| `!radio` | Open the region → country → genre discovery picker |
-| `!radio <name>` | Search 30k+ stations by name and pick from results |
+| Command | What it does |
+|---------|--------------|
+| `!radio` | Browse internet radio by region, country and genre |
+| `!radio <name>` | Search over 30,000 stations by name |
 
-### Audio
+### Sound and the player card
 
-| Command | Description |
-|---------|-------------|
-| `!bitrate [kbps]` | Show or set the Opus encoding bitrate for this server |
-| `!eq` | Show equalizer usage |
-| `!eq bass <-10..10>` | Boost or cut bass (dB) |
-| `!eq treble <-10..10>` | Boost or cut treble (dB) |
-| `!eq preset <name>` | Apply a named preset (e.g. `bass`, `vocal`, `flat`) |
-| `!eq reset` | Reset equalizer to flat |
-| `!setlocation <city>` | Set the city for the weather shown on the player card *(admin)* |
-| `!settimezone <tz>` | Set the timezone for F1 race times, e.g. `Europe/Riga` *(admin)* |
+| Command | What it does |
+|---------|--------------|
+| `!bitrate [kbps]` | Show or set the audio bitrate for this server, from 1 to 512 kbps |
+| `!eq` | Show the equalizer settings and how to change them *(admin only)* |
+| `!eq bass <-10..+10>` | Boost or cut the bass, in dB *(admin only)* |
+| `!eq treble <-10..+10>` | Boost or cut the treble, in dB *(admin only)* |
+| `!eq <preset>` | Use a preset: `flat`, `bass-boost`, `treble-boost` or `vocal` *(admin only)* |
+| `!eq reset` | Set the equalizer back to flat *(admin only)* |
+| `!setlocation <city>` | Set the city for the weather on the player card *(admin only)* |
+| `!settimezone <tz>` | Set the timezone for the times on the player card, e.g. `Europe/Riga` *(admin only)* |
 
-### Admin *(bot admin required)*
+Equalizer changes apply from the next track. Until an admin sets them, the city is Riga and the timezone is `Europe/Riga`.
 
-| Command | Description |
-|---------|-------------|
-| `!fairplay on\|off` | Toggle fair-play interleaving (alternates tracks between users) |
-| `!fairness <0-100>` | Percentage of voice-channel members required to vote-skip or vote-stop |
+### Text-to-speech (optional)
 
-### Owner *(owner_id only)*
+Off by default. To turn it on:
 
-| Command | Description |
-|---------|-------------|
-| `!addadmin @user` | Grant a user bot-admin privileges for this server |
-| `!removeadmin @user` | Revoke bot-admin privileges for a user |
-| `!settc` | Restrict all bot commands to the current channel |
-| `!shutdown` | Shut down the bot |
+1. Set `tts.enabled: true` in `config.yaml`.
+2. Install the edge-tts package and restart the bot:
+   - From source: run `pip install -r requirements-tts.txt` with the virtual environment active.
+   - Docker: add `WITH_TTS=true` to `.env`, then rebuild and restart with `docker compose up -d --build`.
 
-### Other
+It needs no account or key. The voices are Microsoft Edge's online ones, so the text to be spoken goes to Microsoft. If `tts.enabled` is `true` but edge-tts isn't installed, the bot logs a warning and leaves text-to-speech off.
 
-| Command | Description |
-|---------|-------------|
-| `!help` | Show command list |
+| Command | What it does |
+|---------|--------------|
+| `!tts <text>` | Say something in the voice channel right now (the music dips) |
+| `!ttsafter <text>` | Say something after the current song |
+| `!ttslang lv\|en` | Speech language for this server *(admin only)* |
+| `!ttsvoice female\|male` | Speech voice for this server *(admin only)* |
+| `!announce on\|off` | Say the time and songs left every half hour, between songs *(admin only)* |
+| `!announce text <text>` | Your own words for that update: @laiks is the time, @queue the songs left; `reset` goes back to the default *(admin only)* |
+| `!ttsallow on\|off` | Allow or block `!tts` and `!ttsafter` on this server *(admin only)* |
 
-## Bot Permissions
+- The voices are Latvian Everita (female) and Nils (male), and English Aria (female) and Andrew (male). The default is female; an admin changes it with `!ttsvoice male`.
+- Speech is leveled to a fixed loud volume, so every voice is equally loud and stands out over the music.
+- Speech is in Latvian until an admin switches the server to English with `!ttslang en`.
+- `!tts` and `!ttsafter` work on every server until an admin blocks them there with `!ttsallow off`. The half-hourly update has its own switch, `!announce`.
+- The half-hourly update is off until an admin runs `!announce on`. It uses the server's timezone from `!settimezone`.
+- To change the wording, use `!announce text`, for example `!announce text Okupantu radio, precīzs laiks ir @laiks un rindā ir @queue dziesmas`. It is read out in the server's `!ttslang` language and `!ttsvoice` voice, up to 300 characters.
+- A message can be up to 300 characters. Each person can send one every 10 seconds, and up to 5 can wait their turn on a server.
 
-### Required Discord Permissions
+### Fair play and votes
 
-When inviting the bot, grant it the following permissions (or use the permissions integer `2184276992`):
+| Command | What it does |
+|---------|--------------|
+| `!fairplay on\|off` | Alternate queued songs between the people who added them. On by default *(admin only)* |
+| `!fairness <0-100>` | Set the percentage of listeners who must vote when a command takes a vote. Default 50 *(admin only)* |
 
-**Text Channel**
+Neither setting is saved: fair play turns back on after `!stop` or when the bot leaves, and fairness goes back to 50 when the bot restarts.
+
+### Owner only
+
+These work only for the user in `owner_id`.
+
+| Command | What it does |
+|---------|--------------|
+| `!addadmin @user` | Make someone a bot admin on this server |
+| `!removeadmin @user` | Take bot admin away from someone on this server |
+| `!settc` | Only take commands in this channel. Commands sent elsewhere are deleted, and the sender is pointed here |
+| `!shutdown` | Shut the bot down. Under the included `docker-compose.yml` the container starts straight back up (`restart: unless-stopped`), so stop it there with `docker compose stop` |
+
+## Discord permissions and intents
+
+### Permissions
+
+When you invite the bot, give it these permissions, or use the permissions integer `36793408`.
+
+In text channels:
 
 | Permission | Why |
-|---|---|
-| View Channel | Read commands and post responses |
-| Send Messages | Post now-playing embeds and status replies |
-| Manage Messages | Delete user command messages and stale status messages to keep chat clean |
-| Embed Links | Send rich now-playing, queue, search, and radio embeds |
-| Read Message History | Fetch and edit previous now-playing messages |
+|------------|-----|
+| View Channel | See the channel and read commands |
+| Send Messages | Post the player card and replies |
+| Manage Messages | Delete commands sent outside the channel set with `!settc` |
+| Embed Links | Show search results and the radio browser |
+| Read Message History | Discord requires it before the bot can add a reaction (the `!tts` confirmation) |
+| Add Reactions | Confirm a `!tts` message with a speaker reaction. Without it, the bot posts a short message instead. It only matters when text-to-speech is on |
 
-**Voice Channel**
+In voice channels:
 
 | Permission | Why |
-|---|---|
-| Connect | Join the voice channel the user is in |
-| Speak | Stream audio to the channel |
-| Use Voice Activity | Required for audio transmission |
+|------------|-----|
+| Connect | Join your voice channel |
+| Speak | Play audio |
+| Use Voice Activity | Send audio without push-to-talk |
 
-### OAuth2 Invite Scopes
+Text-to-speech needs no extra voice permission. It plays through the same voice connection as the music.
 
-Select both scopes when generating your invite URL:
+### Invite scopes
 
-- `bot` — grants the permissions above
-- `applications.commands` — registers slash commands (`/play`, `/search`, etc.)
+Pick both scopes when you make the invite link:
 
-### Privileged Gateway Intents
+- `bot`, for the permissions above
+- `applications.commands`, for the slash commands
 
-Enable these in the [Discord Developer Portal](https://discord.com/developers/applications) under your application → **Bot → Privileged Gateway Intents**:
+### Privileged intents
 
-| Intent | Why |
-|---|---|
-| **Message Content** | Required — lets the bot read prefix commands (`!play`, `!skip`, etc.) |
-| **Server Members** | Recommended — needed for accurate voice-channel member counts (fair-play vote thresholds and auto-leave) |
+In the [Discord Developer Portal](https://discord.com/developers/applications), open your application, go to the Bot page and turn on Message Content under Privileged Gateway Intents. The bot reads commands like `!play` from message text, and Discord won't let it log in without this intent.
 
-> **Note:** Without Server Members intent, the bot cannot reliably count how many users are in a voice channel, which breaks `!fairness` vote thresholds and may cause premature auto-leave.
-
-## Requirements
-
-- Python 3.11+
-- ffmpeg
-- Deno (for YouTube signature solving)
-- Discord bot with privileged intents enabled (see [Bot Permissions](#bot-permissions) above)
+The bot doesn't ask for the Server Members or Presence intents, so it doesn't need them.

@@ -148,17 +148,29 @@ class TestAbortedStartLeavesNothingRunning(unittest.TestCase):
             player = audio_player.AudioPlayer({"audio": {"sample_rate": 48000, "channels": 2},
                                                "youtube": {"client": "web"}})
         player._voice_client = voice
+        if harness.stop_at == "gap":
+            # A clip waits for the song change, so the start parks until it has been spoken
+            # (the fake voice never finishes it): the last await before voice_client.play().
+            player.speech.queue_after(FRAME * 3)
+            real_wait_for_gap = player.speech.wait_for_gap
+
+            async def wait_for_gap(gen):
+                harness.entered.set()
+                await real_wait_for_gap(gen)
+
+            player.speech.wait_for_gap = wait_for_gap
         outcome = {}
 
         async def scenario():
             task = asyncio.ensure_future(player.play("q", prefetched_info=dict(INFO)))
-            if cancel:
+            if cancel or while_parked:
                 parked = await asyncio.get_running_loop().run_in_executor(
                     None, harness.entered.wait, 5)
                 self.assertTrue(parked, f"play() never reached {harness.stop_at!r}")
                 if while_parked:
                     while_parked(player)
-                task.cancel()
+                if cancel:
+                    task.cancel()
             try:
                 outcome["result"] = await task
             except BaseException as e:
@@ -185,7 +197,7 @@ class TestAbortedStartLeavesNothingRunning(unittest.TestCase):
         self.assertIsNone(player._ytdlp_proc, "a dead stream must not stay tracked")
 
     def test_cancelled_at_each_build_stage(self):
-        for stage in ("open", "ffmpeg", "first_frame", "prefill"):
+        for stage in ("open", "ffmpeg", "first_frame", "prefill", "gap"):
             with self.subTest(stage=stage):
                 harness = _Harness(stop_at=stage)
                 player, outcome = self._start(harness, _FakeVoice(), cancel=True)
@@ -206,7 +218,7 @@ class TestAbortedStartLeavesNothingRunning(unittest.TestCase):
         player, outcome = self._start(harness, voice, cancel=False)
         self.addCleanup(lambda: [b.cleanup() for b in harness.buffers])
         self.assertEqual(outcome.get("result", {}).get("title"), "T", outcome)
-        self.assertIs(voice.played, harness.buffers[0])
+        self.assertIs(voice.played.music, harness.buffers[0])
         self.assertIs(player._ytdlp_proc, harness.procs[0])
         self.assertFalse(harness.procs[0].terminated.is_set())
         self.assertFalse(harness.ffmpegs[0].cleaned.is_set())
@@ -220,7 +232,7 @@ class TestAbortedStartLeavesNothingRunning(unittest.TestCase):
 
     def test_an_abandoned_start_leaves_the_player_idle(self):
         """The prefill and voice_client.play() come after play() flags its track as playing."""
-        for stage in ("open", "ffmpeg", "first_frame", "prefill"):
+        for stage in ("open", "ffmpeg", "first_frame", "prefill", "gap"):
             with self.subTest(stage=stage):
                 player, outcome = self._start(_Harness(stop_at=stage), _FakeVoice(), cancel=True)
                 self.assertIsInstance(outcome.get("error"), asyncio.CancelledError)
@@ -230,6 +242,17 @@ class TestAbortedStartLeavesNothingRunning(unittest.TestCase):
             player, outcome = self._start(_Harness(), voice, cancel=False)
             self.assertIsInstance(outcome.get("error"), discord.ClientException)
             self._assert_player_idle(player)
+
+    def test_a_stop_during_the_gap_ends_the_start(self):
+        """!stop, ■ or a leave while the song waits out the gap speech. The stop's cut ends the
+        wait, and the start must then give up as a cancelled one does, not take the voice client."""
+        harness, voice = _Harness(stop_at="gap"), _FakeVoice()
+        player, outcome = self._start(harness, voice, cancel=False,
+                                      while_parked=lambda p: p.stop_playback())
+        self.assertIsInstance(outcome.get("error"), asyncio.CancelledError, outcome)
+        self.assertIsNone(voice.played.music, "the song reached the voice client after the stop")
+        self._assert_nothing_left_running(harness, player)
+        self._assert_player_idle(player)
 
     def test_a_newer_start_keeps_its_playback_state(self):
         """The skip that cancelled this start has already started its own track."""

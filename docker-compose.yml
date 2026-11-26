@@ -1,7 +1,11 @@
 version: "3.8"
 services:
   music-bot:
-    build: .
+    # WITH_TTS=true in .env includes the edge-tts package; tts.enabled in config.yaml turns the feature on.
+    build:
+      context: .
+      args:
+        WITH_TTS: ${WITH_TTS:-false}
     restart: unless-stopped
     volumes:
       - ./config.yaml:/app/config.yaml:ro

@@ -1,0 +1,1 @@
+edge-tts>=7.3.1  # optional: text-to-speech (!tts). Install with pip install -r requirements-tts.txt
