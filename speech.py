@@ -202,23 +202,28 @@ class Speech:
 
     def cut(self, drop_after_song: bool = False) -> None:
         """Silence all speech now. The after-song list survives unless drop_after_song."""
+        self._held.clear()
+        if self._mixer is not None:
+            self._mixer.clear_speech()
+            if not _busy(self._player._voice_client):
+                self._mixer = None  # its song was stopped
+        self.skip_gap()
+        if drop_after_song:
+            self._after_song.clear()
+
+    def skip_gap(self) -> None:
+        """End the speech that plays alone: the update being fetched, the solo and the clips
+        queued behind it. A song waiting for the gap then starts at once. Clips held for that
+        song and the after-song list stay. !skip and ► call this during the gap."""
         if self._update_task is not None:
             self._update_task.cancel()
             self._update_task = None
-        self._held.clear()
         self._backlog.clear()
-        vc = self._player._voice_client
-        busy = _busy(vc)
-        if self._mixer is not None:
-            self._mixer.clear_speech()
-            if not busy:
-                self._mixer = None  # its song was stopped
         if self._solo is not None:
-            if busy:
+            vc = self._player._voice_client
+            if _busy(vc):
                 vc.stop()
             self._retire_solo()  # a clip sent right after this starts a new solo
-        if drop_after_song:
-            self._after_song.clear()
 
     def stop(self) -> None:
         """An explicit stop: forget the start the gap is for, then silence all speech. The cut

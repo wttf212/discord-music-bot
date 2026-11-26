@@ -1048,7 +1048,7 @@ class _ControlsRow(discord.ui.ActionRow):
             return
         speech = _speech(gs)
         if speech and speech.in_gap:
-            speech.cut()  # only the speech; the next song starts right away
+            speech.skip_gap()  # only the speech; the next song starts right away
             await _respond(interaction, "Skipped the announcement.")
             return
         if gs.auto_next_task and not gs.auto_next_task.done():
@@ -2865,7 +2865,7 @@ class MusicCog(commands.Cog):
             return
         speech = _speech(gs)
         if speech and speech.in_gap:
-            speech.cut()  # only the speech; the next song starts right away
+            speech.skip_gap()  # only the speech; the next song starts right away
             await ctx.send("Skipped the announcement.", delete_after=3)
             return
         # Cancel the existing auto-next task and invalidate its generation

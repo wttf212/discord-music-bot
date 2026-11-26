@@ -439,6 +439,42 @@ class TestStopDuringGapSpeech(unittest.TestCase):
                 self._stop_during_the_gap(holder, stopper)
 
 
+class TestSkipDuringGapSpeech(unittest.TestCase):
+    """!skip or ► during the gap skips only the speech: the song the chain waits to start plays
+    at once, the rest of the queue stays and the chain keeps its generation. A !tts sent during
+    the gap was held for that song, and still plays over its start."""
+
+    def test_skip_or_next_starts_the_waiting_song(self):
+        for how in ("!skip", "►"):
+            with self.subTest(how=how):
+                g, out = _Guild(self, tracks=("b", "c")), {}
+
+                async def scenario():
+                    g.watch_the_gap()
+                    g.player.speech.queue_after(CLIP)        # a waiting !ttsafter clip
+                    chain = g.advance("chain")               # pops b; its start waits out the clip
+                    gen = g.gs.auto_next_gen
+                    await asyncio.wait_for(g.parked.wait(), 5)
+                    out["!tts"] = await g.player.speech.say(CLIP)
+                    await g.advance(how)
+                    for _ in range(100):
+                        if g.songs_played():
+                            break
+                        await asyncio.sleep(0.01)
+                    out["same chain"] = g.gs.auto_next_task is chain and g.gs.auto_next_gen == gen
+                    out["clips over the song"] = g.voice.source.pending_clips() if g.voice.source else None
+                    chain.cancel()
+
+                with g.harness.patched(), _patched_commands():
+                    asyncio.run(scenario())
+                self.assertEqual(out["!tts"], "held")
+                self.assertEqual(g.songs_played(), [0], "the waiting song did not start")
+                self.assertEqual(out["clips over the song"], 1, "the !tts held for the song was dropped")
+                self.assertEqual([t.query for t in g.gs.queue.list()], ["c"])
+                self.assertTrue(out["same chain"], "the skip disarmed or replaced the chain")
+                self.assertTrue(any("announcement" in (m or "") for m in g.sent), g.sent)
+
+
 class TestNewerStartDuringGapSpeech(unittest.TestCase):
     """!skip waits out the gap speech for b, and a newer start comes meanwhile: ◄, !skipto or a
     radio station. The newer start's stop ends the speech and releases b's start, which must

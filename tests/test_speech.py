@@ -385,6 +385,23 @@ class TestCutAndReset(unittest.TestCase):
             self.assertEqual(sp.waiting_clips(), 0)
         _run(go())
 
+    def test_skip_gap_ends_only_the_gap_speech(self):
+        async def go():
+            vc, _, sp = _setup()
+            sp.queue_after(_clip(1))
+            sp.song_change(1)                         # the after-song clip plays alone
+            self.assertEqual(await sp.say(_clip(2)), "held")
+            sp.queue_after(_clip(3))                  # for the next song change
+            waiter = asyncio.ensure_future(sp.wait_for_gap(1))
+            await _settle()
+            sp.skip_gap()
+            await asyncio.wait_for(waiter, 1)         # the waiting song may start now
+            self.assertEqual(vc.stops, 1)
+            self.assertTrue(sp.is_current(1))
+            self.assertEqual(sp.wrap(_Music(5), 1).pending_clips(), 1, "the held clip was dropped")
+            self.assertEqual(len(sp._after_song), 1, "the after-song clip was dropped")
+        _run(go())
+
     def test_clip_after_a_stopped_song_plays_alone(self):
         async def go():
             vc, _, sp = _setup()

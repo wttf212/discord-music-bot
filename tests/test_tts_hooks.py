@@ -11,6 +11,7 @@ class _FakeSpeech:
     def __init__(self, in_gap=False):
         self.in_gap = in_gap
         self.cut = MagicMock()
+        self.skip_gap = MagicMock()
         self.end_of_queue = AsyncMock()
 
 
@@ -27,7 +28,8 @@ class TestSpeechHooks(_Harness):
             with self.subTest(handler=handler):
                 player, gs = _setup(in_gap=True, queued=("g1",))
                 sent = self._run(handler, gs)
-                player.speech.cut.assert_called_once_with()
+                player.speech.skip_gap.assert_called_once_with()
+                player.speech.cut.assert_not_called()   # that would drop the clips held for the song
                 self.assertEqual(player.calls, [])
                 self.assertEqual([t.query for t in gs.queue], ["g1"])
                 self.assertTrue(any("announcement" in (m or "") for m in sent))
@@ -37,6 +39,7 @@ class TestSpeechHooks(_Harness):
         self._run("skip", gs)
         self.assertEqual(player.calls, ["g1"])
         player.speech.cut.assert_not_called()
+        player.speech.skip_gap.assert_not_called()
 
     def test_skip_or_next_with_an_empty_queue_speaks_waiting_speech(self):
         for handler in ("skip", "next"):
