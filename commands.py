@@ -3236,6 +3236,15 @@ class MusicCog(commands.Cog):
             return
         try:
             info = await gs.player.play(next_track.query, next_track.resolved_info, next_track.resolved_at)
+        except asyncio.CancelledError:
+            # Overtaken by a stop or a newer start, which needs no word from here. A deferred
+            # slash command would stay on "is thinking…", so its reply is deleted instead.
+            if ctx.interaction:
+                try:
+                    await ctx.interaction.delete_original_response()
+                except Exception:
+                    pass
+            raise
         except Exception as e:
             print(f"[commands] Manual advance failed (guild {ctx.guild.id}): {e}")
             if not _recover_manual_advance(self.bot, gs, ctx.guild.id, channel_id, next_track, e):

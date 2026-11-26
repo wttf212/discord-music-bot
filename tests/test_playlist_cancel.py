@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import commands
 from test_playlist_start import CHANNEL_ID, FIRST, PLAYLIST, RESOLVED, _Bot, _Player, _VC, _view
+from test_slash_ack import _Bot as _SlashBot, _Ctx as _SlashCtx, _Interaction, _guild_state
+from test_slash_ack import _Player as _SlashPlayer
 from track_queue import TrackQueue
 
 
@@ -215,6 +217,48 @@ class TestOvertakenStartsClearTheirLoadingMessage(unittest.TestCase):
         self.assertEqual(status.edits, [], "an overtaken start is no error")
         self.send_new_np.assert_not_awaited()
         self.start_auto_next.assert_not_called()
+
+
+class _DeferredInteraction(_Interaction):
+    """A slash command's interaction whose deferred "is thinking…" reply can be deleted."""
+
+    def __init__(self):
+        super().__init__()
+        self.reply_deleted = False
+
+    async def delete_original_response(self):
+        self.reply_deleted = True
+
+
+class TestOvertakenSkipto(unittest.TestCase):
+    """/skipto defers first, so a slash /skipto shows "is thinking…" until answered. An
+    overtaken start has nothing to say, so that reply is deleted instead."""
+
+    def setUp(self):
+        self.start_auto_next = MagicMock()
+        for p in (patch.object(commands, "check_channel", AsyncMock(return_value=True)),
+                  patch.object(commands, "_live_voice_client", return_value=object()),
+                  patch.object(commands, "build_player_view", return_value=None),
+                  patch.object(commands, "send_new_np", AsyncMock()),
+                  patch.object(commands, "_start_auto_next", self.start_auto_next)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_an_overtaken_skipto_drops_its_thinking_reply(self):
+        for slash in (True, False):
+            with self.subTest(slash=slash):
+                gs = _guild_state(_SlashPlayer(error=asyncio.CancelledError()))
+                it = _DeferredInteraction() if slash else None
+                ctx = _SlashCtx(_SlashBot(gs), it)
+                with self.assertRaises(asyncio.CancelledError):
+                    asyncio.run(commands.MusicCog.skipto.callback(
+                        SimpleNamespace(bot=ctx.bot), ctx, 2))
+                self.assertEqual(ctx.channel_sent, [], "an overtaken start is no error")
+                if slash:
+                    self.assertTrue(it.acked)
+                    self.assertTrue(it.reply_deleted, "the slash /skipto stayed on 'is thinking…'")
+                    self.assertEqual(it.replies, [], "an overtaken start is no error")
+        self.start_auto_next.assert_not_called()   # the stop or the newer start owns auto-play
 
 
 if __name__ == "__main__":
