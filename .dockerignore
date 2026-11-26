@@ -4,9 +4,11 @@ __pycache__/
 *.pyo
 *.egg-info/
 
-# Secrets and local config
+# Secrets and local config (.env holds the bot token; cookies.txt is mounted, never baked in)
 config.yaml
 guild_settings.json
+.env
+cookies.txt
 
 # Platform binaries (Dockerfile downloads the correct Linux binary)
 bgutil-pot.exe
