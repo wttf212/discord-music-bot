@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import commands
+import commands, speech
 from test_manual_dead_track import CHANNEL_ID, _Bot, _Harness, _Player, _VC, _guild_state
 from test_player_speech import CLIP, _player
 from track_queue import TrackQueue
@@ -17,6 +17,14 @@ class _FakeSpeech:
         self.cut = MagicMock()
         self.skip_gap = MagicMock()
         self.end_of_queue = AsyncMock()
+
+
+class _RecordingVC(_VC):
+    def __init__(self):
+        self.plays = []
+
+    def play(self, source, after=None, **encoder_settings):
+        self.plays.append(source)
 
 
 def _setup(in_gap, queued):
@@ -57,6 +65,22 @@ class TestSpeechHooks(_Harness):
         asyncio.run(commands._auto_next(_Bot(gs), CHANNEL_ID, 1, gs.auto_next_gen))
         player.speech.end_of_queue.assert_awaited_once()
         commands.update_np_stopped.assert_awaited()
+
+    def test_tts_off_players_have_nothing_to_say_when_the_queue_runs_out(self):
+        # With text-to-speech off every player still has a real Speech, with no update provider.
+        for path in ("skip", "next", "chain"):
+            with self.subTest(path=path):
+                commands.update_np_stopped.reset_mock()
+                player = _Player()
+                player._voice_client = vc = _RecordingVC()
+                player.speech = speech.Speech(player)
+                gs = _guild_state(player, "off", current="p")
+                if path == "chain":
+                    asyncio.run(commands._auto_next(_Bot(gs), CHANNEL_ID, 1, gs.auto_next_gen))
+                else:
+                    self._run(path, gs)
+                commands.update_np_stopped.assert_awaited_once()
+                self.assertEqual(vc.plays, [], "something reached the voice client")
 
     def test_players_without_speech_are_untouched(self):
         player = _Player()

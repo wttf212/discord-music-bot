@@ -300,6 +300,19 @@ class TestAdmin(_Base):
         self.assertFalse(guild_settings.get_tts_allowed("1"))
         self.assertEqual(env.speech.cuts, [True])
 
+    def test_only_admins_change_the_settings(self):
+        # The real admin check, not a stand-in: the author is neither the owner nor a bot admin.
+        for name, value, read in (("ttslang", "en", guild_settings.get_tts_language),
+                                  ("announce", "on", guild_settings.get_announce),
+                                  ("ttsallow", "off", guild_settings.get_tts_allowed)):
+            with self.subTest(command=name):
+                env = _Env()
+                env.cog = tts_commands.TtsCog(env.bot)
+                before = read("1")
+                self.assertIn("requires bot admin", env.run(name, value))
+                self.assertEqual(read("1"), before)
+                self.assertEqual(env.speech.cuts, [])
+
     def test_ttsallow_says_what_it_switches(self):
         # It allows or blocks !tts and !ttsafter; the half-hourly update has its own switch.
         self.assertIn("`!tts` and `!ttsafter` are **allowed** on this server", _Env().run("ttsallow"))
