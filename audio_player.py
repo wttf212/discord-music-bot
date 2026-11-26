@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import functools
+import io
 import math
 import queue
 import random
@@ -1436,6 +1437,26 @@ class StreamFailedError(RuntimeError):
     whatever the stream's stderr happened to say."""
 
 
+class _PipeReader(io.BufferedReader):
+    """The read end of the stream reader's pipe, which reads as ended once it is closed.
+
+    discord.py's popen-stdin-writer thread calls ``source.read()`` outside any try. A stop
+    closes this pipe (see terminate()), and when that lands before the thread's first read,
+    the ValueError of a closed file kills the thread without closing FFmpeg's stdin. FFmpeg
+    never sees EOF, and whoever waits on its first frame waits for good, holding a
+    stream-pool worker. Reading as ended, the thread closes FFmpeg's stdin as it does at the
+    end of any stream.
+    """
+
+    def read(self, size=-1):
+        try:
+            return super().read(size)
+        except ValueError:
+            if self.closed:
+                return b""
+            raise
+
+
 class _CurlStreamReader:
     """Streams a progressive CDN URL into a pipe FFmpeg can read.
 
@@ -1485,7 +1506,7 @@ class _CurlStreamReader:
             raise _StreamStartError(self.error_text or "CDN refused the stream URL")
 
         self._rfd, self._wfd = os.pipe()
-        self.stdout = os.fdopen(self._rfd, "rb")
+        self.stdout = _PipeReader(io.FileIO(self._rfd, "rb"))
         self._thread = threading.Thread(target=self._pump, args=(first,), daemon=True,
                                         name="curl-cdn-reader")
         self._thread.start()
