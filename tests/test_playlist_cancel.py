@@ -91,5 +91,74 @@ class TestOvertakenPlaylistStart(unittest.TestCase):
         self.start_auto_next.assert_not_called()
 
 
+class _Message:
+    """A message the bot sent: records its edits and whether it was deleted."""
+
+    def __init__(self):
+        self.edits = []
+        self.deleted = False
+
+    async def edit(self, content=None, **kwargs):
+        self.edits.append(content)
+
+    async def delete(self):
+        self.deleted = True
+
+
+class _OvertakenRadioPlayer:
+    def __init__(self, vc):
+        self._voice_client = vc
+        self.is_playing = False
+        self.stations = []
+
+    async def play_radio(self, track):
+        self.stations.append(track.url)
+        raise asyncio.CancelledError
+
+
+class TestOvertakenPickerStarts(unittest.TestCase):
+    """The pickers show "Loading…" once a choice is made, and stop their view, so its timeout
+    never clears them. An overtaken start must not leave them like that."""
+
+    def setUp(self):
+        self.send_new_np = AsyncMock()
+        self.start_auto_next = MagicMock()
+        for p in (patch.object(commands, "build_player_view", MagicMock(side_effect=_view)),
+                  patch.object(commands, "send_new_np", self.send_new_np),
+                  patch.object(commands, "_start_auto_next", self.start_auto_next)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def _guild(player):
+        gs = SimpleNamespace(queue=TrackQueue(), player=player, auto_next_task=None,
+                             auto_next_gen=1)
+        vc = player._voice_client
+        bot = _Bot(gs, SimpleNamespace(id=1, voice_client=vc))
+        ctx = SimpleNamespace(bot=bot, guild=SimpleNamespace(id=1, voice_client=vc),
+                              author=SimpleNamespace(id=42, voice=SimpleNamespace(channel=vc.channel)),
+                              channel=SimpleNamespace(id=CHANNEL_ID))
+        return bot, ctx
+
+    def test_an_overtaken_radio_start_clears_its_picker(self):
+        station = {"name": "Station", "url_resolved": "https://radio.example/stream"}
+
+        async def scenario():
+            player = _OvertakenRadioPlayer(_VC(True))
+            bot, ctx = self._guild(player)
+            picker = _Message()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(
+                    commands._play_radio_selected(bot, ctx, station, picker), timeout=5)
+            return player, picker
+
+        player, picker = asyncio.run(scenario())
+        self.assertEqual(player.stations, [station["url_resolved"]])
+        self.assertTrue(picker.deleted, "the radio picker stayed on 'Loading…'")
+        self.assertEqual(picker.edits, [], "an overtaken start is no error")
+        self.send_new_np.assert_not_awaited()
+        self.start_auto_next.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

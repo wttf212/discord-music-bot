@@ -661,6 +661,11 @@ async def _play_radio_selected(bot, ctx: commands.Context, station: dict,
         await picker_msg.delete()
         await send_new_np(bot, channel_id, view)
         _start_auto_next(bot, channel_id, ctx.guild.id)
+    except asyncio.CancelledError:
+        # A stop or a newer start overtook this one. That is no error, but the picker must
+        # not stay on "Loading…": its view is stopped, so nothing else would clear it.
+        await _safe_delete(picker_msg)
+        raise
     except Exception as e:
         await picker_msg.edit(
             content=f"Error starting radio: {e}",
