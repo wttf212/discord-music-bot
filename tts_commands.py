@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import discord
 from discord import app_commands
 from discord.ext import commands
 
@@ -179,7 +180,7 @@ async def _tts_flow(cog, ctx, text: str | None, after: bool) -> None:
 
     if ctx.interaction:
         note = {"after": " *(after this song)*", "paused": " *(when playback resumes)*"}.get(where, "")
-        await ctx.send(f"🔊 {text}{note}")
+        await ctx.send(f"🔊 {text}{note}", allowed_mentions=discord.AllowedMentions.none())
         return
     try:
         await ctx.message.add_reaction("🔊")
@@ -203,7 +204,8 @@ async def _announce_text(bot, ctx, gid: str, text: str | None) -> None:
     if not text:
         current = get_announce_text(gid)
         await ctx.send(f"Update text: {current}\n{usage}" if current
-                       else f"The built-in update text is in use.\n{usage}")
+                       else f"The built-in update text is in use.\n{usage}",
+                       allowed_mentions=discord.AllowedMentions.none())
         return
     if text.lower() == "reset":
         set_announce_text(gid, None)
@@ -218,7 +220,8 @@ async def _announce_text(bot, ctx, gid: str, text: str | None) -> None:
     set_announce_text(gid, text)
     now_local = datetime.now(ZoneInfo(get_timezone(gid)))
     example = tts.fill_announcement(text, now_local, len(bot.get_guild_state(ctx.guild.id).queue))
-    await ctx.send(f'Update text set. It will sound like: "{example}"')
+    await ctx.send(f'Update text set. It will sound like: "{example}"',
+                   allowed_mentions=discord.AllowedMentions.none())
 
 
 class TtsCog(commands.Cog):

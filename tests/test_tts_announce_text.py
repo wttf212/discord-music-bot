@@ -2,12 +2,13 @@
 import asyncio, sys, os, unittest
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import discord
 import commands, guild_settings, tts, tts_commands
 from track_queue import Track
 from test_tts_commands import _Env, _Base, CLIP
@@ -126,6 +127,33 @@ class TestCommand(_Base):
         env.cog = tts_commands.TtsCog(env.bot)
         self.assertIn("requires bot admin", env.run("announce", "text", text="hi"))
         self.assertIsNone(guild_settings.get_announce_text("1"))
+
+
+class TestNoPings(_Base):
+    def _mentions(self, env):
+        return [c.kwargs.get("allowed_mentions") for c in env.ctx.send.await_args_list]
+
+    def test_set_and_show_replies_never_ping(self):
+        text = "@everyone @here <@&5> <@42>"
+        env = _Env()
+        env.run("announce", "text", text=text)
+        self.assertEqual(guild_settings.get_announce_text("1"), text)
+        env.run("announce", "text")
+        self.assertEqual(len(env.ctx.send.await_args_list), 2)
+        for allowed in self._mentions(env):
+            self.assertIsInstance(allowed, discord.AllowedMentions)
+            self.assertFalse(allowed.everyone or allowed.users or allowed.roles)
+
+    def test_slash_tts_reply_never_pings(self):
+        env = _Env()
+        env.ctx.interaction = SimpleNamespace()
+        env.ctx.defer = AsyncMock()
+        env.ctx.guild.get_member = lambda uid: None
+        env.bot.get_user = lambda uid: None
+        env.run("tts", text="hei")
+        allowed = self._mentions(env)[-1]
+        self.assertIsInstance(allowed, discord.AllowedMentions)
+        self.assertFalse(allowed.everyone or allowed.users or allowed.roles)
 
 
 class TestHelp(unittest.TestCase):
