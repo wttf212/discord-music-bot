@@ -235,6 +235,21 @@ class TestGap(unittest.TestCase):
             await asyncio.wait_for(waiter, 1)
         _run(go())
 
+    def test_a_cancel_that_arrives_as_the_speech_ends_is_not_lost(self):
+        # A leave stops playback (which ends the speech) and then cancels the start, in one
+        # tick. Python 3.11's asyncio.wait_for returned normally then, swallowing the cancel.
+        async def go():
+            vc, _, sp = _setup()
+            sp.queue_after(_clip(1))
+            sp.song_change(1)
+            waiter = asyncio.ensure_future(sp.wait_for_gap(1))
+            await _settle()
+            sp.cut()
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+            self.assertTrue(waiter.cancelled(), "the cancel was swallowed")
+        _run(go())
+
     def test_wait_for_gap_gives_up_on_stuck_speech(self):
         async def go():
             vc, _, sp = _setup()

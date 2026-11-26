@@ -260,7 +260,10 @@ class Speech:
             solo, done = self._solo, self._solo_done
             timeout = solo.pending_frames() * 0.02 + GAP_MARGIN  # 20 ms frames
             try:
-                await asyncio.wait_for(done.wait(), timeout)
+                # Not asyncio.wait_for: on Python 3.11 it swallows a cancel that lands in the
+                # same tick as the speech ending, and the start would then play anyway.
+                async with asyncio.timeout(timeout):
+                    await done.wait()
             except asyncio.TimeoutError:
                 if gen == self._gen and self._solo is solo:  # stuck: the song gets the voice client
                     vc = self._player._voice_client
