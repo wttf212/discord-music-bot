@@ -406,6 +406,18 @@ class TestTerminateNeverBlocks(unittest.TestCase):
         reader.wait(timeout=2)   # raises TimeoutExpired if the pump never woke
         self.assertTrue(_wait_until(lambda: reader.stdout.closed), "stdout never closed")
 
+    def test_a_read_after_terminate_is_end_of_file_not_an_error(self):
+        """A stop can close the pipe before discord.py's stdin-writer thread has made its
+        first read. That thread calls source.read() outside any try: a ValueError there
+        kills it without closing FFmpeg's stdin, FFmpeg never sees EOF, and whoever waits
+        on FFmpeg's first frame waits for good. A terminated reader reads as ended."""
+        total = 1 << 20
+        reader, _ = _reader([FakeResponse(200, b"a" * total)], url=GV.format(total))
+        reader.terminate()
+        self.assertTrue(_wait_until(lambda: reader.stdout.closed), "stdout never closed")
+        self.assertEqual(reader.stdout.read(8192), b"")
+        self.assertEqual(reader.stdout.read(), b"")
+
 
 class TestStreamFactory(unittest.TestCase):
 

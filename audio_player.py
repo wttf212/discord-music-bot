@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import functools
+import io
 import math
 import queue
 import random
@@ -1436,6 +1437,26 @@ class StreamFailedError(RuntimeError):
     whatever the stream's stderr happened to say."""
 
 
+class _PipeReader(io.BufferedReader):
+    """The read end of the stream reader's pipe, which reads as ended once it is closed.
+
+    discord.py's popen-stdin-writer thread calls ``source.read()`` outside any try. A stop
+    closes this pipe (see terminate()), and when that lands before the thread's first read,
+    the ValueError of a closed file kills the thread without closing FFmpeg's stdin. FFmpeg
+    never sees EOF, and whoever waits on its first frame waits for good, holding a
+    stream-pool worker. Reading as ended, the thread closes FFmpeg's stdin as it does at the
+    end of any stream.
+    """
+
+    def read(self, size=-1):
+        try:
+            return super().read(size)
+        except ValueError:
+            if self.closed:
+                return b""
+            raise
+
+
 class _CurlStreamReader:
     """Streams a progressive CDN URL into a pipe FFmpeg can read.
 
@@ -1485,7 +1506,7 @@ class _CurlStreamReader:
             raise _StreamStartError(self.error_text or "CDN refused the stream URL")
 
         self._rfd, self._wfd = os.pipe()
-        self.stdout = os.fdopen(self._rfd, "rb")
+        self.stdout = _PipeReader(io.FileIO(self._rfd, "rb"))
         self._thread = threading.Thread(target=self._pump, args=(first,), daemon=True,
                                         name="curl-cdn-reader")
         self._thread.start()
@@ -2218,6 +2239,20 @@ class AudioPlayer:
             self.speech.start_failed(gen)
             raise
 
+    def _give_up_if_overtaken(self, gen: int) -> None:
+        """Abandon a start that a stop or a newer start has overtaken, as a cancelled one is.
+
+        A start awaits the lookup, the stream open, the FFmpeg spawn and the first frame, and
+        a stop or a newer play() can land in any of them. From then on it must change no player
+        state, ask nobody for anything and read nothing: its stream handle would replace the
+        newer start's in _ytdlp_proc, a first frame emptied by the stop would pass for a stale
+        URL (a second lookup, a strike against the fast client), and its track would overwrite
+        the newer one's. play() tears down what it built. Nothing awaits between a call and
+        the state change it guards.
+        """
+        if self._playback_gen != gen or not self.speech.is_current(gen):
+            raise asyncio.CancelledError
+
     async def _start_playback(self, url_or_query: str, prefetched_info: dict | None,
                               prefetched_at: float, built: list) -> dict:
         """play()'s body; appends each pipeline piece to ``built`` as it is created."""
@@ -2277,6 +2312,7 @@ class AudioPlayer:
         fast = True
         # Up to three tries: a stale prefetched URL, the fast client, the configured client.
         for _attempt in range(3):
+            self._give_up_if_overtaken(_gen)   # before a retry asks YouTube again
             used_cache = candidate is not None
             if used_cache:
                 info = candidate
@@ -2287,6 +2323,7 @@ class AudioPlayer:
                     print("[debug][player] Resolving audio URL via in-process yt-dlp")
                 info = await resolve_audio(url_or_query, yt["client"], self._debug,
                                            cookies_file, fast=fast)
+                self._give_up_if_overtaken(_gen)   # before the result costs a stream request
 
             try:
                 proc = await _adopt(built, loop.run_in_executor(
@@ -2301,6 +2338,9 @@ class AudioPlayer:
                 invalidate_resolve_cache(url_or_query)
                 fast = False
                 continue
+            # `proc` is in `built`, so an overtaken start's cleanup discards it. Tracked, it
+            # would replace the newer start's handle, and a stop would never reap that reader.
+            self._give_up_if_overtaken(_gen)
             self._ytdlp_proc = proc  # track immediately so a concurrent stop reaps it
 
             # The stream may fail to open at all (invalid/expired URL). A cached URL that
@@ -2350,6 +2390,9 @@ class AudioPlayer:
             # (the play command hands play() its own fresh lookup as a prefetched result); the
             # URL's age decides whether it counts against the fast client.
             frame = await loop.run_in_executor(_STREAM_EXECUTOR, src.read)
+            # A stop reaps the reader under this read, and so does a newer start's own stop,
+            # so the frame comes back empty: the stop's doing, not a stale URL.
+            self._give_up_if_overtaken(_gen)
             if not frame:
                 refused = _issued_to_fast_client(info.get("client"))
                 if self._debug:
@@ -2425,8 +2468,7 @@ class AudioPlayer:
         # cuts the speech). This start must then never reach voice_client.play(): after a stop
         # the connection is closing, and a newer start needs the client for its own track.
         # It gives up as a cancelled start does; nothing awaits between here and the play().
-        if self._playback_gen != _gen or not self.speech.is_current(_gen):
-            raise asyncio.CancelledError
+        self._give_up_if_overtaken(_gen)
         encoder_settings = self._encoder_settings()
         if self._debug:
             print(f"[debug][player] Opus encoder: signal=music, bitrate={encoder_settings['bitrate']}kbps, FEC=off, PLP=0%, bandwidth=full")
