@@ -168,6 +168,11 @@ class Speech:
     def solo_active(self) -> bool:
         return self._solo is not None
 
+    def is_current(self, gen: int) -> bool:
+        """True while gen is the start the gap is for: a newer start replaces it, and an
+        explicit stop forgets it."""
+        return gen == self._gen
+
     def waiting_clips(self) -> int:
         count = len(self._held) + len(self._backlog) + len(self._after_song)
         for source in (self._mixer, self._solo):
@@ -214,6 +219,13 @@ class Speech:
             self._retire_solo()  # a clip sent right after this starts a new solo
         if drop_after_song:
             self._after_song.clear()
+
+    def stop(self) -> None:
+        """An explicit stop: forget the start the gap is for, then silence all speech. The cut
+        ends that start's wait, and once forgotten it gives up instead of playing."""
+        self._gen = None
+        self._starting = False
+        self.cut()
 
     def reset(self) -> None:
         self.cut(drop_after_song=True)

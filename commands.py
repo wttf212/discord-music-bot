@@ -1091,6 +1091,7 @@ class _ControlsRow(discord.ui.ActionRow):
         if gs.auto_next_task and not gs.auto_next_task.done():
             gs.auto_next_task.cancel()
             gs.auto_next_task = None
+        gs.auto_next_gen += 1  # as !stop does: a chain whose cancel was lost can't rejoin
         gs.player.stop_playback()
         gs.queue.clear()
         await gs.player.disconnect()

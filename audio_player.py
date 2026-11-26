@@ -2419,6 +2419,12 @@ class AudioPlayer:
         await loop.run_in_executor(_STREAM_EXECUTOR, source.prefill)
 
         await self.speech.wait_for_gap(_gen)
+        # A stop or a newer start that came during the gap speech ends that wait too (its stop
+        # cuts the speech). This start must then never reach voice_client.play(): after a stop
+        # the connection is closing, and a newer start needs the client for its own track.
+        # It gives up as a cancelled start does; nothing awaits between here and the play().
+        if self._playback_gen != _gen or not self.speech.is_current(_gen):
+            raise asyncio.CancelledError
         encoder_settings = self._encoder_settings()
         if self._debug:
             print(f"[debug][player] Opus encoder: signal=music, bitrate={encoder_settings['bitrate']}kbps, FEC=off, PLP=0%, bandwidth=full")
@@ -2447,7 +2453,8 @@ class AudioPlayer:
         """Stop current playback and terminate the yt-dlp stream subprocess.
 
         keep_speech is a track start's own stop: speech playing alone keeps the voice
-        client, and the start waits for it. Every other stop cuts all speech.
+        client, and the start waits for it. Every other stop cuts all speech, and a start
+        still waiting out the gap speech then gives up instead of playing.
         """
         if self._debug:
             print(f"[debug][player] stop_playback() called")
@@ -2460,7 +2467,7 @@ class AudioPlayer:
             if self._voice_client and (self._voice_client.is_playing() or self._voice_client.is_paused()):
                 self._voice_client.stop()
         if not keep_speech:
-            self.speech.cut()
+            self.speech.stop()
         # Tear down the audio stream (frees the network connection and CPU).
         # terminate() is instant; the wait()/kill() reap runs on a daemon thread so a
         # slow-dying subprocess never freezes the event loop mid-skip. The local handle
@@ -2497,6 +2504,7 @@ class AudioPlayer:
         self._playback_gen += 1
         _gen = self._playback_gen
         self.stop_playback(keep_speech=True)
+        built: list = []  # as in play(): the FFmpeg this start made, stopped if it never plays
         try:
             self.speech.song_change(_gen)
 
@@ -2514,7 +2522,7 @@ class AudioPlayer:
             #   every subsequent frame with delay=0 — audible as choppy/robotic audio at stream start.
             # Build the FFmpeg source off the event loop — Popen spawn is blocking and
             # would otherwise stall every guild's interactions during a radio start.
-            source = await loop.run_in_executor(
+            source = await _adopt(built, loop.run_in_executor(
                 _STREAM_EXECUTOR,
                 lambda: discord.FFmpegPCMAudio(
                     stream_url,
@@ -2527,7 +2535,7 @@ class AudioPlayer:
                     options="-vn",
                     stderr=subprocess.PIPE,
                 ),
-            )
+            ))
 
             def _log_ffmpeg_stderr(proc):
                 try:
@@ -2569,9 +2577,18 @@ class AudioPlayer:
                 pass
 
             await self.speech.wait_for_gap(_gen)
+            if self._playback_gen != _gen or not self.speech.is_current(_gen):
+                raise asyncio.CancelledError  # overtaken during the gap; see _start_playback
             source = self.speech.wrap(source, _gen)
             self._voice_client.play(source, after=after_playback, **self._encoder_settings())
         except BaseException:
+            # As in play(): stop the FFmpeg, and leave the player idle unless a newer start
+            # owns its state by now. Left flagged as playing, auto-next would wait forever.
+            _discard_pipeline(*built)
+            if self._playback_gen == _gen:
+                self.is_playing = False
+                self.current_track_title = None
+                self._playback_done.set()
             self.speech.start_failed(_gen)
             raise
 
