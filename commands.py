@@ -919,6 +919,11 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
         await picker_msg.delete()
         await send_new_np(bot, channel_id, view)
         _start_auto_next(bot, channel_id, ctx.guild.id)
+    except asyncio.CancelledError:
+        # Overtaken by a stop or a newer start: no error, but don't leave the picker on
+        # "Loading…" (see _play_radio_selected).
+        await _safe_delete(picker_msg)
+        raise
     except Exception as e:
         await picker_msg.edit(
             content=f"Error playing track: {e}",

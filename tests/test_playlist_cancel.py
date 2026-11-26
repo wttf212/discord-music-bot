@@ -159,6 +159,29 @@ class TestOvertakenPickerStarts(unittest.TestCase):
         self.send_new_np.assert_not_awaited()
         self.start_auto_next.assert_not_called()
 
+    def test_an_overtaken_search_pick_clears_its_picker(self):
+        async def scenario():
+            events = []
+            player = _OvertakenPlayer(events, _VC(True))
+            bot, ctx = self._guild(player)
+            picker = _Message()
+
+            async def resolve(*args, **kwargs):
+                return dict(RESOLVED)
+
+            with patch.object(commands, "resolve_audio", resolve):
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(commands._play_selected(
+                        bot, ctx, {"url": FIRST, "title": "First song"}, picker), timeout=5)
+            return events, picker
+
+        events, picker = asyncio.run(scenario())
+        self.assertEqual(events, ["play"])
+        self.assertTrue(picker.deleted, "the search picker stayed on 'Loading…'")
+        self.assertEqual(picker.edits, [], "an overtaken start is no error")
+        self.send_new_np.assert_not_awaited()
+        self.start_auto_next.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
