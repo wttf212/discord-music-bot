@@ -303,6 +303,26 @@ class TestPlaySlash(_Patched):
         it = self._play(self.LINK, _Player(error=RuntimeError("voice went away")))
         self.assertEqual(it.replies, [("Error playing track: voice went away", False)])
 
+    def test_an_interrupted_start_drops_its_thinking_reply(self):
+        """A stop or a newer start can overtake this one while it loads, and play() then
+        gives up as cancelled. That is no error, but "is thinking…" must still go."""
+        it = _Interaction()
+        with self.assertRaises(asyncio.CancelledError):
+            self._play(self.LINK, _Player(error=asyncio.CancelledError()), it=it)
+        self.assertFalse(it.thinking, "the interrupted /play stayed on 'is thinking…'")
+        self.assertEqual(it.replies, [])                # no error line for an overtaken start
+        self.start_auto_next.assert_not_called()        # the stop or the newer start owns auto-play
+
+    def test_a_failed_delete_still_ends_as_cancelled(self):
+        """The delete can fail, also with the HTTP session already closed at shutdown. The
+        start must still end as cancelled, not as that error."""
+        for error in (_dead_token(), RuntimeError("Session is closed")):
+            with self.subTest(error=type(error).__name__):
+                it = _Interaction()
+                it.delete_original_response = AsyncMock(side_effect=error)
+                with self.assertRaises(asyncio.CancelledError):
+                    self._play(self.LINK, _Player(error=asyncio.CancelledError()), it=it)
+
 
 class TestRestrictedChannel(_Patched):
 

@@ -2721,6 +2721,16 @@ class MusicCog(commands.Cog):
             # Edit the loading card in place rather than sending a second message.
             await update_np_embed(self.bot, channel_id, view)
             _start_auto_next(self.bot, channel_id, ctx.guild.id)
+        except asyncio.CancelledError:
+            # Overtaken by a stop or a newer start, which needs no word from here (as in
+            # /skipto). A slash command would stay on "is thinking…", so its reply is
+            # deleted instead.
+            if ctx.interaction:
+                try:
+                    await ctx.interaction.delete_original_response()
+                except Exception:
+                    pass
+            raise
         except Exception as e:
             await _fail(f"Error playing track: {e}")
             return
