@@ -284,7 +284,9 @@ class TestPlaylistStartsLikeASingleTrack(unittest.TestCase):
             # A start that played anyway would await the never-ending list: fail, don't hang.
             await asyncio.wait_for(self._play(bot, ctx, resolve, enumerate_), timeout=5)
             await asyncio.sleep(0)              # let the cancellation land
-            return bot, cancelled
+            # A copy taken now: on exit asyncio.run cancels whatever is left, which would
+            # fill the list even if the start never cancelled the enumeration.
+            return bot, list(cancelled)
 
         bot, cancelled = asyncio.run(scenario())
         self.assertNotIn("play", self.events)

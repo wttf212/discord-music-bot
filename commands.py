@@ -2723,6 +2723,16 @@ class MusicCog(commands.Cog):
             _start_auto_next(self.bot, channel_id, ctx.guild.id)
         except Exception as e:
             await _fail(f"Error playing track: {e}")
+            return
+
+        if ctx.interaction:
+            # The card is this command's answer. Delete the deferred "is thinking…" reply,
+            # which Discord otherwise ends as "The application did not respond". Not before
+            # play() has succeeded: until then, a failed start's error takes its place.
+            try:
+                await ctx.interaction.delete_original_response()
+            except discord.HTTPException:
+                pass
 
     @commands.hybrid_command(name="radio", description="Browse or search internet radio stations")
     @app_commands.describe(query="Station name to search, or leave blank to browse by country/genre")
