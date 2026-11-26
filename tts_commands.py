@@ -252,7 +252,7 @@ class TtsCog(commands.Cog):
         set_announce(gid, on)
         await ctx.send(f"Half-hourly updates turned **{'on' if on else 'off'}**.")
 
-    @commands.hybrid_command(name="ttsallow", description="Turn text-to-speech on or off for this server")
+    @commands.hybrid_command(name="ttsallow", description="Allow or block !tts and !ttsafter on this server")
     @app_commands.describe(state="on or off")
     async def ttsallow(self, ctx: commands.Context, state: str = None):
         if not await check_channel(ctx):
@@ -262,13 +262,15 @@ class TtsCog(commands.Cog):
         if not await self._check_admin(ctx):
             return
         gid = str(ctx.guild.id)
+        p = self.bot.command_prefix
         on = _on_off(state)
         if on is None:  # nothing, or not on/off: show the current value
-            current = "on" if get_tts_allowed(gid) else "off"
-            await ctx.send(f"Text-to-speech is **{current}** on this server. "
-                           f"Usage: `{self.bot.command_prefix}ttsallow on|off`")
+            current = "allowed" if get_tts_allowed(gid) else "blocked"
+            await ctx.send(f"`{p}tts` and `{p}ttsafter` are **{current}** on this server. "
+                           f"Usage: `{p}ttsallow on|off`")
             return
         set_tts_allowed(gid, on)
         if not on:  # also silence what is playing and drop every waiting clip
             _speech(self.bot.get_guild_state(ctx.guild.id)).cut(drop_after_song=True)
-        await ctx.send(f"Text-to-speech turned **{'on' if on else 'off'}** for this server.")
+        await ctx.send(f"`{p}tts` and `{p}ttsafter` are now **{'allowed' if on else 'blocked'}** "
+                       f"on this server.")

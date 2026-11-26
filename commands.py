@@ -3593,7 +3593,7 @@ class MusicCog(commands.Cog):
                 f"`{p}ttsafter <text>` — Say something after the current song\n"
                 f"`{p}ttslang lv|en` — Speech language for this server *(admin only)*\n"
                 f"`{p}announce on|off` — Say the time and songs left every half hour, between songs *(admin only)*\n"
-                f"`{p}ttsallow on|off` — Turn text-to-speech on or off for this server *(admin only)*\n"
+                f"`{p}ttsallow on|off` — Allow or block `{p}tts` and `{p}ttsafter` on this server *(admin only)*\n"
             )
         text = (
             f"**Available commands:**\n"

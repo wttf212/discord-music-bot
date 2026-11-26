@@ -189,10 +189,10 @@ It needs no account or key. The voices are Microsoft Edge's online ones, so the 
 | `!ttsafter <text>` | Say something after the current song |
 | `!ttslang lv\|en` | Speech language for this server *(admin only)* |
 | `!announce on\|off` | Say the time and songs left every half hour, between songs *(admin only)* |
-| `!ttsallow on\|off` | Turn text-to-speech on or off for this server *(admin only)* |
+| `!ttsallow on\|off` | Allow or block `!tts` and `!ttsafter` on this server *(admin only)* |
 
 - Speech is in Latvian until an admin switches the server to English with `!ttslang en`.
-- Text-to-speech works on every server until an admin turns it off there with `!ttsallow off`.
+- `!tts` and `!ttsafter` work on every server until an admin blocks them there with `!ttsallow off`. The half-hourly update has its own switch, `!announce`.
 - The half-hourly update is off until an admin runs `!announce on`. It uses the server's timezone from `!settimezone`.
 - A message can be up to 300 characters. Each person can send one every 10 seconds, and up to 5 can wait their turn on a server.
 

@@ -300,6 +300,15 @@ class TestAdmin(_Base):
         self.assertFalse(guild_settings.get_tts_allowed("1"))
         self.assertEqual(env.speech.cuts, [True])
 
+    def test_ttsallow_says_what_it_switches(self):
+        # It allows or blocks !tts and !ttsafter; the half-hourly update has its own switch.
+        self.assertIn("`!tts` and `!ttsafter` are **allowed** on this server", _Env().run("ttsallow"))
+        self.assertIn("`!tts` and `!ttsafter` are now **blocked** on this server",
+                      _Env().run("ttsallow", "off"))
+        self.assertIn("`!tts` and `!ttsafter` are **blocked** on this server", _Env().run("ttsallow"))
+        self.assertEqual(tts_commands.TtsCog.ttsallow.description,
+                         "Allow or block !tts and !ttsafter on this server")
+
     def test_ttslang_validates(self):
         env = _Env()
         self.assertIn("Use `lv` or `en`.", env.run("ttslang", "de"))
@@ -383,7 +392,8 @@ class TestOffSwitch(_Base):
 
     def test_help_lists_tts_only_when_enabled(self):
         self.assertIn("!tts <text>", self._help_text(True))
-        self.assertIn("!ttsallow", self._help_text(True))
+        self.assertIn("`!ttsallow on|off` — Allow or block `!tts` and `!ttsafter` on this server",
+                      self._help_text(True))
         self.assertNotIn("!tts", self._help_text(False))
 
     def test_help_fits_discords_message_limit(self):
