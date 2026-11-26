@@ -3940,6 +3940,9 @@ async def _auto_next(bot, channel_id, guild_id, generation):
             members = [m for m in voice_client.channel.members if not m.bot]
             if not members:
                 gs.player.stop_playback()
+                speech = _speech(gs)
+                if speech:
+                    speech.reset()  # leaving drops the waiting clips and the update's start time
                 await voice_client.disconnect()
                 gs.player._voice_client = None
 

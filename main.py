@@ -219,6 +219,7 @@ def main():
 
         gs.queue.clear()
         gs.player.stop_playback()
+        gs.player.speech.reset()  # leaving drops the waiting clips and the update's start time
         gs.auto_next_gen += 1
         if gs.auto_next_task and not gs.auto_next_task.done():
             gs.auto_next_task.cancel()
