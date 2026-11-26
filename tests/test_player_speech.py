@@ -149,6 +149,16 @@ class TestPlayerSpeech(unittest.TestCase):
         player.set_voice_client(_OneAtATimeVoice())
         self.assertEqual(player.speech.waiting_clips(), 0)
 
+    def test_resyncing_the_same_voice_client_keeps_waiting_speech(self):
+        # Voice recovery hands the player the client it already has: nobody left the channel.
+        voice = _OneAtATimeVoice()
+        player = _player(voice)
+        player.speech.queue_after(CLIP)
+        player.speech.track_started_at = 123.0
+        player.set_voice_client(voice)
+        self.assertEqual(player.speech.waiting_clips(), 1, "an accepted !ttsafter clip was dropped")
+        self.assertEqual(player.speech.track_started_at, 123.0, "the update's start time was dropped")
+
     def test_radio_is_wrapped_too(self):
         class _Radio(discord.AudioSource):
             _process = SimpleNamespace(stderr=[])

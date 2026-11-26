@@ -2139,8 +2139,10 @@ class AudioPlayer:
 
     def set_voice_client(self, voice_client):
         """Set the discord.py VoiceClient (called when bot joins a voice channel)."""
+        same = voice_client is self._voice_client
         self._voice_client = voice_client
-        self.speech.reset()
+        if not same:  # voice recovery re-syncs the same client: its waiting speech stays
+            self.speech.reset()
 
     def get_bitrate_for_guild(self, guild_id: int | None) -> int:
         """Return per-guild bitrate in bps, falling back to the config default."""
