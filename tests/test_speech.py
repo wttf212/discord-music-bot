@@ -401,6 +401,21 @@ class TestCutAndReset(unittest.TestCase):
             self.assertEqual(sp.waiting_clips(), 0)
         _run(go())
 
+    def test_cut_during_a_song_silences_the_speech_and_keeps_the_song(self):
+        # !ttsallow off relies on this: the speech goes quiet, the song plays on.
+        async def go():
+            vc, _, sp = _setup()
+            sp.song_change(1)
+            mixer = sp.wrap(_Music(100), 1)
+            vc.play(mixer)
+            self.assertEqual(await sp.say(_clip(5)), "mixer")
+            sp.cut(drop_after_song=True)
+            self.assertEqual(vc.stops, 0, "cut() stopped the song")
+            self.assertIs(vc.source, mixer)
+            self.assertEqual(mixer.pending_clips(), 0, "the speech over the song kept playing")
+            self.assertEqual(await sp.say(_clip(6)), "mixer", "the song lost its mixer")
+        _run(go())
+
     def test_skip_gap_ends_only_the_gap_speech(self):
         async def go():
             vc, _, sp = _setup()
