@@ -1,7 +1,7 @@
 """Text-to-speech commands: an optional cog the bot loads only when text-to-speech is on.
 
 !tts speaks now, over the music; !ttsafter waits for the next song change. Admins set the
-server's speech language, the half-hourly update and the server's own off switch.
+server's speech language and voice, the half-hourly update and the server's own off switch.
 """
 import re
 import time

@@ -198,7 +198,7 @@ It needs no account or key. The voices are Microsoft Edge's online ones, so the 
 - Speech is in Latvian until an admin switches the server to English with `!ttslang en`.
 - `!tts` and `!ttsafter` work on every server until an admin blocks them there with `!ttsallow off`. The half-hourly update has its own switch, `!announce`.
 - The half-hourly update is off until an admin runs `!announce on`. It uses the server's timezone from `!settimezone`.
-- To change the wording, use `!announce text`, for example `!announce text Okupantu radio, precīzs laiks ir @laiks un rindā ir @queue dziesmas`. It is read out in the `!ttslang` voice, up to 300 characters.
+- To change the wording, use `!announce text`, for example `!announce text Okupantu radio, precīzs laiks ir @laiks un rindā ir @queue dziesmas`. It is read out in the server's `!ttslang` language and `!ttsvoice` voice, up to 300 characters.
 - A message can be up to 300 characters. Each person can send one every 10 seconds, and up to 5 can wait their turn on a server.
 
 ### Fair play and votes
