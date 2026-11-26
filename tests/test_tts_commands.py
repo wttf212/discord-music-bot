@@ -83,7 +83,7 @@ class TestTts(_Base):
         env = _Env()
         env.run("tts", text="labdien")
         self.assertEqual(env.speech.said, [CLIP])
-        tts.synthesize.assert_awaited_once_with("labdien", "lv", "ffmpeg")
+        tts.synthesize.assert_awaited_once_with("labdien", "lv", "ffmpeg", voice="female")
         env.message.add_reaction.assert_awaited_once_with("🔊")
 
     def test_each_accepted_clip_is_logged_with_its_author(self):
@@ -153,7 +153,7 @@ class TestTts(_Base):
 
     def test_switched_off_during_synthesis_is_not_spoken(self):
         # !ttsallow off is the admin's brake: a clip still being made must not play after it.
-        async def synthesize_meanwhile_switched_off(*args):
+        async def synthesize_meanwhile_switched_off(*args, **kwargs):
             guild_settings.set_tts_allowed("1", False)
             return CLIP
         tts.synthesize.side_effect = synthesize_meanwhile_switched_off
@@ -164,7 +164,7 @@ class TestTts(_Base):
     def test_queue_filled_during_synthesis_is_refused(self):
         env = _Env()
 
-        async def synthesize_while_others_queue(*args):
+        async def synthesize_while_others_queue(*args, **kwargs):
             env.speech.waiting = 5
             return CLIP
         tts.synthesize.side_effect = synthesize_while_others_queue
@@ -176,7 +176,7 @@ class TestTts(_Base):
         env.ctx.guild.voice_client = None          # the bot would have to join the author
         env.player._voice_client = None
 
-        async def synthesize_while_the_author_leaves(*args):
+        async def synthesize_while_the_author_leaves(*args, **kwargs):
             env.ctx.author.voice = None
             return CLIP
         tts.synthesize.side_effect = synthesize_while_the_author_leaves
@@ -232,7 +232,7 @@ class TestTts(_Base):
         env = _Env()
         env.ctx.guild._resolve_channel = lambda channel_id: SimpleNamespace(name="general")
         env.run("tts", text="come to <#123456789012345678>")
-        tts.synthesize.assert_awaited_once_with("come to #general", "lv", "ffmpeg")
+        tts.synthesize.assert_awaited_once_with("come to #general", "lv", "ffmpeg", voice="female")
 
 
 class TestSlash(_Base):
@@ -245,7 +245,7 @@ class TestSlash(_Base):
         env.ctx.defer = AsyncMock()
         env.deferred_first = []
 
-        async def synthesize(*args):
+        async def synthesize(*args, **kwargs):
             env.deferred_first.append(env.ctx.defer.await_count == 1)
             return CLIP
         tts.synthesize.side_effect = synthesize
@@ -281,7 +281,7 @@ class TestSlash(_Base):
                 env.ctx.guild.get_member = lambda uid, m=cached_member: m
                 env.bot.get_user = lambda uid, u=cached_user: u
                 env.run("tts", text=f"hi <@!{ANNA}> there")
-                tts.synthesize.assert_awaited_once_with(said, "lv", "ffmpeg")
+                tts.synthesize.assert_awaited_once_with(said, "lv", "ffmpeg", voice="female")
 
     def test_prefix_mentions_come_with_the_message(self):
         env = _Env()
@@ -289,7 +289,7 @@ class TestSlash(_Base):
         env.ctx.guild.get_member = lambda uid: None
         env.bot.get_user = MagicMock(return_value=None)
         env.run("tts", text=f"hi <@{ANNA}>")
-        tts.synthesize.assert_awaited_once_with("hi Anna", "lv", "ffmpeg")
+        tts.synthesize.assert_awaited_once_with("hi Anna", "lv", "ffmpeg", voice="female")
         env.bot.get_user.assert_not_called()
 
 
@@ -358,24 +358,24 @@ class TestUpdateClip(_Base):
     def test_mark_passed_speaks_time_and_songs_left(self):
         guild_settings.set_announce("1", True)
         self.assertEqual(self._call(self._env_with_two_queued(), self.NOW - 600), CLIP)
-        tts.synthesize.assert_awaited_once_with("Pulkstenis ir 14:34. Rindā vēl 3 dziesmas.", "lv", "ffmpeg")
+        tts.synthesize.assert_awaited_once_with("Pulkstenis ir 14:34. Rindā vēl 3 dziesmas.", "lv", "ffmpeg", voice="female")
 
     def test_a_station_starting_counts_only_the_queued_songs(self):
         # Speech passes starting_next=False at a radio start: the station is not a song.
         guild_settings.set_announce("1", True)
         self._call(self._env_with_two_queued(), self.NOW - 600, starting_next=False)
-        tts.synthesize.assert_awaited_once_with("Pulkstenis ir 14:34. Rindā vēl 2 dziesmas.", "lv", "ffmpeg")
+        tts.synthesize.assert_awaited_once_with("Pulkstenis ir 14:34. Rindā vēl 2 dziesmas.", "lv", "ffmpeg", voice="female")
 
     def test_queue_end_says_it_is_empty(self):
         guild_settings.set_announce("1", True)
         self._call(_Env(), self.NOW - 600, starting_next=False)
-        tts.synthesize.assert_awaited_once_with("Pulkstenis ir 14:34. Rinda ir tukša.", "lv", "ffmpeg")
+        tts.synthesize.assert_awaited_once_with("Pulkstenis ir 14:34. Rinda ir tukša.", "lv", "ffmpeg", voice="female")
 
     def test_english(self):
         guild_settings.set_announce("1", True)
         guild_settings.set_tts_language("1", "en")
         self._call(self._env_with_two_queued(), self.NOW - 600)
-        tts.synthesize.assert_awaited_once_with("It's 14:34. 3 more songs in the queue.", "en", "ffmpeg")
+        tts.synthesize.assert_awaited_once_with("It's 14:34. 3 more songs in the queue.", "en", "ffmpeg", voice="female")
 
     def test_broken_timezone_raises_for_the_caller_to_skip(self):
         guild_settings.set_announce("1", True)

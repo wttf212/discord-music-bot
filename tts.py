@@ -9,7 +9,8 @@ from zoneinfo import ZoneInfo
 from speech import FRAME_SIZE
 
 MAX_CHARS = 300
-VOICES = {"lv": "lv-LV-EveritaNeural", "en": "en-US-AriaNeural"}
+VOICES = {"lv": "lv-LV-EveritaNeural", "en": "en-US-AriaNeural"}   # the female voices
+MALE_VOICES = {"lv": "lv-LV-NilsNeural", "en": "en-US-AndrewNeural"}
 SYNTH_TIMEOUT = 15.0
 
 
@@ -106,10 +107,10 @@ def _decode_to_pcm(mp3: bytes, ffmpeg_path: str) -> bytes:
     return done.stdout
 
 
-async def synthesize(text: str, lang: str, ffmpeg_path: str) -> bytes:
-    """Speak text in the language's voice; PCM padded with zeros to whole frames."""
+async def synthesize(text: str, lang: str, ffmpeg_path: str, voice: str = "female") -> bytes:
+    """Speak text in the language's female or male voice; PCM padded with zeros to whole frames."""
     async def _run() -> bytes:
-        mp3 = await _fetch_mp3(text, VOICES[lang])
+        mp3 = await _fetch_mp3(text, (MALE_VOICES if voice == "male" else VOICES)[lang])
         if not mp3:
             raise TtsError("no audio returned")
         loop = asyncio.get_running_loop()

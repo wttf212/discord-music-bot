@@ -188,10 +188,12 @@ It needs no account or key. The voices are Microsoft Edge's online ones, so the 
 | `!tts <text>` | Say something in the voice channel right now (the music dips) |
 | `!ttsafter <text>` | Say something after the current song |
 | `!ttslang lv\|en` | Speech language for this server *(admin only)* |
+| `!ttsvoice female\|male` | Speech voice for this server *(admin only)* |
 | `!announce on\|off` | Say the time and songs left every half hour, between songs *(admin only)* |
 | `!announce text <text>` | Your own words for that update: @laiks is the time, @queue the songs left; `reset` goes back to the default *(admin only)* |
 | `!ttsallow on\|off` | Allow or block `!tts` and `!ttsafter` on this server *(admin only)* |
 
+- The voices are Latvian Everita (female) and Nils (male), and English Aria (female) and Andrew (male). The default is female; an admin changes it with `!ttsvoice male`.
 - Speech is in Latvian until an admin switches the server to English with `!ttslang en`.
 - `!tts` and `!ttsafter` work on every server until an admin blocks them there with `!ttsallow off`. The half-hourly update has its own switch, `!announce`.
 - The half-hourly update is off until an admin runs `!announce on`. It uses the server's timezone from `!settimezone`.

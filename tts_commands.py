@@ -16,6 +16,7 @@ import tts
 from commands import MusicCog, check_channel, _on_cooldown, _speech, _join_voice
 from guild_settings import (
     TTS_LANGUAGES, get_tts_language, set_tts_language,
+    TTS_VOICES, get_tts_voice, set_tts_voice,
     get_tts_allowed, set_tts_allowed, get_announce, set_announce,
     get_announce_text, set_announce_text,
     get_timezone,
@@ -51,7 +52,7 @@ async def _update_clip(bot, guild_id: int, started_at: float | None, starting_ne
             return None
     else:
         spoken = tts.announcement_text(lang, now_local, count)
-    return await tts.synthesize(spoken, lang, gs.player._ffmpeg_path)
+    return await tts.synthesize(spoken, lang, gs.player._ffmpeg_path, voice=get_tts_voice(gid))
 
 
 def attach_speech(bot, guild_id: int, player) -> None:
@@ -137,7 +138,7 @@ async def _tts_flow(cog, ctx, text: str | None, after: bool) -> None:
     if ctx.interaction:
         await ctx.defer()  # synthesis can outlast the 3 s token; the reply is public
     try:
-        pcm = await tts.synthesize(text, lang, gs.player._ffmpeg_path)
+        pcm = await tts.synthesize(text, lang, gs.player._ffmpeg_path, voice=get_tts_voice(gid))
     except tts.TtsError as e:
         print(f"[tts] Synthesis failed: {e}")
         await ctx.send("Couldn't make that into speech right now.")
@@ -258,6 +259,27 @@ class TtsCog(commands.Cog):
             return
         set_tts_language(gid, lang)
         await ctx.send(f"Speech language set to **{lang}**.")
+
+    @commands.hybrid_command(name="ttsvoice", description="Speech voice for this server")
+    @app_commands.describe(voice="female or male")
+    async def ttsvoice(self, ctx: commands.Context, voice: str = None):
+        if not await check_channel(ctx):
+            return
+        if not ctx.guild:
+            return
+        if not await self._check_admin(ctx):
+            return
+        gid = str(ctx.guild.id)
+        if not voice:
+            await ctx.send(f"Speech voice: **{get_tts_voice(gid)}**. "
+                           f"Usage: `{self.bot.command_prefix}ttsvoice female|male`")
+            return
+        voice = voice.strip().lower()
+        if voice not in TTS_VOICES:
+            await ctx.send("Use `female` or `male`.")
+            return
+        set_tts_voice(gid, voice)
+        await ctx.send(f"Speech voice set to **{voice}**.")
 
     @commands.hybrid_command(name="announce", description="Say the time and songs left every half hour, between songs")
     @app_commands.describe(state="on, off or text", text="With text: your own words; @laiks is the time, @queue the songs left; reset for the default")

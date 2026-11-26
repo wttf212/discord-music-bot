@@ -264,6 +264,22 @@ def set_tts_language(guild_id: str, lang: str):
         guild["tts_language"] = lang
 
 
+TTS_VOICES = ("female", "male")
+DEFAULT_TTS_VOICE = "female"
+
+
+def get_tts_voice(guild_id: str) -> str:
+    voice = load_settings().get(guild_id, {}).get("tts_voice")
+    return voice if voice in TTS_VOICES else DEFAULT_TTS_VOICE
+
+
+def set_tts_voice(guild_id: str, voice: str) -> None:
+    if voice not in TTS_VOICES:
+        raise ValueError(f"unsupported TTS voice: {voice!r}")
+    with _guild_entry(guild_id) as guild:
+        guild["tts_voice"] = voice
+
+
 def get_tts_allowed(guild_id: str) -> bool:
     return bool(load_settings().get(guild_id, {}).get("tts_allowed", True))
 

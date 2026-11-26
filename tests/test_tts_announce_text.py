@@ -63,7 +63,7 @@ class TestClip(_Base):
             out = asyncio.run(tts_commands._update_clip(env.bot, 1, self.NOWTS - 600, True))
         self.assertEqual(out, CLIP)
         filled = "Okupantu radio, precīzs laiks ir 14:34 un rindā ir 3 dziesmas"
-        tts.synthesize.assert_awaited_once_with(tts.clean_text(filled, "lv"), "lv", "ffmpeg")
+        tts.synthesize.assert_awaited_once_with(tts.clean_text(filled, "lv"), "lv", "ffmpeg", voice="female")
 
     def test_text_that_cleans_to_nothing_gives_none(self):
         guild_settings.set_announce("1", True)

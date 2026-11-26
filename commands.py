@@ -3597,6 +3597,7 @@ class MusicCog(commands.Cog):
                 f"`{p}tts <text>` — Say something in the voice channel right now (the music dips)\n"
                 f"`{p}ttsafter <text>` — Say something after the current song\n"
                 f"`{p}ttslang lv|en` — Speech language for this server *(admin only)*\n"
+                f"`{p}ttsvoice female|male` — Speech voice for this server *(admin only)*\n"
                 f"`{p}announce on|off` — Say the time and songs left every half hour, between songs *(admin only)*\n"
                 f"`{p}announce text <text>` — Your own words for that update: @laiks is the time, @queue the songs left; `reset` goes back to the default *(admin only)*\n"
                 f"`{p}ttsallow on|off` — Allow or block `{p}tts` and `{p}ttsafter` on this server *(admin only)*\n"
