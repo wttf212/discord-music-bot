@@ -10,6 +10,18 @@ import commands, guild_settings, speech, tts, tts_commands
 from track_queue import Track, TrackQueue
 
 CLIP = b"\x00" * speech.FRAME_SIZE
+def help_text(enabled: bool) -> str:
+    """The !help reply as one string, with text-to-speech listed or not."""
+    sent = []
+
+    async def send(content=None, **kwargs):
+        sent.append(content)
+
+    bot = SimpleNamespace(command_prefix="!", tts_enabled=enabled)
+    asyncio.run(commands.MusicCog.help_cmd.callback(SimpleNamespace(bot=bot), SimpleNamespace(send=send)))
+    return "\n".join(sent)
+
+
 ANNA = 555555555555555555   # a member id; clean_content reads only 15-20 digit ids
 
 
@@ -393,21 +405,11 @@ class TestUpdateClip(_Base):
 
 
 class TestOffSwitch(_Base):
-    def _help_text(self, enabled):
-        sent = []
-
-        async def send(content=None, **kwargs):
-            sent.append(content)
-
-        bot = SimpleNamespace(command_prefix="!", tts_enabled=enabled)
-        asyncio.run(commands.MusicCog.help_cmd.callback(SimpleNamespace(bot=bot), SimpleNamespace(send=send)))
-        return sent[0]
-
     def test_help_lists_tts_only_when_enabled(self):
-        self.assertIn("!tts <text>", self._help_text(True))
+        self.assertIn("!tts <text>", help_text(True))
         self.assertIn("`!ttsallow on|off` — Allow or block `!tts` and `!ttsafter` on this server",
-                      self._help_text(True))
-        self.assertNotIn("!tts", self._help_text(False))
+                      help_text(True))
+        self.assertNotIn("!tts", help_text(False))
 
     def test_help_fits_discords_message_limit(self):
         # Discord refuses a message over 2000 characters, and the five TTS lines take the

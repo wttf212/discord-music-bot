@@ -9,8 +9,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import commands, guild_settings, tts, tts_commands
-from track_queue import Track
-from test_tts_commands import _Env, _Base, CLIP
+from test_tts_commands import _Env, _Base, help_text
 
 
 class TestSetting(_Base):
@@ -91,19 +90,9 @@ class TestCommand(_Base):
 
 
 class TestHelp(unittest.TestCase):
-    def _help(self, enabled):
-        sent = []
-
-        async def send(content=None, **kwargs):
-            sent.append(content)
-
-        bot = SimpleNamespace(command_prefix="!", tts_enabled=enabled)
-        asyncio.run(commands.MusicCog.help_cmd.callback(SimpleNamespace(bot=bot), SimpleNamespace(send=send)))
-        return "\n".join(sent)
-
     def test_listed_only_with_tts_on(self):
-        self.assertIn("`!ttsvoice female|male` — Speech voice for this server *(admin only)*", self._help(True))
-        self.assertNotIn("ttsvoice", self._help(False))
+        self.assertIn("`!ttsvoice female|male` — Speech voice for this server *(admin only)*", help_text(True))
+        self.assertNotIn("ttsvoice", help_text(False))
 
 
 if __name__ == "__main__":
