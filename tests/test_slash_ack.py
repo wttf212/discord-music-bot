@@ -147,7 +147,7 @@ class _Bot:
 
 def _guild_state(player):
     gs = SimpleNamespace(queue=TrackQueue(), player=player, auto_next_task=None,
-                         auto_next_gen=0)
+                         auto_next_gen=0, np_message_id=None)
     for name in ("t1", "t2", "t3"):
         gs.queue.add(Track(query=name, title=name, requested_by="42"))
     return gs

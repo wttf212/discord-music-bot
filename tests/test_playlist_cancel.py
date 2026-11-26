@@ -4,10 +4,12 @@ AudioPlayer.play() and play_radio() raise asyncio.CancelledError right after the
 wait when the start is no longer current: a stop, or a newer start, overtook it (with or
 without text-to-speech). A caller's `except Exception` cleanup never sees it, so a caller
 holding something nothing else will clean up does that in an `except asyncio.CancelledError`
-and re-raises. It sends no error line: whatever overtook the start owns the card and the chain.
+and re-raises. It sends no error line, and the chain belongs to whatever overtook the start.
 
 - The playlist start with nothing playing stops the background enumeration of the rest of
   the list, which would otherwise keep paging YouTube for a list nobody will load.
+- A /play start whose card still shows its own "Loading…" marks it stopped, since not every
+  stop edits it. A card that a newer start put up is left alone.
 - The radio and search pickers, and a Spotify start, delete their "Loading…" message.
 - A slash /skipto deletes its deferred "is thinking…" reply.
 
@@ -91,8 +93,87 @@ class TestOvertakenPlaylistStart(unittest.TestCase):
         self.assertEqual(cancelled, [PLAYLIST], "the enumeration kept paging for nobody")
         self.assertFalse(any("error playing first track" in (m or "").lower() for m in bot.sent),
                          bot.sent)
-        self.clear_np.assert_not_awaited()      # a stop or the newer start owns the card
+        self.clear_np.assert_not_awaited()      # no error path: the card is not deleted
         self.start_auto_next.assert_not_called()
+
+
+LOADING_CARD, NEWER_CARD = 100, 101
+
+
+class TestOvertakenPlayCard(unittest.TestCase):
+    """An overtaken /play start leaves alone a card that a newer start has put up. A card that
+    is still this start's "Loading…" is marked stopped, because not every stop edits it: the
+    empty-channel leave doesn't, and !stop edits the card in the channel auto-play last used."""
+
+    QUERIES = {"a single track": FIRST, "a playlist": PLAYLIST}
+
+    def setUp(self):
+        self.np_stopped, self.clear_np, self.np_embed = AsyncMock(), AsyncMock(), AsyncMock()
+        playlist = {"title": "P", "tracks": [{"url": FIRST, "title": "First entry"}]}
+
+        async def send_card(bot, channel_id, view):
+            bot.get_guild_state(1).np_message_id = LOADING_CARD
+
+        async def enumerate_(query, client):
+            await asyncio.sleep(3600)
+
+        for p in (patch.object(commands, "build_player_view", MagicMock(side_effect=_view)),
+                  patch.object(commands, "send_new_np", AsyncMock(side_effect=send_card)),
+                  patch.object(commands, "update_np_embed", self.np_embed),
+                  patch.object(commands, "update_np_stopped", self.np_stopped),
+                  patch.object(commands, "_clear_np", self.clear_np),
+                  patch.object(commands, "_start_auto_next", MagicMock()),
+                  patch.object(commands, "check_channel", AsyncMock(return_value=True)),
+                  patch.object(commands, "extract_playlist_info", return_value=playlist),
+                  patch.object(commands, "resolve_audio", AsyncMock(return_value=dict(RESOLVED))),
+                  patch.object(commands, "enumerate_playlist", enumerate_)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _overtaken_play(self, query, newer_card):
+        for m in (self.np_stopped, self.clear_np, self.np_embed):
+            m.reset_mock()
+
+        async def scenario():
+            vc = _VC(True)
+            gs = SimpleNamespace(queue=TrackQueue(), player=None, auto_next_task=None,
+                                 auto_next_gen=1, autoplay=False, current_text_channel_id=None,
+                                 np_message_id=None)
+
+            class _Overtaken(_Player):
+                async def play(self, query, resolved_info=None, resolved_at=0.0):
+                    if newer_card:
+                        gs.np_message_id = NEWER_CARD   # send_new_np of the start that overtook
+                    raise asyncio.CancelledError
+
+            gs.player = _Overtaken([], vc)
+            bot = _Bot(gs, SimpleNamespace(id=1, voice_client=vc))
+            ctx = SimpleNamespace(bot=bot, interaction=None,
+                                  guild=SimpleNamespace(id=1, voice_client=vc),
+                                  author=SimpleNamespace(id=42, voice=SimpleNamespace(channel=vc.channel)),
+                                  channel=SimpleNamespace(id=CHANNEL_ID), send=bot.record)
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(commands.MusicCog.play.callback(
+                    SimpleNamespace(bot=bot), ctx, query=query), timeout=5)
+            return bot
+
+        return asyncio.run(scenario())
+
+    def test_a_loading_card_still_up_is_marked_stopped(self):
+        for name, query in self.QUERIES.items():
+            with self.subTest(name):
+                bot = self._overtaken_play(query, newer_card=False)
+                self.np_stopped.assert_awaited_once_with(bot, CHANNEL_ID)
+                self.clear_np.assert_not_awaited()
+                self.np_embed.assert_not_awaited()
+
+    def test_a_newer_start_s_card_is_left_alone(self):
+        for name, query in self.QUERIES.items():
+            with self.subTest(name):
+                self._overtaken_play(query, newer_card=True)
+                self.np_stopped.assert_not_awaited()
+                self.clear_np.assert_not_awaited()
+                self.np_embed.assert_not_awaited()
 
 
 class _Message:

@@ -2567,9 +2567,11 @@ class MusicCog(commands.Cog):
             except asyncio.CancelledError:
                 # A stop or a newer start overtook track 1 (play() gives up as cancelled), or
                 # this command is being cancelled. Nobody will load the rest, so stop its pages.
-                # No error line, and the card is left alone: a stop updates it itself, and a
-                # newer start owns it now.
+                # No error line. A newer start has put up its own card; a card still on this
+                # start's "Loading…" is marked stopped, since not every stop edits it.
                 _abandon_enumeration(full_fut)
+                if gs.np_message_id == loading_card:
+                    await update_np_stopped(self.bot, channel_id)
                 raise
             except Exception as e:
                 _abandon_enumeration(full_fut)
@@ -2679,6 +2681,7 @@ class MusicCog(commands.Cog):
             guild_id=ctx.guild.id, loading=True,
         )
         await send_new_np(self.bot, channel_id, loading_view)
+        loading_card = gs.np_message_id
 
         async def _fail(message: str):
             """Replace the loading card with a plain error line."""
@@ -2723,8 +2726,12 @@ class MusicCog(commands.Cog):
             _start_auto_next(self.bot, channel_id, ctx.guild.id)
         except asyncio.CancelledError:
             # Overtaken by a stop or a newer start, which needs no word from here (as in
-            # /skipto). A slash command would stay on "is thinking…", so its reply is
+            # /skipto). A newer start has put up its own card. A card still on this start's
+            # "Loading…" is marked stopped, since not every stop edits it (the empty-channel
+            # leave doesn't). A slash command would stay on "is thinking…", so its reply is
             # deleted instead.
+            if gs.np_message_id == loading_card:
+                await update_np_stopped(self.bot, channel_id)
             if ctx.interaction:
                 try:
                     await ctx.interaction.delete_original_response()
