@@ -47,6 +47,16 @@ def announcement_text(lang: str, now_local: datetime, songs_left: int) -> str:
     return f"It's {clock}. {tail}"
 
 
+_PLACEHOLDER = re.compile(r"@(laiks|queue)\b", re.IGNORECASE)
+
+
+def fill_announcement(template: str, now_local: datetime, songs_left: int) -> str:
+    """An admin's update text with @laiks as HH:MM and @queue as the songs left. Only these
+    two words change; the result still goes through clean_text."""
+    values = {"laiks": now_local.strftime("%H:%M"), "queue": str(songs_left)}
+    return _PLACEHOLDER.sub(lambda m: values[m[1].lower()], template)
+
+
 def half_hour_mark_passed(started_at: float, now: float, tz_name: str) -> bool:
     """True when the latest local :00/:30 mark at or before now lies strictly after started_at."""
     local = datetime.fromtimestamp(now, ZoneInfo(tz_name))

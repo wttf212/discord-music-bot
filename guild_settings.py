@@ -280,3 +280,16 @@ def get_announce(guild_id: str) -> bool:
 def set_announce(guild_id: str, on: bool):
     with _guild_entry(guild_id) as guild:
         guild["announce"] = bool(on)
+
+
+def get_announce_text(guild_id: str) -> str | None:
+    """The server's own half-hourly update text, or None for the built-in wording."""
+    return load_settings().get(guild_id, {}).get("announce_text") or None
+
+
+def set_announce_text(guild_id: str, text: str | None):
+    with _guild_entry(guild_id) as guild:
+        if text:
+            guild["announce_text"] = text
+        else:
+            guild.pop("announce_text", None)

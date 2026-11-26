@@ -17,6 +17,7 @@ from commands import MusicCog, check_channel, _on_cooldown, _speech, _join_voice
 from guild_settings import (
     TTS_LANGUAGES, get_tts_language, set_tts_language,
     get_tts_allowed, set_tts_allowed, get_announce, set_announce,
+    get_announce_text, set_announce_text,
     get_timezone,
 )
 
@@ -41,9 +42,16 @@ async def _update_clip(bot, guild_id: int, started_at: float | None, starting_ne
     gs = bot.get_guild_state(guild_id)
     lang = get_tts_language(gid)
     count = len(gs.queue) + (1 if starting_next else 0)  # the song about to start counts
-    return await tts.synthesize(
-        tts.announcement_text(lang, datetime.fromtimestamp(now, ZoneInfo(tz)), count),
-        lang, gs.player._ffmpeg_path)
+    now_local = datetime.fromtimestamp(now, ZoneInfo(tz))
+    custom = get_announce_text(gid)
+    if custom:
+        # Fill in first: clean_text strips the @ the placeholders start with.
+        spoken = tts.clean_text(tts.fill_announcement(custom, now_local, count), lang)
+        if not spoken:
+            return None
+    else:
+        spoken = tts.announcement_text(lang, now_local, count)
+    return await tts.synthesize(spoken, lang, gs.player._ffmpeg_path)
 
 
 def attach_speech(bot, guild_id: int, player) -> None:
@@ -185,6 +193,33 @@ def _on_off(state: str | None) -> bool | None:
     return {"on": True, "off": False}.get((state or "").strip().lower())
 
 
+async def _announce_text(bot, ctx, gid: str, text: str | None) -> None:
+    """!announce text: show, set or reset the server's own update text."""
+    p = bot.command_prefix
+    usage = (f"Usage: `{p}announce text <text>` (@laiks is the time, @queue the songs left) "
+             f"or `{p}announce text reset`")
+    text = (text or "").strip()
+    if not text:
+        current = get_announce_text(gid)
+        await ctx.send(f"Update text: {current}\n{usage}" if current
+                       else f"The built-in update text is in use.\n{usage}")
+        return
+    if text.lower() == "reset":
+        set_announce_text(gid, None)
+        await ctx.send("Back to the built-in update text.")
+        return
+    if len(text) > tts.MAX_CHARS:
+        await ctx.send(f"That's too long — {tts.MAX_CHARS} characters max.")
+        return
+    if not tts.clean_text(text, get_tts_language(gid)):
+        await ctx.send(usage)
+        return
+    set_announce_text(gid, text)
+    now_local = datetime.now(ZoneInfo(get_timezone(gid)))
+    example = tts.fill_announcement(text, now_local, len(bot.get_guild_state(ctx.guild.id).queue))
+    await ctx.send(f'Update text set. It will sound like: "{example}"')
+
+
 class TtsCog(commands.Cog):
     """The text-to-speech commands. setup() in commands.py adds this cog only when TTS is on."""
 
@@ -225,8 +260,8 @@ class TtsCog(commands.Cog):
         await ctx.send(f"Speech language set to **{lang}**.")
 
     @commands.hybrid_command(name="announce", description="Say the time and songs left every half hour, between songs")
-    @app_commands.describe(state="on or off")
-    async def announce(self, ctx: commands.Context, state: str = None):
+    @app_commands.describe(state="on, off or text", text="With text: your own words; @laiks is the time, @queue the songs left; reset for the default")
+    async def announce(self, ctx: commands.Context, state: str = None, *, text: str = None):
         if not await check_channel(ctx):
             return
         if not ctx.guild:
@@ -234,11 +269,17 @@ class TtsCog(commands.Cog):
         if not await self._check_admin(ctx):
             return
         gid = str(ctx.guild.id)
+        p = self.bot.command_prefix
+        if (state or "").strip().lower() == "text":
+            await _announce_text(self.bot, ctx, gid, text)
+            return
         on = _on_off(state)
-        if on is None:  # nothing, or not on/off: show the current value
+        if on is None:  # nothing, or not on/off/text: show the current value
             current = "on" if get_announce(gid) else "off"
-            await ctx.send(f"Half-hourly updates are **{current}**. "
-                           f"Usage: `{self.bot.command_prefix}announce on|off`")
+            custom = ("A custom text is set." if get_announce_text(gid)
+                      else "It uses the built-in wording.")
+            await ctx.send(f"Half-hourly updates are **{current}**. {custom} "
+                           f"Usage: `{p}announce on|off`, `{p}announce text <text>`")
             return
         set_announce(gid, on)
         await ctx.send(f"Half-hourly updates turned **{'on' if on else 'off'}**.")
