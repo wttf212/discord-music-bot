@@ -296,6 +296,8 @@ class TtsCog(commands.Cog):
             return
         gid = str(ctx.guild.id)
         p = self.bot.command_prefix
+        if not (state or "").strip() and (text or "").strip():
+            state = "text"  # the slash form: /announce text:<words> with no state filled in
         if (state or "").strip().lower() == "text":
             await _announce_text(self.bot, ctx, gid, text)
             return

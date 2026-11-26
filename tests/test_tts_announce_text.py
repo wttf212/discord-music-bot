@@ -130,6 +130,14 @@ class TestCommand(_Base):
                 self._run("text", text="hello")
         self.assertIsNone(guild_settings.get_announce_text("1"))
 
+    def test_slash_text_without_a_state_is_stored(self):
+        # /announce text:<words> arrives as announce(ctx, None, text=...)
+        for state in (None, "", "  "):
+            with self.subTest(state=state):
+                guild_settings.set_announce_text("1", None)
+                self._run(state, text="Okupantu @laiks")
+                self.assertEqual(guild_settings.get_announce_text("1"), "Okupantu @laiks")
+
     def test_on_off_still_work(self):
         self._run("on")
         self.assertTrue(guild_settings.get_announce("1"))
