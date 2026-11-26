@@ -116,9 +116,10 @@ class _OvertakenRadioPlayer:
         raise asyncio.CancelledError
 
 
-class TestOvertakenPickerStarts(unittest.TestCase):
+class TestOvertakenStartsClearTheirLoadingMessage(unittest.TestCase):
     """The pickers show "Loading…" once a choice is made, and stop their view, so its timeout
-    never clears them. An overtaken start must not leave them like that."""
+    never clears them. A Spotify start posts "Loading <list>…" first. An overtaken start must
+    not leave either message up."""
 
     def setUp(self):
         self.send_new_np = AsyncMock()
@@ -179,6 +180,39 @@ class TestOvertakenPickerStarts(unittest.TestCase):
         self.assertEqual(events, ["play"])
         self.assertTrue(picker.deleted, "the search picker stayed on 'Loading…'")
         self.assertEqual(picker.edits, [], "an overtaken start is no error")
+        self.send_new_np.assert_not_awaited()
+        self.start_auto_next.assert_not_called()
+
+    def test_an_overtaken_spotify_start_removes_its_loading_line(self):
+        resolved = {"title": "Mix", "tracks": [{"query": "a - one", "title": "one"},
+                                               {"query": "b - two", "title": "two"}]}
+
+        async def scenario():
+            events, sent = [], []
+            player = _OvertakenPlayer(events, _VC(True))
+            bot, ctx = self._guild(player)
+
+            async def send(content=None, **kwargs):
+                sent.append((content, _Message()))
+                return sent[-1][1]
+
+            async def resolve(*args, **kwargs):
+                return dict(RESOLVED)
+
+            ctx.send = send
+            with patch.object(commands, "resolve_audio", resolve):
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(commands.MusicCog._queue_spotify(
+                        SimpleNamespace(bot=bot), ctx, bot.get_guild_state(1), resolved), timeout=5)
+            return events, sent
+
+        events, sent = asyncio.run(scenario())
+        self.assertEqual(events, ["play"])
+        self.assertEqual(len(sent), 1, sent)
+        content, status = sent[0]
+        self.assertTrue(content.startswith("Loading"), content)
+        self.assertTrue(status.deleted, "the Spotify start left its 'Loading…' line up")
+        self.assertEqual(status.edits, [], "an overtaken start is no error")
         self.send_new_np.assert_not_awaited()
         self.start_auto_next.assert_not_called()
 

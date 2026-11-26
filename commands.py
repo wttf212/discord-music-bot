@@ -3042,6 +3042,10 @@ class MusicCog(commands.Cog):
         gs.auto_next_gen += 1
         try:
             played = await gs.player.play(first["query"], info, resolved_at)
+        except asyncio.CancelledError:
+            # Overtaken by a stop or a newer start: no error, but don't leave "Loading…" up.
+            await _safe_delete(status)
+            raise
         except Exception as e:
             # A voice drop (or a block met re-resolving a stale URL) is no fault of the
             # track: re-arm auto-play, as a refused playlist start does.
