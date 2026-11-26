@@ -81,7 +81,7 @@ Compose reads `.env` and passes the token to the bot, so `bot_token` in `config.
 
 ## Configuration
 
-The settings are in `config.yaml`, and `config.example.yaml` explains each one in comments. These are the ones you're most likely to change:
+The settings are in `config.yaml`. `config.example.yaml` has comments on the bot token and on the YouTube, Spotify and text-to-speech settings. These are the ones you're most likely to change:
 
 | Key | What it does |
 |-----|--------------|
@@ -133,7 +133,7 @@ Commands marked *(admin only)* are for the bot owner and the bot admins the owne
 | `!skip` | Skip the current track |
 | `!stop` | Stop playback, clear the queue and leave the voice channel |
 
-When other people are listening too, skipping, pausing or stopping someone else's song takes a vote. The same goes for the buttons on the player card. `!fairness` sets how many votes it takes.
+When other people are listening too, `!skip`, `!pause` and `!resume` take a vote unless the current song is yours, and `!stop` takes one unless you added every song that is playing or queued. The pause, previous, next and stop buttons on the player card work the same way. `!fairness` sets how many votes it takes.
 
 ### Queue
 
@@ -201,7 +201,9 @@ It needs no account or key. The voices are Microsoft Edge's online ones, so the 
 | Command | What it does |
 |---------|--------------|
 | `!fairplay on\|off` | Alternate queued songs between the people who added them. On by default *(admin only)* |
-| `!fairness <0-100>` | Set the percentage of listeners who must vote to skip, pause or stop someone else's song. Default 50 *(admin only)* |
+| `!fairness <0-100>` | Set the percentage of listeners who must vote when a command takes a vote. Default 50 *(admin only)* |
+
+Neither setting is saved: fair play turns back on after `!stop` or when the bot leaves, and fairness goes back to 50 when the bot restarts.
 
 ### Owner only
 
@@ -212,13 +214,13 @@ These work only for the user in `owner_id`.
 | `!addadmin @user` | Make someone a bot admin on this server |
 | `!removeadmin @user` | Take bot admin away from someone on this server |
 | `!settc` | Only take commands in this channel. Commands sent elsewhere are deleted, and the sender is pointed here |
-| `!shutdown` | Shut the bot down |
+| `!shutdown` | Shut the bot down. Under the included `docker-compose.yml` the container starts straight back up (`restart: unless-stopped`), so stop it there with `docker compose stop` |
 
 ## Discord permissions and intents
 
 ### Permissions
 
-When you invite the bot, give it these permissions, or use the permissions integer `2184277056`.
+When you invite the bot, give it these permissions, or use the permissions integer `36793408`.
 
 In text channels:
 
