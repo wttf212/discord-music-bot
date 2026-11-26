@@ -1,10 +1,10 @@
 """Speech hooks: a skip in the gap only cuts the speech; a drained queue still speaks."""
-import asyncio, os, sys, unittest
+import asyncio, os, sys
 from unittest.mock import AsyncMock, MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import commands
-from test_manual_dead_track import CHANNEL_ID, _Bot, _Harness, _Player, _advance, _guild_state
+from test_manual_dead_track import CHANNEL_ID, _Bot, _Harness, _Player, _guild_state
 
 
 class _FakeSpeech:
