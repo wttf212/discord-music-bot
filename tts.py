@@ -91,7 +91,7 @@ def startup_status(config: dict) -> tuple[bool, str]:
     if not installed():
         return False, ("Warning: tts.enabled is true, but the edge-tts package is not installed, "
                        "so text-to-speech stays off. Install it with: pip install -r requirements-tts.txt "
-                       "(Docker: set WITH_TTS=true in .env and rebuild).")
+                       "(Docker: rebuild the image with docker compose up -d --build).")
     return True, "Text-to-speech is on."
 
 

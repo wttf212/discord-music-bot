@@ -37,7 +37,8 @@ class TestStartupStatus(unittest.TestCase):
             enabled, line = tts.startup_status({"tts": {"enabled": True}})
         self.assertFalse(enabled)
         self.assertIn("pip install -r requirements-tts.txt", line)
-        self.assertIn("WITH_TTS=true", line)
+        self.assertIn("docker compose up -d --build", line)
+        self.assertNotIn(".env", line)
 
     def test_on(self):
         with patch.object(tts, "installed", return_value=True):
@@ -82,11 +83,11 @@ class TestPackaging(unittest.TestCase):
         self.assertNotIn("edge-tts", _read("requirements.txt"))
         self.assertIn("edge-tts>=7.3.1", _read("requirements-tts.txt"))
 
-    def test_docker_installs_it_only_on_request(self):
+    def test_compose_builds_it_in_and_a_bare_docker_build_does_not(self):
         dockerfile = _read("Dockerfile")
         self.assertIn("ARG WITH_TTS=false", dockerfile)
         self.assertIn("requirements-tts.txt", dockerfile)
-        self.assertIn("WITH_TTS", _read("docker-compose.yml"))
+        self.assertIn("WITH_TTS: ${WITH_TTS:-true}", _read("docker-compose.yml"))
 
     def test_example_config_ships_it_off(self):
         import yaml

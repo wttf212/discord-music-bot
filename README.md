@@ -179,7 +179,7 @@ Off by default. To turn it on:
 1. Set `tts.enabled: true` in `config.yaml`.
 2. Install the edge-tts package and restart the bot:
    - From source: run `pip install -r requirements-tts.txt` with the virtual environment active.
-   - Docker: add `WITH_TTS=true` to `.env`, then rebuild and restart with `docker compose up -d --build`.
+   - Docker: the image that `docker-compose.yml` builds already includes it. Rebuild and restart with `docker compose up -d --build`.
 
 It needs no account or key. The voices are Microsoft Edge's online ones, so the text to be spoken goes to Microsoft. If `tts.enabled` is `true` but edge-tts isn't installed, the bot logs a warning and leaves text-to-speech off.
 
