@@ -138,6 +138,35 @@ class TestCommand(_Base):
                 self._run(state, text="Okupantu @laiks")
                 self.assertEqual(guild_settings.get_announce_text("1"), "Okupantu @laiks")
 
+    def test_example_counts_the_queued_songs(self):
+        # No song is about to start here, so the count is just the queue: two tracks, "2".
+        env = _Env()
+        for n in ("a", "b"):
+            env.gs.queue.add(Track(query=n, title=n, requested_by="u"))
+        with patch.object(tts_commands, "datetime") as dt:
+            dt.now.return_value = NOW
+            env.run("announce", "text", text=EXAMPLE)
+        self.assertIn("rindā ir 2 dziesmas", " ".join(env.sent))
+
+    def test_example_time_follows_the_server_timezone(self):
+        guild_settings.set_timezone("1", "Asia/Tokyo")
+        env = _Env()
+        # 14:34 in Riga is 21:34 in Tokyo.
+        fake = SimpleNamespace(now=lambda tz: NOW.astimezone(tz))
+        with patch.object(tts_commands, "datetime", fake):
+            env.run("announce", "text", text=EXAMPLE)
+        self.assertIn("laiks ir 21:34", " ".join(env.sent))
+
+    def test_show_reply_has_the_usage_line(self):
+        self.assertIn("Usage:", self._run("text")[1])
+        guild_settings.set_announce_text("1", "my words")
+        self.assertIn("Usage:", self._run("text")[1])
+
+    def test_exactly_300_characters_is_accepted(self):
+        text = "a" * 300
+        self._run("text", text=text)
+        self.assertEqual(guild_settings.get_announce_text("1"), text)
+
     def test_on_off_still_work(self):
         self._run("on")
         self.assertTrue(guild_settings.get_announce("1"))
