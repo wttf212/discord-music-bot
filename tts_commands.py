@@ -13,11 +13,11 @@ from discord.ext import commands
 
 import speech
 import tts
-from commands import MusicCog, check_channel, _on_cooldown, _speech
+from commands import MusicCog, check_channel, _on_cooldown, _speech, _join_voice
 from guild_settings import (
     TTS_LANGUAGES, get_tts_language, set_tts_language,
     get_tts_allowed, set_tts_allowed, get_announce, set_announce,
-    get_timezone, get_bitrate, get_eq_bass, get_eq_treble,
+    get_timezone,
 )
 
 TTS_COOLDOWN = 10.0   # seconds per user, shared by !tts and !ttsafter
@@ -75,17 +75,8 @@ async def _join_author_voice(ctx, gs):
     connected (see _tts_flow). Returns the voice client, or None after telling the author
     why the join failed.
     """
-    guild_id = str(ctx.guild.id)
     try:
-        voice_client = await ctx.author.voice.channel.connect()
-        gs.player.set_voice_client(voice_client)
-        saved_br = get_bitrate(guild_id)
-        if saved_br:
-            await gs.player.set_bitrate(ctx.guild.id, saved_br)
-        saved_bass = get_eq_bass(guild_id)
-        saved_treble = get_eq_treble(guild_id)
-        if saved_bass != 0 or saved_treble != 0:
-            await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+        voice_client = await _join_voice(ctx, gs, ctx.author.voice.channel)
     except Exception as e:
         await ctx.send(f"Failed to join voice channel: {e}")
         return None

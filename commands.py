@@ -580,6 +580,26 @@ class RadioPickerView(discord.ui.View):
             pass
 
 
+async def _join_voice(ctx, gs, voice_channel):
+    """Join voice_channel, give the player the new client and restore the server's saved
+    bitrate and EQ. Returns the client; a failed join raises for the caller to report.
+
+    Callers deal with an existing client first, so this never connects while discord.py
+    is still reconnecting one.
+    """
+    guild_id = str(ctx.guild.id)
+    voice_client = await voice_channel.connect()
+    gs.player.set_voice_client(voice_client)
+    saved_br = get_bitrate(guild_id)
+    if saved_br:
+        await gs.player.set_bitrate(ctx.guild.id, saved_br)
+    saved_bass = get_eq_bass(guild_id)
+    saved_treble = get_eq_treble(guild_id)
+    if saved_bass != 0 or saved_treble != 0:
+        await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+    return voice_client
+
+
 async def _play_radio_selected(bot, ctx: commands.Context, station: dict,
                                picker_msg: discord.Message):
     """Continue the play flow with a radio station selected from RadioPickerView.
@@ -588,7 +608,6 @@ async def _play_radio_selected(bot, ctx: commands.Context, station: dict,
     gs.player.play(url). The Track has is_radio=True so it is excluded from history.
     NP embed shows extra_desc="\U0001f534 LIVE" instead of a duration.
     """
-    guild_id = str(ctx.guild.id)
     gs = bot.get_guild_state(ctx.guild.id)
     voice_channel = ctx.author.voice.channel
     user_id = str(ctx.author.id)
@@ -608,15 +627,7 @@ async def _play_radio_selected(bot, ctx: commands.Context, station: dict,
                 pass
             gs.player._voice_client = None
         try:
-            voice_client = await voice_channel.connect()
-            gs.player.set_voice_client(voice_client)
-            saved_br = get_bitrate(guild_id)
-            if saved_br:
-                await gs.player.set_bitrate(ctx.guild.id, saved_br)
-            saved_bass = get_eq_bass(guild_id)
-            saved_treble = get_eq_treble(guild_id)
-            if saved_bass != 0 or saved_treble != 0:
-                await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+            voice_client = await _join_voice(ctx, gs, voice_channel)
         except Exception as e:
             await picker_msg.edit(
                 content=f"Failed to join voice channel: {e}",
@@ -812,7 +823,6 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
     Trusts the flat-search metadata for display (so a queue-add skips the redundant
     background full resolve) and overlaps the URL resolve with the voice connect.
     """
-    guild_id = str(ctx.guild.id)
     gs = bot.get_guild_state(ctx.guild.id)
     voice_channel = ctx.author.voice.channel
     user_id = str(ctx.author.id)
@@ -864,15 +874,7 @@ async def _play_selected(bot, ctx: commands.Context, result: dict,
                 pass
             gs.player._voice_client = None
         try:
-            voice_client = await voice_channel.connect()
-            gs.player.set_voice_client(voice_client)
-            saved_br = get_bitrate(guild_id)
-            if saved_br:
-                await gs.player.set_bitrate(ctx.guild.id, saved_br)
-            saved_bass = get_eq_bass(guild_id)
-            saved_treble = get_eq_treble(guild_id)
-            if saved_bass != 0 or saved_treble != 0:
-                await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+            voice_client = await _join_voice(ctx, gs, voice_channel)
         except Exception as e:
             _discard_future(resolve_fut)
             await picker_msg.edit(
@@ -2502,15 +2504,7 @@ class MusicCog(commands.Cog):
                         pass
                     gs.player._voice_client = None
                 try:
-                    voice_client = await voice_channel.connect()
-                    gs.player.set_voice_client(voice_client)
-                    saved_br = get_bitrate(guild_id)
-                    if saved_br:
-                        await gs.player.set_bitrate(ctx.guild.id, saved_br)
-                    saved_bass = get_eq_bass(guild_id)
-                    saved_treble = get_eq_treble(guild_id)
-                    if saved_bass != 0 or saved_treble != 0:
-                        await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+                    voice_client = await _join_voice(ctx, gs, voice_channel)
                 except Exception as e:
                     _abandon_enumeration(full_fut)
                     _discard_future(resolve_fut)  # let the in-flight resolve finish and drop it
@@ -2665,17 +2659,7 @@ class MusicCog(commands.Cog):
                     pass
                 gs.player._voice_client = None
             try:
-                voice_client = await voice_channel.connect()
-                gs.player.set_voice_client(voice_client)
-                # Restore saved bitrate for this guild
-                saved_br = get_bitrate(guild_id)
-                if saved_br:
-                    await gs.player.set_bitrate(ctx.guild.id, saved_br)
-                # Restore saved EQ for this guild (per D-09)
-                saved_bass = get_eq_bass(guild_id)
-                saved_treble = get_eq_treble(guild_id)
-                if saved_bass != 0 or saved_treble != 0:
-                    await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+                voice_client = await _join_voice(ctx, gs, voice_channel)
             except Exception as e:
                 _discard_future(resolve_fut)  # let the in-flight resolve finish and drop it
                 await ctx.send(f"Failed to join voice channel: {e}")
@@ -2983,7 +2967,6 @@ class MusicCog(commands.Cog):
         sp_tracks = resolved["tracks"]
         user_id = str(ctx.author.id)
         channel_id = ctx.channel.id
-        guild_id = str(ctx.guild.id)
         voice_channel = ctx.author.voice.channel
         voice_client = ctx.guild.voice_client
         playing = gs.player.is_playing and voice_client and voice_client.is_playing()
@@ -3008,15 +2991,7 @@ class MusicCog(commands.Cog):
                     pass
                 gs.player._voice_client = None
             try:
-                voice_client = await voice_channel.connect()
-                gs.player.set_voice_client(voice_client)
-                saved_br = get_bitrate(guild_id)
-                if saved_br:
-                    await gs.player.set_bitrate(ctx.guild.id, saved_br)
-                saved_bass = get_eq_bass(guild_id)
-                saved_treble = get_eq_treble(guild_id)
-                if saved_bass != 0 or saved_treble != 0:
-                    await gs.player.set_eq(ctx.guild.id, saved_bass, saved_treble)
+                voice_client = await _join_voice(ctx, gs, voice_channel)
             except Exception as e:
                 await ctx.send(f"Failed to join voice channel: {e}")
                 return
