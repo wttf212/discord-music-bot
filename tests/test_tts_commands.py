@@ -137,6 +137,39 @@ class TestTts(_Base):
         self.assertIn("turned off on this server", env.run("tts", text="hei"))
         tts.synthesize.assert_not_awaited()
 
+    def test_switched_off_during_synthesis_is_not_spoken(self):
+        # !ttsallow off is the admin's brake: a clip still being made must not play after it.
+        async def synthesize_meanwhile_switched_off(*args):
+            guild_settings.set_tts_allowed("1", False)
+            return CLIP
+        tts.synthesize.side_effect = synthesize_meanwhile_switched_off
+        env = _Env()
+        self.assertIn("turned off on this server", env.run("tts", text="hei"))
+        self.assertEqual((env.speech.said, env.speech.after), ([], []))
+
+    def test_queue_filled_during_synthesis_is_refused(self):
+        env = _Env()
+
+        async def synthesize_while_others_queue(*args):
+            env.speech.waiting = 5
+            return CLIP
+        tts.synthesize.side_effect = synthesize_while_others_queue
+        self.assertIn("Too many messages waiting", env.run("tts", text="hei"))
+        self.assertEqual(env.speech.said, [])
+
+    def test_author_who_left_voice_during_synthesis_is_not_followed(self):
+        env = _Env()
+        env.ctx.guild.voice_client = None          # the bot would have to join the author
+        env.player._voice_client = None
+
+        async def synthesize_while_the_author_leaves(*args):
+            env.ctx.author.voice = None
+            return CLIP
+        tts.synthesize.side_effect = synthesize_while_the_author_leaves
+        self.assertIn("You need to be in a voice channel.", env.run("tts", text="hei"))
+        env.channel.connect.assert_not_awaited()
+        self.assertEqual(env.speech.said, [])
+
     def test_queue_full_is_refused(self):
         env = _Env(speech_=_Speech(waiting=5))
         self.assertIn("Too many messages waiting", env.run("tts", text="hei"))

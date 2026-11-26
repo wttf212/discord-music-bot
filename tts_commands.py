@@ -125,11 +125,22 @@ async def _tts_flow(cog, ctx, text: str | None, after: bool) -> None:
         await ctx.send("Couldn't make that into speech right now.")
         return
 
+    # Synthesis takes a second or so: what was checked before it may have changed since.
+    if not get_tts_allowed(gid):
+        await ctx.send("Text-to-speech is turned off on this server.")
+        return
+    if speech_.waiting_clips() >= TTS_MAX_WAITING:
+        await ctx.send("Too many messages waiting — try again in a moment.")
+        return
     # Join only when the bot isn't in voice at all. A voice client that isn't connected is
     # discord.py connecting or reconnecting: dropping it would stop the song, so say()
     # reports the outage instead.
-    if ctx.guild.voice_client is None and await _join_author_voice(ctx, gs) is None:
-        return
+    if ctx.guild.voice_client is None:
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            await ctx.send("You need to be in a voice channel.")
+            return
+        if await _join_author_voice(ctx, gs) is None:
+            return
     current = gs.queue.current
     # While a station starts, current is still the song that ended, but a station never ends
     # by itself: the clip goes with its start, as a !tts would.
