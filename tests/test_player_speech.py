@@ -457,6 +457,35 @@ class TestStopDuringGapSpeech(unittest.TestCase):
                 self._stop_during_the_gap(holder, stopper)
 
 
+class TestStopDuringAStreamOpen(unittest.TestCase):
+    """!stop while the auto-next chain opens the next track's stream, with no speech anywhere.
+    Before !stop disarmed the chain, this posted "Lost the voice connection…" and "Voice
+    connection didn't come back…" and put the track back into the queue !stop had just
+    cleared. The disarm applies on every server, with text-to-speech or without."""
+
+    def test_stop_ends_auto_play_quietly(self):
+        g, out = _Guild(self), {}
+        g.harness = _Harness(stop_at="open")
+
+        async def scenario():
+            chain = g.advance("chain")                # pops b; its stream open is parked
+            parked = await asyncio.get_running_loop().run_in_executor(None, g.harness.entered.wait, 5)
+            self.assertTrue(parked, "the chain never reached the stream open")
+            await g.stop("!stop")
+            g.harness.release.set()
+            await asyncio.wait({chain}, timeout=3)
+            out["chain ended"] = chain.done()
+            await asyncio.sleep(0.3)                  # room to wait out a "voice drop" and rejoin
+
+        with g.harness.patched(), _patched_commands():
+            asyncio.run(scenario())
+        self.assertTrue(out["chain ended"], "the auto-next chain outlived !stop")
+        self.assertEqual(g.sent, ["Stopped playback and left voice."])
+        self.assertEqual(g.gs.queue.list(), [])
+        self.assertEqual(g.rejoins, [])
+        self.assertEqual(g.songs_played(), [])
+
+
 class TestSkipDuringGapSpeech(unittest.TestCase):
     """!skip or ► during the gap skips only the speech: the song the chain waits to start plays
     at once, the rest of the queue stays and the chain keeps its generation. A !tts sent during
