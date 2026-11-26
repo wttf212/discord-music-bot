@@ -273,6 +273,22 @@ class TestGap(unittest.TestCase):
             sp.between_songs.assert_awaited_once_with(started, True)
         _run(go())
 
+    def test_a_station_starting_is_not_a_song_in_the_update(self):
+        async def go():
+            vc, _, sp = _setup()
+            sp.song_change(1); sp.wrap(_Music(1), 1)   # a finished track's start time
+            started = sp.track_started_at
+            sp.between_songs = AsyncMock(return_value=None)
+            sp.song_change(2, radio=True)
+            self.assertTrue(sp.starting_radio)
+            await _settle()
+            sp.between_songs.assert_awaited_once_with(started, False)   # no song about to start
+            sp.wrap(_Music(5), 2)
+            self.assertFalse(sp.starting_radio)
+            sp.song_change(3)
+            self.assertFalse(sp.starting_radio)
+        _run(go())
+
     def test_update_provider_failure_is_skipped(self):
         async def go():
             vc, _, sp = _setup()

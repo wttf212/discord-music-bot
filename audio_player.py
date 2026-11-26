@@ -2509,7 +2509,7 @@ class AudioPlayer:
         self.stop_playback(keep_speech=True)
         built: list = []  # as in play(): the FFmpeg this start made, stopped if it never plays
         try:
-            self.speech.song_change(_gen)
+            self.speech.song_change(_gen, radio=True)
 
             if self._debug:
                 print(f"[debug][player] play_radio() starting: {title} -> {stream_url}")

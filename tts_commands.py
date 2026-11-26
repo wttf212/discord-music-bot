@@ -26,7 +26,9 @@ TTS_MAX_WAITING = 5   # clips waiting per server
 async def _update_clip(bot, guild_id: int, started_at: float | None, starting_next: bool) -> bytes | None:
     """The half-hourly update's audio for this song change, or None when none is due.
 
-    A broken time zone or a failed synthesis raises; Speech logs it and skips the update.
+    starting_next: a song is about to start, and counts as waiting. It is False when the
+    queue has run out and when a radio station is starting. A broken time zone or a failed
+    synthesis raises; Speech logs it and skips the update.
     """
     gid = str(guild_id)
     if not get_announce(gid) or started_at is None:
@@ -37,7 +39,7 @@ async def _update_clip(bot, guild_id: int, started_at: float | None, starting_ne
         return None
     gs = bot.get_guild_state(guild_id)
     lang = get_tts_language(gid)
-    count = len(gs.queue) + 1 if starting_next else 0  # the track about to start counts
+    count = len(gs.queue) + (1 if starting_next else 0)  # the song about to start counts
     return await tts.synthesize(
         tts.announcement_text(lang, datetime.fromtimestamp(now, ZoneInfo(tz)), count),
         lang, gs.player._ffmpeg_path)
@@ -129,7 +131,10 @@ async def _tts_flow(cog, ctx, text: str | None, after: bool) -> None:
     if ctx.guild.voice_client is None and await _join_author_voice(ctx, gs) is None:
         return
     current = gs.queue.current
-    if after and current is not None and not current.is_radio and (gs.player.is_playing or speech_.starting):
+    # While a station starts, current is still the song that ended, but a station never ends
+    # by itself: the clip goes with its start, as a !tts would.
+    if (after and current is not None and not current.is_radio and not speech_.starting_radio
+            and (gs.player.is_playing or speech_.starting)):
         speech_.queue_after(pcm)
         where = "after"
     else:

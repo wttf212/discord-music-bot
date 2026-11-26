@@ -229,6 +229,24 @@ class TestPlayerSpeech(unittest.TestCase):
             asyncio.run(player.play_radio(track))
         self.assertIsInstance(voice.played, speech.SpeechMixer)
 
+    def test_radio_start_is_no_song_in_the_update(self):
+        class _Radio(discord.AudioSource):
+            _process = SimpleNamespace(stderr=[])
+
+            def read(self):
+                return FRAME
+
+            def is_opus(self):
+                return False
+
+        player = _player(_OneAtATimeVoice())
+        player.speech.between_songs = AsyncMock(return_value=None)
+        player.speech.track_started_at = 100.0     # the song that just ended
+        track = Track(query="r", title="R", requested_by="u", url="http://radio", is_radio=True)
+        with patch.object(discord, "FFmpegPCMAudio", lambda *a, **k: _Radio()):
+            asyncio.run(player.play_radio(track))
+        player.speech.between_songs.assert_awaited_once_with(100.0, False)
+
 
 class TestRadioStartTeardown(unittest.TestCase):
     """A radio start that never plays stops its FFmpeg and leaves the player idle, as a song

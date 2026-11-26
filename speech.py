@@ -147,6 +147,7 @@ class Speech:
         self.track_started_at: float | None = None
         self._gen: int | None = None
         self._starting = False
+        self._radio = False                       # the start is a radio station, not a song
         self._mixer: SpeechMixer | None = None    # the song's mixer; kept after a natural end until the next change
         self._solo: SpeechMixer | None = None     # speech-only source on the voice client
         self._solo_done: asyncio.Event | None = None
@@ -158,6 +159,11 @@ class Speech:
     @property
     def starting(self) -> bool:
         return self._starting
+
+    @property
+    def starting_radio(self) -> bool:
+        """A radio station is starting. It never ends by itself, so nothing waits for it."""
+        return self._starting and self._radio
 
     @property
     def in_gap(self) -> bool:
@@ -238,10 +244,12 @@ class Speech:
         self._starting = False
         self.track_started_at = None
 
-    def song_change(self, gen: int) -> None:
-        """A track is about to start: speak the after-song clips and fetch the update."""
+    def song_change(self, gen: int, radio: bool = False) -> None:
+        """A track is about to start: speak the after-song clips and fetch the update.
+        radio: the track is a station, which the update doesn't count as a song."""
         self._gen = gen
         self._starting = True
+        self._radio = radio
         self._mixer = None  # the old song is over
         after, self._after_song = self._after_song, []
         self._play_solo(after)
@@ -251,7 +259,7 @@ class Speech:
         started_at, self.track_started_at = self.track_started_at, None
         if self.between_songs is not None and (self._update_task is None or self._update_task.done()):
             self._update_task = asyncio.create_task(
-                self._fetch_update(self.between_songs, started_at, True))
+                self._fetch_update(self.between_songs, started_at, not radio))
 
     async def wait_for_gap(self, gen: int) -> None:
         """Hold the song until the gap's speech has played. Every wait is bounded."""

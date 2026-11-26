@@ -13,8 +13,9 @@ CLIP = b"\x00" * speech.FRAME_SIZE
 
 
 class _Speech:
-    def __init__(self, result="solo", waiting=0, error=None, starting=False):
+    def __init__(self, result="solo", waiting=0, error=None, starting=False, starting_radio=False):
         self.result, self.waiting, self.error, self.starting = result, waiting, error, starting
+        self.starting_radio = starting_radio
         self.said, self.after, self.cuts = [], [], []
         self.between_songs = None
 
@@ -94,6 +95,14 @@ class TestTts(_Base):
         env.gs.queue.current = Track(query="c", title="C", requested_by="u")
         env.run("ttsafter", text="paldies")
         self.assertEqual((env.speech.after, env.speech.said), ([CLIP], []))
+
+    def test_after_song_while_a_station_starts_speaks_with_it(self):
+        # The song that ended is still queue.current until the station has started, but a
+        # station never ends by itself: the clip goes with the station's start, like a !tts.
+        env = _Env(speech_=_Speech(starting=True, starting_radio=True))
+        env.gs.queue.current = Track(query="c", title="C", requested_by="u")
+        env.run("ttsafter", text="paldies")
+        self.assertEqual((env.speech.said, env.speech.after), ([CLIP], []))
 
     def test_after_song_during_radio_or_idle_speaks_now(self):
         for env in (_Env(playing=True, radio=True), _Env(playing=False)):
@@ -223,6 +232,12 @@ class TestUpdateClip(_Base):
         guild_settings.set_announce("1", True)
         self.assertEqual(self._call(self._env_with_two_queued(), self.NOW - 600), CLIP)
         tts.synthesize.assert_awaited_once_with("Pulkstenis ir 14:34. Rindā vēl 3 dziesmas.", "lv", "ffmpeg")
+
+    def test_a_station_starting_counts_only_the_queued_songs(self):
+        # Speech passes starting_next=False at a radio start: the station is not a song.
+        guild_settings.set_announce("1", True)
+        self._call(self._env_with_two_queued(), self.NOW - 600, starting_next=False)
+        tts.synthesize.assert_awaited_once_with("Pulkstenis ir 14:34. Rindā vēl 2 dziesmas.", "lv", "ffmpeg")
 
     def test_queue_end_says_it_is_empty(self):
         guild_settings.set_announce("1", True)
